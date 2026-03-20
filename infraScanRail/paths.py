@@ -27,6 +27,11 @@ POPULATION_SCENARIO_CH_EUROSTAT_2100 = r"data\Scenario\Eurostat_population_CH_21
 POPULATION_PER_COMMUNE_ZH_2018 = r"data\Scenario\population_by_gemeinde_2018.csv"
 RANDOM_SCENARIO_CACHE_PATH = r"data\Scenario\cache"
 DISTRICT_PATH = r"data\_basic_data\Gemeindegrenzen\UP_BEZIRKE_F.shp"
+CANTON_BOUNDARIES_GPKG = r"data/Spatial_Data/Boundaries/Swissboundaries_Cantons_2026_CH.gpkg"
+GTFS_TRANSIT_DIR = r"data/Network/GTFS_Timetable"
+BUS_LINES_DIR = r"data/Network/Buslines"
+FEEDER_LINES_DIR = r"data/Network/Feeder_Lines"
+RAIL_PROCESSED_DIR = r"data/Network/processed"
 
 CONSTRUCTION_COSTS =  r"data/costs/construction_cost.csv"
 TOTAL_COST_WITH_GEOMETRY = r"data/costs/total_costs_with_geometry.csv"

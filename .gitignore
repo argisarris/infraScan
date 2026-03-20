@@ -8,4 +8,5 @@
 infraScanRail/__pycache__
 infraScanRail/_unused_files
 /infraScanRail/markdowns
-.claude/settings.local.json
+/.claude
+/.vscode

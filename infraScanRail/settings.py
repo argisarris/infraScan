@@ -22,6 +22,13 @@ infra_generation_rail_network = paths.RAIL_SERVICES_AK2035_PATH
 OD_type = 'canton_ZH' #either 'canton_ZH' or 'pt_catchment_perimeter'
 only_demand_from_to_perimeter = True
 
+# Catchment method: 'pt_feeder' uses GTFS-based multimodal PT-Feeder allocation;
+# 'municipal' preserves the existing centroid-based approach.
+# 'pt_catchment_perimeter' (OD_type) and perimeter_demand are retained for cross-evaluation.
+CATCHMENT_METHOD = 'pt_feeder'
+# Canton name must match the attribute value in CANTON_BOUNDARIES_GPKG
+CATCHMENT_CANTON = ['Zürich']  # Add canton names to include multiple cantons in the boundary
+
 # Scenario settings: Choose either 'GENERATED' or 'STATIC_9' or 'dummy'
 scenario_type = 'GENERATED' 
 amount_of_scenarios = 100
