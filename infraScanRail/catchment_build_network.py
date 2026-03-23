@@ -28,7 +28,10 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import LineString
+from shapely.geometry import LineString, MultiLineString, Point
+from shapely.ops import substring, linemerge
+import numpy as np
+from scipy.spatial import cKDTree
 
 import paths
 import settings
@@ -49,8 +52,37 @@ RAIL_OUTPUT_FOLDER      = 'FP2026_ZH_network'       # subfolder of paths.RAIL_PR
 RAIL_STOPS_FILE         = 'rail_stops.gpkg'
 RAIL_LINES_FILE         = 'rail_lines.gpkg'
 
-PT_FEEDER_PROJECT_FILE  = 'pt_feeder_lines.qgz'
-RAIL_PROJECT_FILE       = 'rail_lines.qgz'
+PT_FEEDER_SEGMENTS_FILE = 'pt_feeder_segments.gpkg'
+RAIL_SEGMENTS_FILE      = 'rail_segments.gpkg'
+
+PT_FEEDER_PROJECT_FILE          = 'pt_feeder_lines.qgz'
+RAIL_PROJECT_FILE               = 'rail_lines.qgz'
+PT_FEEDER_SEGMENTS_PROJECT_FILE = 'pt_feeder_segments.qgz'
+RAIL_SEGMENTS_PROJECT_FILE      = 'rail_segments.qgz'
+
+# Peak / off-peak filtered output files
+PT_FEEDER_LINES_PEAK_FILE       = 'pt_feeder_lines_peak.gpkg'
+PT_FEEDER_LINES_OFFPEAK_FILE    = 'pt_feeder_lines_offpeak.gpkg'
+PT_FEEDER_SEGMENTS_PEAK_FILE    = 'pt_feeder_segments_peak.gpkg'
+PT_FEEDER_SEGMENTS_OFFPEAK_FILE = 'pt_feeder_segments_offpeak.gpkg'
+PT_FEEDER_STOPS_PEAK_FILE       = 'pt_feeder_stops_peak.gpkg'
+PT_FEEDER_STOPS_OFFPEAK_FILE    = 'pt_feeder_stops_offpeak.gpkg'
+RAIL_LINES_PEAK_FILE            = 'rail_lines_peak.gpkg'
+RAIL_LINES_OFFPEAK_FILE         = 'rail_lines_offpeak.gpkg'
+RAIL_SEGMENTS_PEAK_FILE         = 'rail_segments_peak.gpkg'
+RAIL_SEGMENTS_OFFPEAK_FILE      = 'rail_segments_offpeak.gpkg'
+RAIL_STOPS_PEAK_FILE            = 'rail_stops_peak.gpkg'
+RAIL_STOPS_OFFPEAK_FILE         = 'rail_stops_offpeak.gpkg'
+
+PT_FEEDER_LINES_PEAK_PROJECT_FILE       = 'pt_feeder_lines_peak.qgz'
+PT_FEEDER_LINES_OFFPEAK_PROJECT_FILE    = 'pt_feeder_lines_offpeak.qgz'
+PT_FEEDER_SEGMENTS_PEAK_PROJECT_FILE    = 'pt_feeder_segments_peak.qgz'
+PT_FEEDER_SEGMENTS_OFFPEAK_PROJECT_FILE = 'pt_feeder_segments_offpeak.qgz'
+RAIL_LINES_PEAK_PROJECT_FILE            = 'rail_lines_peak.qgz'
+RAIL_LINES_OFFPEAK_PROJECT_FILE         = 'rail_lines_offpeak.qgz'
+RAIL_SEGMENTS_PEAK_PROJECT_FILE         = 'rail_segments_peak.qgz'
+RAIL_SEGMENTS_OFFPEAK_PROJECT_FILE      = 'rail_segments_offpeak.qgz'
+
 BUILD_REPORT_FILE       = 'build_report.txt'
 
 # ---------------------------------------------------------------------------
@@ -75,18 +107,18 @@ PEAK_MIN_CLUSTER_BINS         = 2           # cluster must span ≥ this many bi
 PEAK_CLASSIFICATION_THRESHOLD = 0.80        # fraction of deps to classify peak_only / offpeak_only
 
 # Line-level acceptance gate — applied per route_id before variant classification.
-# A line must have ≥ LINE_MIN_DEPARTURES_IN_WINDOW departures in at least one
-# time window (AM peak, off-peak, PM peak) considering either direction, AND its
-# departures (both directions pooled) must span ≥ LINE_MIN_HOUR_SPREAD distinct hours.
-LINE_MIN_DEPARTURES_IN_WINDOW = 3     # ≈1 dep/hr in a 3-hour window
-LINE_MIN_HOUR_SPREAD          = 2     # min distinct hours across both directions
+# Each direction individually must have ≥ LINE_MIN_DEPARTURES_PER_DIR departures
+# in at least one time window (AM peak, off-peak, PM peak), AND each direction's
+# departures must span ≥ LINE_MIN_HOUR_SPREAD distinct hours.
+LINE_MIN_DEPARTURES_PER_DIR = 2     # ≈ min deps per direction in any window
+LINE_MIN_HOUR_SPREAD        = 2     # min distinct hours per direction
 
 # Variant classification thresholds
 VARIANT_MIN_TRIP_SHARE           = 0.10  # min fraction of direction's trips
 VARIANT_MIN_HOUR_SPREAD          = 2     # min distinct hours variant appears in
 VARIANT_HEADWAY_CV_MAX           = 0.40  # max coefficient of variation of inter-departure gaps
 VARIANT_MIN_DEPARTURES_IN_WINDOW = 3     # min departures in a window to compute frequency
-VARIANT_RELAXED_MIN_DEPARTURES   = 2     # relaxed minimum (used when line has ≥2 deps in both AM and PM peaks)
+VARIANT_FREQ_MIN_DEPARTURES      = 2     # min departures in a window for frequency computation
 
 # Short-working suppression: a passing variant is suppressed if its stop sequence
 # is a contiguous prefix of a longer passing variant AND at least this fraction of
@@ -122,7 +154,29 @@ MIN_WEEKDAY_ACTIVE_FRACTION = 0.50
 #   'pt_feeder'   : only PT-Feeder modes (tram, bus, metro, ship, funicular)
 #   'rail'        : only Rail modes (S-Bahn, regional, inter-regional, long-distance)
 #   list of ints  : only specific route_types, e.g. [900] for tram, [109, 106] for S-Bahn + regional
+# NOTE: default value — overridden by _configure_pipeline() at runtime.
 BUILD_MODES = 'all'
+
+# ---------------------------------------------------------------------------
+# ZVV Geometry — replaces straight-line geometries with actual route geometry
+# ---------------------------------------------------------------------------
+# When True, stop-to-stop geometries are sourced from the ZVV transit lines
+# GeoPackage (tram / bus / funicular / ship via ZVV_LINIEN_L, S-Bahn via
+# ZVV_S_BAHN_LINIEN_L).  Unmatched segments keep the straight-line fallback.
+# NOTE: default value — overridden by _configure_pipeline() at runtime.
+USE_ZVV_GEOMETRY       = True
+
+ZVV_LINES_GPKG         = os.path.join('data', 'Spatial_Data', 'Transit_Lines',
+                                      'ZVV_Lines_2026.gpkg')
+ZVV_SEGMENT_LAYER      = 'ZVV_LINIEN_L'
+ZVV_SBAHN_LAYER        = 'ZVV_S_BAHN_LINIEN_L'
+ZVV_MATCH_TOLERANCE_M  = 150   # max distance (m) for spatial stop crosswalk
+
+# S-Bahn snapping — relaxed tolerance and quality gates for whole-line projection
+SBAHN_SNAP_TOLERANCE_M = 2000  # max per-point distance (m) for S-Bahn line snapping
+SBAHN_MAX_SINUOSITY    = 3.5   # max path_length / straight_distance for a snapped segment
+SBAHN_MIN_SINUOSITY    = 0.85  # min path_length / straight_distance; rejects cross-corridor projections
+SBAHN_MIN_PART_LENGTH  = 50    # min geometry part length (m) to keep; filters degenerate parts
 
 PT_FEEDER_LINE_TYPES = {
     900:  'Tram',
@@ -220,6 +274,666 @@ def _build_linestring(stop_id_seq, coord_dict):
     if len(coords) < 2:
         return None
     return LineString(coords)
+
+
+# ---------------------------------------------------------------------------
+# ZVV Geometry helpers
+# ---------------------------------------------------------------------------
+
+# Module-level ZVV geometry state (populated in Step 2b when USE_ZVV_GEOMETRY)
+_zvv_seg_index    = {}                  # (line_name, from_sid, to_sid) → LineString
+_zvv_chain_index  = {}                  # (line_name, from_sid) → [(to_sid, geom, seq), ...]
+_zvv_sbahn_index  = {}                  # line_name → [LineString, ...]
+_zvv_sbahn_jgraph = {}                  # line_name → {junction_id → [(part_idx, other_junction, geom)]}
+_zvv_match_counts = defaultdict(int)    # 'direct'|'chain'|'sbahn'|'sbahn_chain'|'fallback' → int
+
+
+def _load_zvv_geometry():
+    """Load ZVV GeoPackage and build geometry lookup indices.
+
+    Uses *stop_coord* (module-level, available after Step 2) to build a
+    spatial crosswalk between ZVV internal stop numbering and GTFS DiDok/UIC
+    stop IDs.  Populates ``_zvv_seg_index``, ``_zvv_chain_index``, and
+    ``_zvv_sbahn_index``.  Returns True on success, False on failure.
+    """
+    global _zvv_seg_index, _zvv_chain_index, _zvv_sbahn_index
+
+    zvv_path = os.path.join(paths.MAIN, ZVV_LINES_GPKG)
+    if not os.path.isfile(zvv_path):
+        print(f"  WARNING: ZVV GeoPackage not found at {zvv_path}")
+        print("           Falling back to straight-line geometry.")
+        return False
+
+    # --- Load ZVV layers (expected CRS: EPSG:2056) --------------------------
+    print(f"  Loading {ZVV_SEGMENT_LAYER} ...", end=' ', flush=True)
+    zvv_seg = gpd.read_file(zvv_path, layer=ZVV_SEGMENT_LAYER)
+    print(f"{len(zvv_seg):,} segments")
+
+    print(f"  Loading {ZVV_SBAHN_LAYER} ...", end=' ', flush=True)
+    zvv_sbahn = gpd.read_file(zvv_path, layer=ZVV_SBAHN_LAYER)
+    print(f"{len(zvv_sbahn):,} lines")
+
+    # --- Spatial stop crosswalk (ZVV internal → GTFS DiDok) -----------------
+    print("  Building spatial stop crosswalk (ZVV → GTFS) ...")
+
+    # Collect coordinate observations per ZVV stop (median for robustness)
+    zvv_stop_obs = defaultdict(list)
+    for _, row in zvv_seg.iterrows():
+        if row.geometry is None or row.geometry.is_empty:
+            continue
+        coords = list(row.geometry.coords)
+        zvv_stop_obs[int(row['VONHALTESTELLENNR'])].append(coords[0])
+        zvv_stop_obs[int(row['BISHALTESTELLENNR'])].append(coords[-1])
+
+    zvv_stops = {}
+    for vid, obs in zvv_stop_obs.items():
+        xs = [c[0] for c in obs]
+        ys = [c[1] for c in obs]
+        zvv_stops[vid] = (float(np.median(xs)), float(np.median(ys)))
+
+    # KD-tree from GTFS parent-station stops
+    gtfs_ids = list(stop_coord.keys())
+    gtfs_pts = np.array([(stop_coord[sid].x, stop_coord[sid].y)
+                         for sid in gtfs_ids])
+    tree = cKDTree(gtfs_pts)
+
+    zvv_ids = list(zvv_stops.keys())
+    zvv_pts = np.array([zvv_stops[vid] for vid in zvv_ids])
+    dists, idxs = tree.query(zvv_pts)
+
+    crosswalk = {}          # zvv_stop_id (int) → gtfs_stop_id (str)
+    matched_dists = []
+    for i, zvv_id in enumerate(zvv_ids):
+        if dists[i] <= ZVV_MATCH_TOLERANCE_M:
+            crosswalk[zvv_id] = gtfs_ids[idxs[i]]
+            matched_dists.append(dists[i])
+
+    if matched_dists:
+        med_dist = float(np.median(matched_dists))
+    else:
+        med_dist = float('nan')
+    print(f"    {len(zvv_stops):,} ZVV stops → "
+          f"{len(crosswalk):,} matched within {ZVV_MATCH_TOLERANCE_M}m "
+          f"(median {med_dist:.0f}m)")
+
+    if not crosswalk:
+        print("  WARNING: No stops matched — ZVV geometry unavailable.")
+        return False
+
+    # --- Segment index (tram / bus / funicular / ship / metro) --------------
+    print("  Building ZVV segment index ...")
+    seg_index   = {}
+    chain_index = defaultdict(list)
+
+    for _, row in zvv_seg.iterrows():
+        if row.geometry is None or row.geometry.is_empty:
+            continue
+        line_name = str(row['LINIENNUMMER']).strip()
+        von = int(row['VONHALTESTELLENNR'])
+        bis = int(row['BISHALTESTELLENNR'])
+        seq_nr = int(row['SEQUENZNR']) if pd.notna(row.get('SEQUENZNR')) else 0
+
+        gtfs_from = crosswalk.get(von)
+        gtfs_to   = crosswalk.get(bis)
+        if gtfs_from is None or gtfs_to is None:
+            continue
+
+        geom = row.geometry
+        key  = (line_name, gtfs_from, gtfs_to)
+        if key not in seg_index:
+            seg_index[key] = geom
+
+        chain_index[(line_name, gtfs_from)].append((gtfs_to, geom, seq_nr))
+
+    # Sort chain entries by sequence number
+    for k in chain_index:
+        chain_index[k].sort(key=lambda x: x[2])
+
+    # --- Direction validation & geometry correction -------------------------
+    print("  Validating segment geometry directions ...")
+    n_correct = n_reversed = n_unknown = 0
+
+    for key, geom in list(seg_index.items()):
+        _, from_sid, to_sid = key
+        from_pt = stop_coord.get(from_sid)
+        to_pt   = stop_coord.get(to_sid)
+        if from_pt is None or to_pt is None:
+            n_unknown += 1
+            continue
+
+        geom_start = Point(geom.coords[0])
+        geom_end   = Point(geom.coords[-1])
+
+        dist_ok  = geom_start.distance(from_pt) + geom_end.distance(to_pt)
+        dist_rev = geom_start.distance(to_pt) + geom_end.distance(from_pt)
+
+        if dist_rev < dist_ok:
+            seg_index[key] = LineString(list(geom.coords)[::-1])
+            n_reversed += 1
+        else:
+            n_correct += 1
+
+    print(f"    Direction: {n_correct:,} correct, "
+          f"{n_reversed:,} reversed, {n_unknown:,} unknown")
+
+    # Also correct chain_index geometries that were reversed in seg_index
+    for k, entries in chain_index.items():
+        new_entries = []
+        for to_sid, geom, seq_nr in entries:
+            seg_key = (k[0], k[1], to_sid)       # (line, from, to)
+            if seg_key in seg_index:
+                new_entries.append((to_sid, seg_index[seg_key], seq_nr))
+            else:
+                new_entries.append((to_sid, geom, seq_nr))
+        chain_index[k] = new_entries
+
+    # --- S-Bahn whole-line index -------------------------------------------
+    print("  Building S-Bahn line index ...")
+    sbahn_index = defaultdict(list)
+
+    for _, row in zvv_sbahn.iterrows():
+        name = str(row['LINIESBAHN']).strip()
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+
+        # Keep each connected component as a separate geometry so that
+        # _snap_to_sbahn can match against individual branches rather than
+        # a force-concatenated line that backtracks between disconnected parts.
+        if isinstance(geom, MultiLineString):
+            merged = linemerge(geom)
+            if isinstance(merged, MultiLineString):
+                for part in merged.geoms:
+                    if (part is not None and not part.is_empty
+                            and len(part.coords) >= 2
+                            and part.length >= SBAHN_MIN_PART_LENGTH):
+                        sbahn_index[name].append(part)
+            else:
+                if merged.length >= SBAHN_MIN_PART_LENGTH:
+                    sbahn_index[name].append(merged)
+        else:
+            if geom.length >= SBAHN_MIN_PART_LENGTH:
+                sbahn_index[name].append(geom)
+
+    n_sbahn = len(sbahn_index)
+    print(f"    {n_sbahn} S-Bahn lines indexed")
+
+    # --- Junction graph for multi-part chaining ----------------------------
+    # For lines stored as disconnected MultiLineStrings, build a lightweight
+    # graph so _snap_to_sbahn_chained can route across 2–3 parts.
+    # Nodes = junction clusters (nearby part endpoints); edges = parts.
+    JUNCTION_TOLERANCE = 100          # max distance (m) between endpoints to merge
+    jgraph = {}                       # line_name → {junc_id → [(part_idx, other_junc, geom)]}
+    n_jgraph = 0
+
+    for name, parts in sbahn_index.items():
+        if len(parts) < 2:
+            continue                  # single-part line — no chaining needed
+
+        # Collect all part endpoints
+        endpoints = []                # (part_idx, end_flag, x, y)
+        for idx, p in enumerate(parts):
+            c = list(p.coords)
+            endpoints.append((idx, 0, c[0][0],  c[0][1]))    # start
+            endpoints.append((idx, 1, c[-1][0], c[-1][1]))    # end
+
+        # Cluster nearby endpoints into junction nodes
+        ep_pts = np.array([(e[2], e[3]) for e in endpoints])
+        junc_ids = list(range(len(endpoints)))     # initially each is its own cluster
+        for i in range(len(endpoints)):
+            for j in range(i + 1, len(endpoints)):
+                if np.hypot(ep_pts[i, 0] - ep_pts[j, 0],
+                            ep_pts[i, 1] - ep_pts[j, 1]) < JUNCTION_TOLERANCE:
+                    # Union-find merge (simple relabel)
+                    old_id, new_id = max(junc_ids[i], junc_ids[j]), min(junc_ids[i], junc_ids[j])
+                    for k in range(len(junc_ids)):
+                        if junc_ids[k] == old_id:
+                            junc_ids[k] = new_id
+
+        # Build adjacency: each part connects its start-junction to its end-junction
+        graph = defaultdict(list)
+        for idx, p in enumerate(parts):
+            start_j = junc_ids[idx * 2]
+            end_j   = junc_ids[idx * 2 + 1]
+            if start_j == end_j:
+                continue              # degenerate loop — skip
+            graph[start_j].append((idx, end_j, p))
+            graph[end_j].append((idx, start_j, p))
+
+        if graph:
+            jgraph[name] = dict(graph)
+            n_jgraph += 1
+
+    print(f"    {n_jgraph} S-Bahn junction graphs built")
+
+    # --- Publish indices ----------------------------------------------------
+    _zvv_seg_index   = dict(seg_index)
+    _zvv_chain_index = dict(chain_index)
+    _zvv_sbahn_index = dict(sbahn_index)
+    _zvv_sbahn_jgraph.update(jgraph)
+
+    n_lines_matched = len({k[0] for k in seg_index})
+    print(f"  ZVV geometry ready: {len(seg_index):,} segment mappings "
+          f"across {n_lines_matched} lines, {n_sbahn} S-Bahn lines")
+    return True
+
+
+def _chain_zvv_segments(line_name, from_sid, to_sid, max_hops=30):
+    """Follow ZVV segment chain from *from_sid* to *to_sid*.
+
+    Returns a concatenated LineString, or None if no path is found.
+    """
+    if not _zvv_chain_index:
+        return None
+
+    visited = set()
+    current = from_sid
+    geoms   = []
+
+    for _ in range(max_hops):
+        if current == to_sid:
+            break
+        next_segs = _zvv_chain_index.get((line_name, current), [])
+        if not next_segs:
+            return None
+
+        found = False
+        for nxt, geom, _ in next_segs:
+            if nxt not in visited:
+                geoms.append(geom)
+                visited.add(current)
+                current = nxt
+                found = True
+                break
+        if not found:
+            return None
+
+    if current != to_sid or not geoms:
+        return None
+
+    coords = []
+    for g in geoms:
+        c = list(g.coords)
+        if coords:
+            coords.extend(c[1:])        # skip duplicate junction point
+        else:
+            coords.extend(c)
+    return LineString(coords) if len(coords) >= 2 else None
+
+
+def _snap_to_sbahn(from_pt, to_pt, line_name):
+    """Project *from_pt*/*to_pt* onto an S-Bahn whole-line geometry.
+
+    Tries every geometry part stored for *line_name* independently and
+    picks the candidate whose substring is shortest while passing the
+    sinuosity gate.  When a stop projects near a geometry endpoint but
+    is far in perpendicular distance (common at terminal stations where
+    the ZVV geometry ends short), the result is extended with a short
+    straight-line stub so the segment still connects to the station.
+    """
+    geom_list = _zvv_sbahn_index.get(line_name)
+    if not geom_list:
+        return None
+
+    from_point = Point(from_pt.x, from_pt.y)
+    to_point   = Point(to_pt.x, to_pt.y)
+    straight_dist = from_point.distance(to_point)
+    if straight_dist < 1.0:
+        return None
+
+    best_sub   = None
+    best_score = float('inf')      # lower = better (prefer shortest valid path)
+
+    for geom in geom_list:
+        if geom is None or geom.is_empty or len(geom.coords) < 2:
+            continue
+
+        d_from = geom.distance(from_point)
+        d_to   = geom.distance(to_point)
+
+        # Per-point tolerance — relaxed compared to the old combined check
+        if d_from > SBAHN_SNAP_TOLERANCE_M or d_to > SBAHN_SNAP_TOLERANCE_M:
+            continue
+
+        # Original-geometry sinuosity gate — reject cross-corridor projections
+        # where a stop is far from this part and projects from the side.
+        # Exception: "endpoint extension" case where both stops project near
+        # the same geometry endpoint (the geometry simply doesn't reach far
+        # enough, e.g. S12 Neuhausen→Schaffhausen).
+        orig_from_proj = geom.project(from_point)
+        orig_to_proj   = geom.project(to_point)
+        geom_len       = geom.length
+        orig_sub_len   = abs(orig_from_proj - orig_to_proj)
+        orig_sinuosity = orig_sub_len / straight_dist
+
+        if orig_sinuosity < SBAHN_MIN_SINUOSITY:
+            close_d = min(d_from, d_to)
+            both_near_start = orig_from_proj < 1000 and orig_to_proj < 1000
+            both_near_end   = (orig_from_proj > geom_len - 1000
+                               and orig_to_proj > geom_len - 1000)
+            is_endpoint_ext = close_d < 100 and (both_near_start or both_near_end)
+            if not is_endpoint_ext:
+                continue
+
+        # Pre-extend: when a stop is far from the geometry but projects to
+        # near an endpoint, the geometry doesn't reach that station.  Extend
+        # with a straight stub *before* projecting so the projection diff
+        # becomes meaningful (fixes e.g. S12 Neuhausen→Schaffhausen).
+        work_geom = geom
+        work_coords = list(geom.coords)
+        for pt, d_pt in [(from_point, d_from), (to_point, d_to)]:
+            if d_pt <= 50:
+                continue                       # already close — no extension needed
+            proj = geom.project(pt)
+            if proj < 50:                      # projects to near start
+                work_coords = [(pt.x, pt.y)] + work_coords
+            elif proj > geom_len - 50:         # projects to near end
+                work_coords = work_coords + [(pt.x, pt.y)]
+        if len(work_coords) > len(geom.coords):
+            work_geom = LineString(work_coords)
+
+        from_proj = work_geom.project(from_point)
+        to_proj   = work_geom.project(to_point)
+
+        if abs(from_proj - to_proj) < 10.0:     # < 10 m apart on the line
+            continue
+
+        if from_proj <= to_proj:
+            sub = substring(work_geom, from_proj, to_proj)
+        else:
+            sub = substring(work_geom, to_proj, from_proj)
+            sub = LineString(list(sub.coords)[::-1])
+
+        if sub is None or sub.is_empty or len(sub.coords) < 2:
+            continue
+
+        # Sinuosity gate — reject substrings that are clearly wrong
+        sinuosity = sub.length / straight_dist
+        if sinuosity > SBAHN_MAX_SINUOSITY:
+            continue
+
+        # Score: prefer the shortest valid path
+        score = sub.length
+        if score < best_score:
+            best_score = score
+            best_sub   = sub
+
+    return best_sub
+
+
+def _snap_to_sbahn_chained(from_pt, to_pt, line_name, max_hops=3):
+    """Chain multiple S-Bahn geometry parts via junction graph.
+
+    Activated when single-part snapping fails — typically for express
+    variants whose from/to stops sit on different geometry parts of a
+    disconnected MultiLineString.  Uses BFS through the junction graph
+    built at load time, then concatenates substrings along the path.
+    """
+    graph = _zvv_sbahn_jgraph.get(line_name)
+    geom_list = _zvv_sbahn_index.get(line_name)
+    if not graph or not geom_list or len(geom_list) < 2:
+        return None
+
+    from_point = Point(from_pt.x, from_pt.y)
+    to_point   = Point(to_pt.x, to_pt.y)
+    straight_dist = from_point.distance(to_point)
+    if straight_dist < 1.0:
+        return None
+
+    # Identify which parts each stop projects onto (within tolerance)
+    from_parts = []      # (part_idx, proj_distance, perp_distance)
+    to_parts   = []
+    for idx, geom in enumerate(geom_list):
+        d_from = geom.distance(from_point)
+        d_to   = geom.distance(to_point)
+        if d_from <= SBAHN_SNAP_TOLERANCE_M:
+            from_parts.append((idx, geom.project(from_point), d_from))
+        if d_to <= SBAHN_SNAP_TOLERANCE_M:
+            to_parts.append((idx, geom.project(to_point), d_to))
+
+    if not from_parts or not to_parts:
+        return None
+
+    # Map part_idx → its junction nodes (start_junc, end_junc)
+    # Reconstruct from the graph: each part appears as edges between two junctions
+    part_juncs = {}       # part_idx → (start_junc, end_junc)
+    for junc, neighbours in graph.items():
+        for pidx, other_junc, _ in neighbours:
+            if pidx not in part_juncs:
+                part_juncs[pidx] = (junc, other_junc)
+
+    best_result = None
+    best_score  = float('inf')
+
+    for from_idx, from_proj, _ in from_parts:
+        for to_idx, to_proj, _ in to_parts:
+            if from_idx == to_idx:
+                continue              # same part — already handled by single-part snap
+
+            fj = part_juncs.get(from_idx)
+            tj = part_juncs.get(to_idx)
+            if fj is None or tj is None:
+                continue
+
+            # BFS from both junctions of from_part to both junctions of to_part
+            target_juncs = set(tj)
+            for start_junc in fj:
+                # BFS
+                queue = [(start_junc, [])]        # (current_junc, path_of_part_indices)
+                visited = {start_junc}
+                found_path = None
+                while queue:
+                    cur, path = queue.pop(0)
+                    if cur in target_juncs and len(path) > 0:
+                        found_path = (path, cur)
+                        break
+                    if len(path) >= max_hops:
+                        continue
+                    for pidx, nxt_junc, _ in graph.get(cur, []):
+                        if nxt_junc not in visited:
+                            visited.add(nxt_junc)
+                            queue.append((nxt_junc, path + [pidx]))
+
+                if found_path is None:
+                    continue
+
+                path_parts, end_junc = found_path
+
+                # Build geometry: substring of from_part + full intermediate parts + substring of to_part
+                # Determine direction for from_part: which end connects to the path?
+                from_geom = geom_list[from_idx]
+                to_geom   = geom_list[to_idx]
+
+                # Figure out which end of from_part faces the path start_junc
+                _, from_end_j = part_juncs[from_idx]
+                from_fwd = (from_end_j == start_junc)     # True if path leaves via end
+
+                # Substring of from_part: from the from_stop projection to the junction end
+                if from_fwd:
+                    sub_from = substring(from_geom, from_proj, from_geom.length)
+                else:
+                    sub_from = substring(from_geom, 0, from_proj)
+
+                if (sub_from is None or sub_from.is_empty
+                        or sub_from.geom_type != 'LineString'
+                        or len(sub_from.coords) < 2):
+                    continue
+
+                if not from_fwd:
+                    sub_from = LineString(list(sub_from.coords)[::-1])
+
+                # Collect intermediate full parts (with correct direction)
+                chain_geoms = [sub_from]
+                prev_junc = start_junc
+                valid = True
+                for pidx in path_parts:
+                    p_start_j, p_end_j = part_juncs.get(pidx, (None, None))
+                    p_geom = geom_list[pidx]
+                    if pidx == from_idx or pidx == to_idx:
+                        # from/to parts are handled separately
+                        if pidx == to_idx:
+                            break
+                        continue
+                    if p_start_j == prev_junc:
+                        chain_geoms.append(p_geom)
+                        prev_junc = p_end_j
+                    elif p_end_j == prev_junc:
+                        chain_geoms.append(LineString(list(p_geom.coords)[::-1]))
+                        prev_junc = p_start_j
+                    else:
+                        valid = False
+                        break
+                if not valid:
+                    continue
+
+                # Substring of to_part: from the junction end to the to_stop projection
+                to_start_j, _ = part_juncs[to_idx]
+                to_fwd = (to_start_j == end_junc)         # True if path enters via start
+
+                if to_fwd:
+                    sub_to = substring(to_geom, 0, to_proj)
+                else:
+                    sub_to = substring(to_geom, to_proj, to_geom.length)
+
+                if (sub_to is None or sub_to.is_empty
+                        or sub_to.geom_type != 'LineString'
+                        or len(sub_to.coords) < 2):
+                    continue
+
+                if not to_fwd:
+                    sub_to = LineString(list(sub_to.coords)[::-1])
+
+                chain_geoms.append(sub_to)
+
+                # Concatenate all parts
+                all_coords = []
+                for g in chain_geoms:
+                    c = list(g.coords)
+                    if all_coords:
+                        all_coords.extend(c[1:])     # skip duplicate junction point
+                    else:
+                        all_coords.extend(c)
+
+                if len(all_coords) < 2:
+                    continue
+                result = LineString(all_coords)
+
+                # Sinuosity gate
+                if result.length / straight_dist > SBAHN_MAX_SINUOSITY:
+                    continue
+
+                if result.length < best_score:
+                    best_score  = result.length
+                    best_result = result
+
+    return best_result
+
+
+def _get_zvv_segment_geom(from_sid, to_sid, line_name):
+    """Look up ZVV geometry for a single segment.
+
+    Tries in order:
+      1. Direct segment match        (ZVV_LINIEN_L)
+      2. Multi-segment chain          (ZVV_LINIEN_L, concatenated)
+      3. S-Bahn single-part snapping  (ZVV_S_BAHN_LINIEN_L)
+      4. S-Bahn multi-part chaining   (ZVV_S_BAHN_LINIEN_L, junction graph)
+    Returns a LineString or None (caller should fall back to straight line).
+    """
+    # 1. Direct match
+    geom = _zvv_seg_index.get((line_name, from_sid, to_sid))
+    if geom is not None:
+        _zvv_match_counts['direct'] += 1
+        return geom
+
+    # 2. Chain match
+    chained = _chain_zvv_segments(line_name, from_sid, to_sid)
+    if chained is not None:
+        _zvv_match_counts['chain'] += 1
+        return chained
+
+    # 3. S-Bahn single-part snapping
+    if line_name in _zvv_sbahn_index:
+        from_pt = stop_coord.get(from_sid)
+        to_pt   = stop_coord.get(to_sid)
+        if from_pt is not None and to_pt is not None:
+            snapped = _snap_to_sbahn(from_pt, to_pt, line_name)
+            if snapped is not None:
+                _zvv_match_counts['sbahn'] += 1
+                return snapped
+
+    # 4. S-Bahn multi-part chaining (junction graph BFS)
+    if line_name in _zvv_sbahn_jgraph:
+        from_pt = stop_coord.get(from_sid)
+        to_pt   = stop_coord.get(to_sid)
+        if from_pt is not None and to_pt is not None:
+            chained_sbahn = _snap_to_sbahn_chained(from_pt, to_pt, line_name)
+            if chained_sbahn is not None:
+                _zvv_match_counts['sbahn_chain'] += 1
+                return chained_sbahn
+
+    # 5. Cross-line S-Bahn fallback — S-Bahn lines share rail infrastructure,
+    #    so geometry from another line may cover the same stop pair.
+    from_pt = stop_coord.get(from_sid)
+    to_pt   = stop_coord.get(to_sid)
+    if from_pt is not None and to_pt is not None:
+        for other_line in _zvv_sbahn_index:
+            if other_line == line_name:
+                continue
+            snapped = _snap_to_sbahn(from_pt, to_pt, other_line)
+            if snapped is not None:
+                _zvv_match_counts['sbahn_crossline'] += 1
+                return snapped
+
+    _zvv_match_counts['fallback'] += 1
+    return None
+
+
+def _build_linestring_zvv(stop_id_seq, coord_dict, line_name):
+    """Build a LineString using ZVV geometry where available.
+
+    For each consecutive stop pair, looks up the ZVV segment geometry.
+    Falls back to a straight line for unmatched pairs.
+    """
+    if len(stop_id_seq) < 2:
+        return None
+
+    all_coords = []
+    for i in range(len(stop_id_seq) - 1):
+        from_sid = stop_id_seq[i]
+        to_sid   = stop_id_seq[i + 1]
+
+        zvv_geom = _get_zvv_segment_geom(from_sid, to_sid, line_name)
+        if zvv_geom is not None:
+            seg_coords = list(zvv_geom.coords)
+        else:
+            from_pt = coord_dict.get(from_sid)
+            to_pt   = coord_dict.get(to_sid)
+            if from_pt is None or to_pt is None:
+                continue
+            seg_coords = [(from_pt.x, from_pt.y), (to_pt.x, to_pt.y)]
+
+        if all_coords:
+            all_coords.extend(seg_coords[1:])   # skip duplicate junction
+        else:
+            all_coords.extend(seg_coords)
+
+    if len(all_coords) < 2:
+        return None
+    return LineString(all_coords)
+
+
+def _print_zvv_match_summary(label):
+    """Print and reset ZVV geometry match statistics."""
+    total = sum(_zvv_match_counts.values())
+    if total == 0:
+        return
+    parts = []
+    for src in ['direct', 'chain', 'sbahn', 'sbahn_chain', 'sbahn_crossline', 'fallback']:
+        n = _zvv_match_counts.get(src, 0)
+        if n > 0:
+            parts.append(f"{src} {n:,} ({100 * n / total:.0f}%)")
+    print(f"  ZVV geometry [{label}]: {' | '.join(parts)}")
+    _zvv_match_counts.clear()
 
 
 def _detect_dominant_period(route_trip_ids, sid_active_sets):
@@ -548,7 +1262,7 @@ def _dedup_first_stops(first_stops, time_col):
     # Pass 1 — dedup on (time, stop_id) — already parent-station level
     df = df.drop_duplicates(subset=[time_col, 'stop_id'])
 
-    # Pass 3 — time-window dedup within (route_id, direction_id)
+    # Pass 2 — time-window dedup within (route_id, direction_id)
     if 'route_id' not in df.columns or 'direction_id' not in df.columns:
         return df
 
@@ -674,33 +1388,6 @@ def _compute_frequencies(trip_ids, windows=None, min_departures=None):
         'freq_offpeak_dep_hr':  _median_freq(op_deps,  time_col, min_departures=min_departures),
     }
 
-
-def _compute_directionality(trip_ids_dir0, trip_ids_dir1, windows=None):
-    """Return True if peak frequency differs significantly between directions.
-
-    Directional if, in either peak window:
-      - Both directions have measurable frequency and max/min ratio >= 1.5, OR
-      - One direction has measurable frequency and the other does not
-        (asymmetric service — the strongest form of directionality).
-    """
-    time_col = 'departure_time' if 'departure_time' in stop_times.columns else 'arrival_time'
-    if windows is not None:
-        peak_pairs = [(windows['am_start'], windows['am_end']),
-                      (windows['pm_start'], windows['pm_end'])]
-    else:
-        peak_pairs = [(AM_PEAK_START, AM_PEAK_END), (PM_PEAK_START, PM_PEAK_END)]
-    for ws, we in peak_pairs:
-        f0 = _median_freq(_get_window_departures(trip_ids_dir0, time_col, ws, we), time_col)
-        f1 = _median_freq(_get_window_departures(trip_ids_dir1, time_col, ws, we), time_col)
-        f0_ok = f0 is not None and f0 > 0
-        f1_ok = f1 is not None and f1 > 0
-        if f0_ok and f1_ok:
-            if max(f0, f1) / min(f0, f1) >= 1.5:
-                return True
-        elif f0_ok or f1_ok:
-            # One direction has meaningful service, the other doesn't
-            return True
-    return False
 
 
 def _hex_to_rgba(hex_colour, alpha=255):
@@ -872,7 +1559,7 @@ def _build_qgz(qgz_path, layers):
     layers_xml   = "\n".join(maplayer_blocks)
 
     qgs = f"""<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
-<qgis projectname="Network Build" version="3.28.0-Firenze">
+<qgis projectname="Network Build" version="3.44.3-Solothurn">
   <homePath path=""/>
   <title>Network Build</title>
   <autotransaction active="0"/>
@@ -903,18 +1590,146 @@ def _build_qgz(qgz_path, layers):
 
 
 # ---------------------------------------------------------------------------
+# Pipeline configuration — interactive choice interface
+# ---------------------------------------------------------------------------
+
+def _configure_pipeline():
+    """Prompt the user for pipeline configuration choices.
+
+    Returns a dict with keys:
+        build_modes      : 'all' | 'pt_feeder' | 'rail'
+        use_zvv_geometry : bool
+        write_fullday    : bool
+        write_peak       : bool
+        write_offpeak    : bool
+    """
+    print("=" * 70)
+    print("catchment_build_network.py — PIPELINE CONFIGURATION")
+    print("=" * 70)
+
+    # --- A. Mode Selection ---------------------------------------------------
+    print("\nA. MODE SELECTION")
+    print("   Which mode groups should be built?")
+    print("   1) All         - Build both PT-Feeder and Rail (default)")
+    print("   2) PT-Feeder   - Only PT-Feeder modes (tram, bus, metro, ship, funicular)")
+    print("   3) Rail        - Only Rail modes (S-Bahn, regional, inter-regional, long-distance)")
+
+    while True:
+        mode_choice = input("\n   Select mode (1-3) [1]: ").strip() or "1"
+        if mode_choice in ['1', '2', '3']:
+            break
+        print("   Invalid selection. Please enter 1, 2, or 3.")
+
+    mode_map = {'1': 'all', '2': 'pt_feeder', '3': 'rail'}
+    build_modes = mode_map[mode_choice]
+
+    # --- B. Time-Period Outputs ----------------------------------------------
+    print("\nB. TIME-PERIOD OUTPUTS")
+    print("   Which time-period GeoPackages & QGZ files should be written?")
+    print("   1) All              - Full-day + peak + off-peak (default)")
+    print("   2) Full-day only    - No peak/off-peak split")
+    print("   3) Peak + off-peak  - No full-day output")
+    print("   4) Peak only")
+    print("   5) Off-peak only")
+
+    while True:
+        period_choice = input("\n   Select time-period output (1-5) [1]: ").strip() or "1"
+        if period_choice in ['1', '2', '3', '4', '5']:
+            break
+        print("   Invalid selection. Please enter 1, 2, 3, 4, or 5.")
+
+    period_map = {
+        '1': (True,  True,  True),   # full-day, peak, off-peak
+        '2': (True,  False, False),
+        '3': (False, True,  True),
+        '4': (False, True,  False),
+        '5': (False, False, True),
+    }
+    write_fullday, write_peak, write_offpeak = period_map[period_choice]
+
+    # --- C. Geometry Source ---------------------------------------------------
+    print("\nC. GEOMETRY SOURCE")
+    print("   Which geometry should be used for line features?")
+    print("   1) ZVV Geometry - Use actual ZVV route alignments where available,")
+    print("                     straight-line fallback for unmatched segments (default)")
+    print("   2) Simplified   - Use straight-line stop-to-stop geometry only")
+
+    while True:
+        geom_choice = input("\n   Select geometry source (1-2) [1]: ").strip() or "1"
+        if geom_choice in ['1', '2']:
+            break
+        print("   Invalid selection. Please enter 1 or 2.")
+
+    use_zvv_geometry = (geom_choice == '1')
+
+    # --- Summary -------------------------------------------------------------
+    mode_labels = {'all': 'ALL', 'pt_feeder': 'PT-FEEDER ONLY', 'rail': 'RAIL ONLY'}
+    period_labels = {
+        '1': 'FULL-DAY + PEAK + OFF-PEAK',
+        '2': 'FULL-DAY ONLY',
+        '3': 'PEAK + OFF-PEAK (no full-day)',
+        '4': 'PEAK ONLY',
+        '5': 'OFF-PEAK ONLY',
+    }
+    geom_labels = {'1': 'ZVV GEOMETRY', '2': 'SIMPLIFIED (straight-line)'}
+
+    print("\n" + "-" * 70)
+    print(f"  Mode selection     : {mode_labels[build_modes]}")
+    print(f"  Time-period output : {period_labels[period_choice]}")
+    print(f"  Geometry source    : {geom_labels[geom_choice]}")
+    print("-" * 70)
+
+    return {
+        'build_modes':      build_modes,
+        'use_zvv_geometry': use_zvv_geometry,
+        'write_fullday':    write_fullday,
+        'write_peak':       write_peak,
+        'write_offpeak':    write_offpeak,
+    }
+
+
+# Run configuration and apply to module-level constants
+_pipeline_cfg   = _configure_pipeline()
+BUILD_MODES     = _pipeline_cfg['build_modes']
+USE_ZVV_GEOMETRY = _pipeline_cfg['use_zvv_geometry']
+WRITE_FULLDAY   = _pipeline_cfg['write_fullday']
+WRITE_PEAK      = _pipeline_cfg['write_peak']
+WRITE_OFFPEAK   = _pipeline_cfg['write_offpeak']
+
+
+# ---------------------------------------------------------------------------
 # Step 0 — setup
 # ---------------------------------------------------------------------------
 
 os.chdir(paths.MAIN)
 
-_pt_out_dir   = os.path.join(paths.FEEDER_LINES_DIR,   PT_FEEDER_OUTPUT_FOLDER)
-_rail_out_dir = os.path.join(paths.RAIL_PROCESSED_DIR,  RAIL_OUTPUT_FOLDER)
+_pt_out_dir       = os.path.join(paths.FEEDER_LINES_DIR,   PT_FEEDER_OUTPUT_FOLDER)
+_rail_out_dir     = os.path.join(paths.RAIL_PROCESSED_DIR,  RAIL_OUTPUT_FOLDER)
+_pt_peak_dir      = os.path.join(_pt_out_dir,   'Peak')
+_pt_offpeak_dir   = os.path.join(_pt_out_dir,   'Off_Peak')
+_rail_peak_dir    = os.path.join(_rail_out_dir,  'Peak')
+_rail_offpeak_dir = os.path.join(_rail_out_dir,  'Off_Peak')
 
-pt_stops_path  = os.path.join(_pt_out_dir,   PT_FEEDER_STOPS_FILE)
-pt_lines_path = os.path.join(_pt_out_dir,   PT_FEEDER_LINES_FILE)
-rl_stops_path  = os.path.join(_rail_out_dir,  RAIL_STOPS_FILE)
-rl_lines_path = os.path.join(_rail_out_dir,  RAIL_LINES_FILE)
+pt_stops_path     = os.path.join(_pt_out_dir,   PT_FEEDER_STOPS_FILE)
+pt_lines_path     = os.path.join(_pt_out_dir,   PT_FEEDER_LINES_FILE)
+pt_segments_path  = os.path.join(_pt_out_dir,   PT_FEEDER_SEGMENTS_FILE)
+rl_stops_path     = os.path.join(_rail_out_dir,  RAIL_STOPS_FILE)
+rl_lines_path     = os.path.join(_rail_out_dir,  RAIL_LINES_FILE)
+rl_segments_path  = os.path.join(_rail_out_dir,  RAIL_SEGMENTS_FILE)
+
+# Peak / off-peak paths — written into Peak / Off_Peak subdirectories
+pt_lines_peak_path       = os.path.join(_pt_peak_dir,      PT_FEEDER_LINES_PEAK_FILE)
+pt_lines_offpeak_path    = os.path.join(_pt_offpeak_dir,   PT_FEEDER_LINES_OFFPEAK_FILE)
+pt_segments_peak_path    = os.path.join(_pt_peak_dir,      PT_FEEDER_SEGMENTS_PEAK_FILE)
+pt_segments_offpeak_path = os.path.join(_pt_offpeak_dir,   PT_FEEDER_SEGMENTS_OFFPEAK_FILE)
+pt_stops_peak_path       = os.path.join(_pt_peak_dir,      PT_FEEDER_STOPS_PEAK_FILE)
+pt_stops_offpeak_path    = os.path.join(_pt_offpeak_dir,   PT_FEEDER_STOPS_OFFPEAK_FILE)
+rl_lines_peak_path       = os.path.join(_rail_peak_dir,    RAIL_LINES_PEAK_FILE)
+rl_lines_offpeak_path    = os.path.join(_rail_offpeak_dir, RAIL_LINES_OFFPEAK_FILE)
+rl_segments_peak_path    = os.path.join(_rail_peak_dir,    RAIL_SEGMENTS_PEAK_FILE)
+rl_segments_offpeak_path = os.path.join(_rail_offpeak_dir, RAIL_SEGMENTS_OFFPEAK_FILE)
+rl_stops_peak_path       = os.path.join(_rail_peak_dir,    RAIL_STOPS_PEAK_FILE)
+rl_stops_offpeak_path    = os.path.join(_rail_offpeak_dir, RAIL_STOPS_OFFPEAK_FILE)
 
 print("=" * 70)
 print("catchment_build_network.py")
@@ -928,6 +1743,12 @@ print("=" * 70)
 
 _ensure_dir(_pt_out_dir)
 _ensure_dir(_rail_out_dir)
+if WRITE_PEAK:
+    _ensure_dir(_pt_peak_dir)
+    _ensure_dir(_rail_peak_dir)
+if WRITE_OFFPEAK:
+    _ensure_dir(_pt_offpeak_dir)
+    _ensure_dir(_rail_offpeak_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -1147,6 +1968,20 @@ if _unmapped > 0:
     print(f"  WARNING: {_unmapped:,} stop_times rows with unmapped stop_id")
 else:
     print(f"  All stop_times stop_ids mapped to parent stations")
+
+
+# ---------------------------------------------------------------------------
+# Step 2b — load ZVV geometry (optional)
+# ---------------------------------------------------------------------------
+
+_zvv_geometry_available = False
+if USE_ZVV_GEOMETRY:
+    print("\n[2b] Loading ZVV route geometry ...")
+    _zvv_geometry_available = _load_zvv_geometry()
+    if not _zvv_geometry_available:
+        print("  ZVV geometry disabled — using straight-line geometry.")
+else:
+    print("\n[2b] ZVV geometry disabled (USE_ZVV_GEOMETRY = False)")
 
 
 # ---------------------------------------------------------------------------
@@ -1411,13 +2246,6 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
     line_records   = {}   # route_type_int → list of dicts
     stop_ids_by_type = {}  # route_type_int → set of stop_id
 
-    # Pre-compute directionality per route_id
-    dir_trip_ids = {}  # route_id → {direction_id: set of trip_ids}
-    for route_id, rg in ste.groupby('route_id'):
-        dir_trip_ids[route_id] = {}
-        for dir_id, dg in rg.groupby('direction_id'):
-            dir_trip_ids[route_id][dir_id] = set(dg['trip_id'].unique())
-
     for route_id, rt_group in ste.groupby('route_id'):
         route_row = routes_sub[routes_sub['route_id'] == route_id]
         if route_row.empty:
@@ -1427,33 +2255,54 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
         route_type_int = int(pd.to_numeric(route_row.get('route_type', None), errors='coerce')
                              ) if pd.notna(route_row.get('route_type', None)) else None
         mode_label = mode_label_map.get(route_type_int, 'Unknown') if route_type_int is not None else 'Unknown'
-        colour     = LINE_COLOURS.get(route_type_int, '#888888')
-        line_style = LINE_STYLE.get(route_type_int, 'solid')
         agency_id  = route_row.get('agency_id', None)
         short_name = route_row.get('route_short_name', None)
 
-        # --- Line-level acceptance gate ---
-        # Pool all weekday trips (both directions) and check minimum service.
-        _all_line_trips = set(rt_group['trip_id'].unique())
-        _weekday_line_trips = set(
-            trips_all.loc[
-                trips_all['trip_id'].isin(_all_line_trips) &
-                trips_all['service_id'].isin(_weekday_service_ids),
-                'trip_id'
-            ]
-        )
-        if _weekday_line_trips:
-            _time_col_gate = 'departure_time' if 'departure_time' in stop_times.columns else 'arrival_time'
-            # Check ≥ LINE_MIN_DEPARTURES_IN_WINDOW in at least one window
-            _n_am = len(_get_window_departures(_weekday_line_trips, _time_col_gate, AM_PEAK_START, AM_PEAK_END))
-            _n_pm = len(_get_window_departures(_weekday_line_trips, _time_col_gate, PM_PEAK_START, PM_PEAK_END))
-            _n_op = len(_get_window_departures(_weekday_line_trips, _time_col_gate, OFFPEAK_START, OFFPEAK_END))
-            if max(_n_am, _n_pm, _n_op) < LINE_MIN_DEPARTURES_IN_WINDOW:
-                continue  # too few departures in every window
+        # --- Phase 0: detect dominant calendar period for this route ---
+        # Computed once per route_id so both directions share the same period.
+        # Moved BEFORE the line gate so departure counts are not inflated by
+        # non-overlapping seasonal calendar splits.
+        all_route_trip_ids = set(rt_group['trip_id'].unique())
+        dominant_trip_ids = _detect_dominant_period(all_route_trip_ids, _sid_active_sets)
 
-            # Check hour spread (both directions pooled)
-            _gate_sub = stop_times[stop_times['trip_id'].isin(_weekday_line_trips)]
-            _gate_first = _gate_sub.loc[_gate_sub.groupby('trip_id')['stop_sequence_int'].idxmin(), _time_col_gate]
+        directions = sorted(rt_group['direction_id'].dropna().unique().tolist())
+        if not directions:
+            directions = ['0']
+
+        # --- Line-level acceptance gate (per direction) ---
+        # Each direction individually must have ≥ LINE_MIN_DEPARTURES_PER_DIR
+        # departures in at least one window AND ≥ LINE_MIN_HOUR_SPREAD distinct
+        # hours.  Uses static windows (adaptive detection runs later).
+        _time_col_gate = 'departure_time' if 'departure_time' in stop_times.columns else 'arrival_time'
+        _gate_pass = True
+        for _dir in directions:
+            _dir_trips = set(
+                rt_group.loc[rt_group['direction_id'] == _dir, 'trip_id']
+            ) & dominant_trip_ids
+            _weekday_dir_trips = set(
+                trips_all.loc[
+                    trips_all['trip_id'].isin(_dir_trips) &
+                    trips_all['service_id'].isin(_weekday_service_ids),
+                    'trip_id'
+                ]
+            )
+            if not _weekday_dir_trips:
+                _gate_pass = False
+                break
+
+            # Check ≥ LINE_MIN_DEPARTURES_PER_DIR in at least one window
+            _n_am = len(_get_window_departures(_weekday_dir_trips, _time_col_gate, AM_PEAK_START, AM_PEAK_END))
+            _n_pm = len(_get_window_departures(_weekday_dir_trips, _time_col_gate, PM_PEAK_START, PM_PEAK_END))
+            _n_op = len(_get_window_departures(_weekday_dir_trips, _time_col_gate, OFFPEAK_START, OFFPEAK_END))
+            if max(_n_am, _n_pm, _n_op) < LINE_MIN_DEPARTURES_PER_DIR:
+                _gate_pass = False
+                break
+
+            # Check hour spread per direction
+            _gate_sub = stop_times[stop_times['trip_id'].isin(_weekday_dir_trips)]
+            _gate_first = _gate_sub.loc[
+                _gate_sub.groupby('trip_id')['stop_sequence_int'].idxmin(), _time_col_gate
+            ]
             _gate_hours = set()
             for _t in _gate_first.dropna():
                 try:
@@ -1462,31 +2311,10 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
                 except Exception:
                     pass
             if len(_gate_hours) < LINE_MIN_HOUR_SPREAD:
-                continue  # departures not spread across enough hours
-
-            # Relaxed frequency threshold: allow 2-departure windows when the
-            # line has ≥ VARIANT_RELAXED_MIN_DEPARTURES in both AM and PM peaks
-            # (both directions pooled). This keeps marginal but genuine peak
-            # services that have sparse but symmetric peak departures.
-            _line_min_deps = VARIANT_MIN_DEPARTURES_IN_WINDOW  # default
-            if (_n_am >= VARIANT_RELAXED_MIN_DEPARTURES
-                    and _n_pm >= VARIANT_RELAXED_MIN_DEPARTURES):
-                _line_min_deps = VARIANT_RELAXED_MIN_DEPARTURES
-        else:
-            continue  # no weekday trips at all
-
-        d_trips = dir_trip_ids.get(route_id, {})
-        dir0_trips = d_trips.get('0', set()) | d_trips.get(0, set())
-        dir1_trips = d_trips.get('1', set()) | d_trips.get(1, set())
-
-        directions = sorted(rt_group['direction_id'].dropna().unique().tolist())
-        if not directions:
-            directions = ['0']
-
-        # --- Phase 0: detect dominant calendar period for this route ---
-        # Computed once per route_id so both directions share the same period.
-        all_route_trip_ids = set(rt_group['trip_id'].unique())
-        dominant_trip_ids = _detect_dominant_period(all_route_trip_ids, _sid_active_sets)
+                _gate_pass = False
+                break
+        if not _gate_pass:
+            continue
 
         # --- Phase 1: classify variants and apply short-working suppression ---
         def _departure_set(trip_ids_set):
@@ -1569,36 +2397,69 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
                 if suppress:
                     dir_variants[direction_id] = [v for k, v in enumerate(variants) if k not in suppress]
 
-        # --- Bidirectional enforcement (CV relaxation) ---
-        # If one direction has accepted variants but the opposite direction has
-        # none, re-run _classify_variants for the missing direction with
-        # relax_cv=True (only trip share + hour spread required).  This ensures
-        # lines are imported in both directions when at least one direction
-        # demonstrates regular service.
-        # Track which direction triggered and which was inserted so we can
-        # withdraw the insertion if the triggering direction is later dropped
-        # by frequency filters.
-        _bidir_trigger = None   # direction that originally passed
-        _bidir_inserted = None  # direction that was force-inserted
-        if len(directions) >= 2:
-            _has_0 = bool(dir_variants.get(directions[0]))
-            _has_1 = bool(dir_variants.get(directions[1]))
-            if _has_0 and not _has_1:
-                _dg_miss = rt_group[rt_group['direction_id'] == directions[1]].copy()
-                _relaxed = _classify_variants(_dg_miss, allowed_trip_ids=dominant_trip_ids,
-                                              relax_cv=True)
-                if _relaxed:
-                    dir_variants[directions[1]] = _relaxed
-                    _bidir_trigger = directions[0]
-                    _bidir_inserted = directions[1]
-            elif _has_1 and not _has_0:
-                _dg_miss = rt_group[rt_group['direction_id'] == directions[0]].copy()
-                _relaxed = _classify_variants(_dg_miss, allowed_trip_ids=dominant_trip_ids,
-                                              relax_cv=True)
-                if _relaxed:
-                    dir_variants[directions[0]] = _relaxed
-                    _bidir_trigger = directions[1]
-                    _bidir_inserted = directions[0]
+        # --- Variant symmetry enforcement (rail only) ---
+        # In Swiss rail the same service always runs the same stopping pattern
+        # in both directions (reversed).  After independent per-direction
+        # classification we cross-match variants by stop *set* so that both
+        # directions use the same structural variants.
+        # Bus/tram/ship/funicular routes commonly have minor directional
+        # asymmetries (one-way streets, loop terminals, directional-only
+        # stops), so symmetry enforcement is skipped for PT-feeder modes.
+        #
+        # Algorithm:
+        #   1. Build the union of accepted variant stop-sets across both
+        #      directions.
+        #   2. For each canonical stop-set, locate the matching variant in
+        #      each direction.  If a direction has no match, force-accept the
+        #      trip group whose stop-set matches (relax_cv=True).
+        #   3. Variant ranks are synchronised: rank 1 in dir 0 corresponds to
+        #      rank 1 in dir 1 (same stop-set).
+
+        if mode_class_tag == 'rail' and len(directions) >= 2:
+            d0, d1 = directions[0], directions[1]
+            vars_0 = dir_variants.get(d0, [])
+            vars_1 = dir_variants.get(d1, [])
+
+            # Index by frozenset of stop_ids
+            _set_to_var_0 = {frozenset(seq): (seq, tids) for seq, tids in vars_0}
+            _set_to_var_1 = {frozenset(seq): (seq, tids) for seq, tids in vars_1}
+
+            # Canonical stop-sets: union of both directions
+            _canonical_sets = list(dict.fromkeys(
+                list(_set_to_var_0.keys()) + list(_set_to_var_1.keys())
+            ))
+
+            # For each canonical set, ensure both directions have a variant.
+            # If one is missing, force-find it from the raw trips.
+            for _cset in _canonical_sets:
+                for _miss_dir, _, _miss_idx, _ in [
+                    (d0, d1, _set_to_var_0, _set_to_var_1),
+                    (d1, d0, _set_to_var_1, _set_to_var_0),
+                ]:
+                    if _cset in _miss_idx:
+                        continue  # already present
+                    # Try to force-accept from the missing direction's trips
+                    _dg_miss = rt_group[rt_group['direction_id'] == _miss_dir].copy()
+                    _all_miss = _classify_variants(_dg_miss,
+                                                   allowed_trip_ids=dominant_trip_ids,
+                                                   relax_cv=True)
+                    for _rseq, _rtids in _all_miss:
+                        if frozenset(_rseq) == _cset:
+                            _miss_idx[_cset] = (_rseq, _rtids)
+                            break
+
+            # Rebuild dir_variants with synchronised ranks
+            _synced_0, _synced_1 = [], []
+            for _cset in _canonical_sets:
+                _v0 = _set_to_var_0.get(_cset)
+                _v1 = _set_to_var_1.get(_cset)
+                if _v0 and _v1:
+                    _synced_0.append(_v0)
+                    _synced_1.append(_v1)
+                # If only one direction has the variant, drop it (no symmetric match)
+
+            dir_variants[d0] = _synced_0 if _synced_0 else []
+            dir_variants[d1] = _synced_1 if _synced_1 else []
 
         # --- Phase 2: detect adaptive peak windows per direction ---
         # Uses only the final accepted variants' trip_ids per direction.
@@ -1619,17 +2480,7 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
                       f"PM=[{w['pm_start']}–{w['pm_end']}) "
                       f"OP=[{w['op_start']}–{w['op_end']})")
 
-        # Directionality: compare dir 0 vs dir 1 (using detected windows)
-        freq_directional = False
-        if dir0_trips and dir1_trips:
-            freq_directional = _compute_directionality(
-                dir0_trips, dir1_trips,
-                windows=dir_windows.get(directions[0]) if directions else None
-            )
-
-        # Track how many features each direction emits (for bidir withdrawal)
-        _dir_feature_counts = {d: 0 for d in directions}
-
+        # --- Emit line features per direction / variant ---
         for direction_id in directions:
             variants = dir_variants.get(direction_id)
             if not variants:
@@ -1638,14 +2489,19 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
 
             for variant_rank, (seq, variant_trip_ids) in enumerate(variants, start=1):
                 # stop_ids are parent-station level — direct lookup in stop_coord
-                geom = _build_linestring(seq, stop_coord)
+                if _zvv_geometry_available:
+                    geom = _build_linestring_zvv(seq, stop_coord, short_name)
+                else:
+                    geom = None
+                if geom is None:
+                    geom = _build_linestring(seq, stop_coord)
                 if geom is None:
                     continue
 
                 circular        = _is_circular(seq)
                 _variant_windows = dir_windows.get(direction_id)
                 freqs           = _compute_frequencies(variant_trip_ids, windows=_variant_windows,
-                                                       min_departures=_line_min_deps)
+                                                       min_departures=VARIANT_FREQ_MIN_DEPARTURES)
 
                 # Drop variants with no computable frequency in any window
                 freq_vals = [freqs['freq_am_peak_dep_hr'], freqs['freq_pm_peak_dep_hr'], freqs['freq_offpeak_dep_hr']]
@@ -1658,6 +2514,14 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
                     continue
 
                 service_period  = _service_period_tag(variant_trip_ids, windows=_variant_windows)
+
+                # Total weekday departures across the full operational window
+                _time_col_td = 'departure_time' if 'departure_time' in stop_times.columns else 'arrival_time'
+                total_dep = (
+                    len(_get_window_departures(variant_trip_ids, _time_col_td, AM_PEAK_START, AM_PEAK_END))
+                    + len(_get_window_departures(variant_trip_ids, _time_col_td, OFFPEAK_START, OFFPEAK_END))
+                    + len(_get_window_departures(variant_trip_ids, _time_col_td, PM_PEAK_START, PM_PEAK_END))
+                )
 
                 # Trip share: weekday trips only (stop_times already filtered to 06:00–19:00)
                 all_dir_trip_ids = set(dir_group['trip_id'].unique())
@@ -1700,33 +2564,97 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
                     'freq_am_peak_dep_hr':   freqs['freq_am_peak_dep_hr'],
                     'freq_pm_peak_dep_hr':   freqs['freq_pm_peak_dep_hr'],
                     'freq_offpeak_dep_hr':   freqs['freq_offpeak_dep_hr'],
-                    'freq_directional':      freq_directional,
-                    'colour':                colour,
-                    'line_style':            line_style,
+                    'total_dep':             total_dep,
+                    'freq_directional':      False,  # placeholder — computed below
                     'geometry':              geom,
+                    '_stop_sequence':        seq,
+                    '_variant_trip_ids':     variant_trip_ids,
                 })
-                _dir_feature_counts[direction_id] += 1
 
                 if circular:
                     break
 
-        # --- Bidirectional withdrawal ---
-        # If bidirectional enforcement inserted a direction but the triggering
-        # direction was subsequently dropped (e.g. by frequency filters),
-        # remove the inserted direction's features to avoid one-direction orphans.
-        if _bidir_inserted is not None:
-            trigger_emitted  = _dir_feature_counts.get(_bidir_trigger, 0)
-            inserted_emitted = _dir_feature_counts.get(_bidir_inserted, 0)
-            if trigger_emitted == 0 and inserted_emitted > 0:
-                if route_type_int in line_records:
-                    line_records[route_type_int] = [
-                        r for r in line_records[route_type_int]
-                        if not (r['route_id'] == route_id and r['direction_id'] == _bidir_inserted)
-                    ]
-                # Also remove stop_ids contributed by the inserted direction's variants
-                if route_type_int in stop_ids_by_type:
-                    for seq, _ in dir_variants.get(_bidir_inserted, []):
-                        stop_ids_by_type[route_type_int] -= set(seq)
+    # --- Fix 4: Recompute directionality from accepted variant trips ---
+    # For each route_id, collect the emitted variant trip_ids per direction
+    # and compute directionality using per-direction adaptive windows.
+    _route_records = defaultdict(list)  # route_id → list of record dicts
+    for rt, records in line_records.items():
+        for rec in records:
+            _route_records[rec['route_id']].append(rec)
+
+    for route_id, recs in _route_records.items():
+        # Collect accepted trip_ids and windows per direction
+        _dir_trip_pools = defaultdict(set)  # direction_id → set of trip_ids
+        for rec in recs:
+            _dir_trip_pools[rec['direction_id']] |= rec['_variant_trip_ids']
+
+        _dirs = sorted(_dir_trip_pools.keys())
+        if len(_dirs) >= 2:
+            # Use per-direction windows: detect from each direction's own trips
+            _w0 = _detect_peak_windows(_dir_trip_pools[_dirs[0]])
+            _w1 = _detect_peak_windows(_dir_trip_pools[_dirs[1]])
+            # Directionality: check both peak windows using each direction's
+            # own adaptive windows for its own frequency computation.
+            _time_col_dir = 'departure_time' if 'departure_time' in stop_times.columns else 'arrival_time'
+            _directional = False
+            for _w in (_w0, _w1):
+                if _w is None:
+                    continue
+                _peak_pairs = [(_w['am_start'], _w['am_end']),
+                               (_w['pm_start'], _w['pm_end'])]
+                for _ws, _we in _peak_pairs:
+                    _f0 = _median_freq(
+                        _get_window_departures(_dir_trip_pools[_dirs[0]], _time_col_dir, _ws, _we),
+                        _time_col_dir)
+                    _f1 = _median_freq(
+                        _get_window_departures(_dir_trip_pools[_dirs[1]], _time_col_dir, _ws, _we),
+                        _time_col_dir)
+                    _f0_ok = _f0 is not None and _f0 > 0
+                    _f1_ok = _f1 is not None and _f1 > 0
+                    if _f0_ok and _f1_ok:
+                        if max(_f0, _f1) / min(_f0, _f1) >= 1.5:
+                            _directional = True
+                            break
+                    elif _f0_ok or _f1_ok:
+                        _directional = True
+                        break
+                if _directional:
+                    break
+            for rec in recs:
+                rec['freq_directional'] = _directional
+        else:
+            # Single direction — not directional (will be dropped by Fix 1)
+            for rec in recs:
+                rec['freq_directional'] = False
+
+    # --- Fix 1: Drop routes present in only one direction ---
+    # Swiss PT services always operate bidirectionally.  Routes with only
+    # one direction surviving indicate geographic filter artefacts or
+    # incomplete GTFS data; they are removed entirely.
+    _single_dir_dropped = 0
+    for rt in list(line_records.keys()):
+        _route_dirs = defaultdict(set)  # route_id → set of direction_ids
+        for rec in line_records[rt]:
+            _route_dirs[rec['route_id']].add(rec['direction_id'])
+        _drop_routes = {rid for rid, dirs in _route_dirs.items() if len(dirs) < 2}
+        if _drop_routes:
+            _before = len(line_records[rt])
+            line_records[rt] = [
+                r for r in line_records[rt] if r['route_id'] not in _drop_routes
+            ]
+            _n_dropped = _before - len(line_records[rt])
+            _single_dir_dropped += _n_dropped
+            # Also remove stop_ids contributed exclusively by dropped routes
+            if rt in stop_ids_by_type:
+                _remaining_stops = set()
+                for r in line_records[rt]:
+                    _remaining_stops.update(r['_stop_sequence'])
+                stop_ids_by_type[rt] = _remaining_stops
+    if _single_dir_dropped:
+        print(f"    Dropped {_single_dir_dropped} single-direction features")
+
+    # Remove route_types that became empty after filtering
+    line_records = {rt: recs for rt, recs in line_records.items() if recs}
 
     # Build lines GeoDataFrames per route_type
     lines_by_type = {
@@ -1739,7 +2667,161 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
         stop_ids_by_type, mode_class_tag, mode_label_map
     )
 
+    if _zvv_geometry_available:
+        _print_zvv_match_summary(f'{mode_class_tag} lines')
+
     return stops_by_type, lines_by_type
+
+
+def _round_half_min(minutes):
+    """Round a value in minutes to the nearest 0.5 (i.e. 30-second precision)."""
+    if minutes is None:
+        return None
+    return round(minutes * 2) / 2
+
+
+def _compute_segment_travel_times(variant_trip_ids, seq, time_col='departure_time'):
+    """Compute median travel time and dwell time per consecutive stop pair.
+
+    Returns a list of dicts (one per segment) with keys:
+        travel_time_min : float  (median, rounded to .0 / .5)
+        InVehWait_min   : float  (dwell at from_stop, rounded to .0 / .5)
+    """
+    # Get stop_times for this variant's trips, sorted by trip then sequence
+    sub = stop_times[stop_times['trip_id'].isin(variant_trip_ids)].copy()
+    sub = sub[sub['stop_id'].isin(seq)]
+    sub = sub.sort_values(['trip_id', 'stop_sequence_int'])
+
+    # Parse times to minutes
+    arr_col = 'arrival_time' if 'arrival_time' in sub.columns else time_col
+    dep_col = 'departure_time' if 'departure_time' in sub.columns else time_col
+    sub['_arr_min'] = sub[arr_col].apply(_to_minutes_str)
+    sub['_dep_min'] = sub[dep_col].apply(_to_minutes_str)
+
+    # Build per-trip ordered records: stop_id → (arrival_min, departure_min)
+    trip_stop_times = {}  # trip_id → {stop_id → (arr, dep)}
+    for _, row in sub.iterrows():
+        tid = row['trip_id']
+        sid = row['stop_id']
+        trip_stop_times.setdefault(tid, {})[sid] = (row['_arr_min'], row['_dep_min'])
+
+    results = []
+    for i in range(len(seq) - 1):
+        from_sid = seq[i]
+        to_sid   = seq[i + 1]
+
+        travel_times = []
+        dwell_times  = []
+        for tid, st_map in trip_stop_times.items():
+            from_rec = st_map.get(from_sid)
+            to_rec   = st_map.get(to_sid)
+            if from_rec is None or to_rec is None:
+                continue
+            from_dep = from_rec[1]  # departure at from_stop
+            to_arr   = to_rec[0]    # arrival at to_stop
+            from_arr = from_rec[0]  # arrival at from_stop
+            from_dep_val = from_rec[1]
+
+            if from_dep is not None and to_arr is not None:
+                tt = to_arr - from_dep
+                if tt >= 0:
+                    travel_times.append(tt)
+            if from_arr is not None and from_dep_val is not None:
+                dw = from_dep_val - from_arr
+                if dw >= 0:
+                    dwell_times.append(dw)
+
+        if travel_times:
+            travel_times.sort()
+            median_tt = travel_times[len(travel_times) // 2]
+        else:
+            median_tt = None
+
+        if dwell_times:
+            dwell_times.sort()
+            median_dw = dwell_times[len(dwell_times) // 2]
+        else:
+            median_dw = None
+
+        results.append({
+            'travel_time_min': _round_half_min(median_tt),
+            'InVehWait_min':   _round_half_min(median_dw),
+        })
+
+    return results
+
+
+def build_segments(lines_by_type, mode_class_tag):
+    """Build segment GeoDataFrames from accepted line variants.
+
+    For each line feature (variant), generates one segment per consecutive
+    stop pair. Each segment carries the parent variant's metadata plus
+    travel time and dwell time.
+
+    Returns dict: route_type_int → GeoDataFrame of segments.
+    """
+    time_col = 'departure_time' if 'departure_time' in stop_times.columns else 'arrival_time'
+    segment_records = {}  # route_type_int → list of dicts
+
+    for rt, gdf in lines_by_type.items():
+        if gdf.empty:
+            continue
+        for _, row in gdf.iterrows():
+            seq       = row['_stop_sequence']
+            trip_ids  = row['_variant_trip_ids']
+            if seq is None or len(seq) < 2:
+                continue
+
+            seg_times = _compute_segment_travel_times(trip_ids, seq, time_col)
+
+            for i in range(len(seq) - 1):
+                from_sid = seq[i]
+                to_sid   = seq[i + 1]
+
+                from_pt = stop_coord.get(from_sid)
+                to_pt   = stop_coord.get(to_sid)
+                if from_pt is None or to_pt is None:
+                    continue
+
+                if _zvv_geometry_available:
+                    zvv_geom = _get_zvv_segment_geom(
+                        from_sid, to_sid, row['line_short_name'])
+                    geom = zvv_geom if zvv_geom is not None else \
+                        LineString([(from_pt.x, from_pt.y), (to_pt.x, to_pt.y)])
+                else:
+                    geom = LineString([(from_pt.x, from_pt.y), (to_pt.x, to_pt.y)])
+
+                seg_rec = {
+                    'route_id':         row['route_id'],
+                    'direction_id':     row['direction_id'],
+                    'variant_rank':     row['variant_rank'],
+                    'line_short_name':  row['line_short_name'],
+                    'mode_label':       row['mode_label'],
+                    'mode_class':       mode_class_tag,
+                    'from_stop_id':     from_sid,
+                    'to_stop_id':       to_sid,
+                    'from_stop_name':   stop_name.get(from_sid, ''),
+                    'to_stop_name':     stop_name.get(to_sid, ''),
+                    'from_stop_E':      from_pt.x,
+                    'from_stop_N':      from_pt.y,
+                    'to_stop_E':        to_pt.x,
+                    'to_stop_N':        to_pt.y,
+                    'travel_time_min':  seg_times[i]['travel_time_min'],
+                    'InVehWait_min':    seg_times[i]['InVehWait_min'],
+                    'service_period':   row['service_period'],
+                    'geometry':         geom,
+                }
+                segment_records.setdefault(rt, []).append(seg_rec)
+
+    segments_by_type = {
+        rt: gpd.GeoDataFrame(records, crs=CODEBASE_CRS)
+        for rt, records in segment_records.items()
+    }
+
+    if _zvv_geometry_available:
+        _print_zvv_match_summary(f'{mode_class_tag} segments')
+
+    return segments_by_type
 
 
 def _build_stops_by_type(stop_ids_by_type, mode_class_tag, mode_label_map):
@@ -1772,8 +2854,6 @@ def _build_stops_by_type(stop_ids_by_type, mode_class_tag, mode_label_map):
     stops_sub = stops_sub.rename(columns={'parent_numeric_id': 'stop_id'})
 
     if mode_class_tag == 'rail':
-        stops_sub['fill_colour']    = RAIL_STOP_FILL
-        stops_sub['outline_colour'] = RAIL_STOP_OUTLINE
         # Single layer: use the first (and typically only) route_type key
         rt = next(iter(stop_ids_by_type)) if stop_ids_by_type else 109
         return {rt: stops_sub.reset_index(drop=True)}
@@ -1787,10 +2867,6 @@ def _build_stops_by_type(stop_ids_by_type, mode_class_tag, mode_label_map):
         return next(iter(served)) if served else None
 
     stops_sub['dominant_rt'] = stops_sub['stop_id'].map(_dominant)
-    stops_sub['fill_colour']    = stops_sub['dominant_rt'].map(
-        lambda rt: LINE_COLOURS.get(rt, '#888888')
-    )
-    stops_sub['outline_colour'] = '#000000'
 
     stops_by_type = {}
     for rt in stops_sub['dominant_rt'].dropna().unique():
@@ -1807,26 +2883,32 @@ def _build_stops_by_type(stop_ids_by_type, mode_class_tag, mode_label_map):
 # Step 7 — build PT-Feeder outputs
 # ---------------------------------------------------------------------------
 
-print("\n[7] Building PT-Feeder stops and lines ...")
+print("\n[7] Building PT-Feeder stops, lines, and segments ...")
 pt_stops_by_type, pt_lines_by_type = build_outputs(pt_route_ids, PT_FEEDER_LINE_TYPES, 'pt_feeder')
+pt_segments_by_type = build_segments(pt_lines_by_type, 'pt_feeder')
 
-n_pt_stops  = sum(len(v) for v in pt_stops_by_type.values())
-n_pt_lines = sum(len(v) for v in pt_lines_by_type.values())
-print(f"  PT-Feeder stops  : {n_pt_stops:,} across {len(pt_stops_by_type)} mode layer(s)")
-print(f"  PT-Feeder lines  : {n_pt_lines:,} features across {len(pt_lines_by_type)} mode layer(s)")
+n_pt_stops    = sum(len(v) for v in pt_stops_by_type.values())
+n_pt_lines    = sum(len(v) for v in pt_lines_by_type.values())
+n_pt_segments = sum(len(v) for v in pt_segments_by_type.values())
+print(f"  PT-Feeder stops    : {n_pt_stops:,} across {len(pt_stops_by_type)} mode layer(s)")
+print(f"  PT-Feeder lines    : {n_pt_lines:,} features across {len(pt_lines_by_type)} mode layer(s)")
+print(f"  PT-Feeder segments : {n_pt_segments:,} features across {len(pt_segments_by_type)} mode layer(s)")
 
 
 # ---------------------------------------------------------------------------
 # Step 8 — build Rail outputs
 # ---------------------------------------------------------------------------
 
-print("\n[8] Building Rail stops and lines ...")
+print("\n[8] Building Rail stops, lines, and segments ...")
 rail_stops_by_type, rail_lines_by_type = build_outputs(rail_route_ids, RAIL_LINE_TYPES, 'rail')
+rail_segments_by_type = build_segments(rail_lines_by_type, 'rail')
 
-n_rail_stops  = sum(len(v) for v in rail_stops_by_type.values())
-n_rail_lines = sum(len(v) for v in rail_lines_by_type.values())
-print(f"  Rail stops  : {n_rail_stops:,} across {len(rail_stops_by_type)} mode layer(s)")
-print(f"  Rail lines  : {n_rail_lines:,} features across {len(rail_lines_by_type)} mode layer(s)")
+n_rail_stops    = sum(len(v) for v in rail_stops_by_type.values())
+n_rail_lines    = sum(len(v) for v in rail_lines_by_type.values())
+n_rail_segments = sum(len(v) for v in rail_segments_by_type.values())
+print(f"  Rail stops    : {n_rail_stops:,} across {len(rail_stops_by_type)} mode layer(s)")
+print(f"  Rail lines    : {n_rail_lines:,} features across {len(rail_lines_by_type)} mode layer(s)")
+print(f"  Rail segments : {n_rail_segments:,} features across {len(rail_segments_by_type)} mode layer(s)")
 
 
 # ---------------------------------------------------------------------------
@@ -1837,15 +2919,19 @@ print("\n[9] Writing GeoPackages ...")
 
 
 def _write_layers(by_type, gpkg_path):
-    """Write each route_type as a named layer into a single GeoPackage."""
+    """Write each route_type as a named layer into a single GeoPackage.
+    Internal columns (prefixed with '_') are stripped before writing."""
     written = []
     for rt, gdf in by_type.items():
         if gdf.empty:
             continue
         layer_name = LAYER_NAMES.get(rt, f'type_{rt}')
-        gdf.to_file(gpkg_path, layer=layer_name, driver='GPKG')
+        # Strip internal columns before writing
+        internal_cols = [c for c in gdf.columns if c.startswith('_')]
+        gdf_out = gdf.drop(columns=internal_cols, errors='ignore')
+        gdf_out.to_file(gpkg_path, layer=layer_name, driver='GPKG')
         written.append(layer_name)
-        print(f"    Layer '{layer_name}': {len(gdf):,} features")
+        print(f"    Layer '{layer_name}': {len(gdf_out):,} features")
 
     if written:
         print(f"  Wrote {gpkg_path} ({len(written)} layer(s))")
@@ -1854,49 +2940,166 @@ def _write_layers(by_type, gpkg_path):
     return written
 
 
-print(f"  PT-Feeder lines  → {pt_lines_path}")
-_write_layers(pt_lines_by_type, pt_lines_path)
+if WRITE_FULLDAY:
+    print(f"  PT-Feeder lines    → {pt_lines_path}")
+    _write_layers(pt_lines_by_type, pt_lines_path)
 
-print(f"  PT-Feeder stops  → {pt_stops_path}")
-_write_layers(pt_stops_by_type,  pt_stops_path)
+    print(f"  PT-Feeder stops    → {pt_stops_path}")
+    _write_layers(pt_stops_by_type,  pt_stops_path)
 
-print(f"  Rail lines   → {rl_lines_path}")
-_write_layers(rail_lines_by_type, rl_lines_path)
+    print(f"  PT-Feeder segments → {pt_segments_path}")
+    _write_layers(pt_segments_by_type, pt_segments_path)
 
-print(f"  Rail stops  → {rl_stops_path}")
-_write_layers(rail_stops_by_type,  rl_stops_path)
+    print(f"  Rail lines    → {rl_lines_path}")
+    _write_layers(rail_lines_by_type, rl_lines_path)
+
+    print(f"  Rail stops    → {rl_stops_path}")
+    _write_layers(rail_stops_by_type,  rl_stops_path)
+
+    print(f"  Rail segments → {rl_segments_path}")
+    _write_layers(rail_segments_by_type, rl_segments_path)
+else:
+    print("  Skipping full-day GeoPackage writes (not selected)")
 
 
 # ---------------------------------------------------------------------------
-# Step 9b — write QGIS project file (.qgz) with styled layers
+# Step 9a — peak / off-peak filtering and writing
 # ---------------------------------------------------------------------------
 
-print("\n[9b] Writing QGIS project file ...")
+print("\n[9a] Building peak / off-peak filtered networks ...")
 
-_qgz_layers = []  # layer descriptors for _build_qgz
-_layer_counter = 0
 
-def _add_line_layers(by_type, gpkg_filename, label_map):
-    """Register line layers for the QGZ project."""
-    global _layer_counter
+def _filter_lines_by_period(lines_by_type, periods):
+    """Filter line GeoDataFrames to variants matching given service_period values."""
+    result = {}
+    for rt, gdf in lines_by_type.items():
+        if gdf.empty:
+            continue
+        filtered = gdf[gdf['service_period'].isin(periods)].copy()
+        if not filtered.empty:
+            result[rt] = filtered
+    return result
+
+
+def _filter_segments_by_period(segments_by_type, periods):
+    """Filter segment GeoDataFrames to segments matching given service_period values."""
+    result = {}
+    for rt, gdf in segments_by_type.items():
+        if gdf.empty:
+            continue
+        filtered = gdf[gdf['service_period'].isin(periods)].copy()
+        if not filtered.empty:
+            result[rt] = filtered
+    return result
+
+
+def _filter_stops_for_lines(lines_by_type, stops_by_type):
+    """Filter stops to only those referenced by the given line variants."""
+    # Collect all stop_ids from retained line features
+    all_stop_ids = set()
+    for rt, gdf in lines_by_type.items():
+        if gdf.empty or '_stop_sequence' not in gdf.columns:
+            continue
+        for seq in gdf['_stop_sequence']:
+            if seq is not None:
+                all_stop_ids.update(seq)
+
+    result = {}
+    for rt, gdf in stops_by_type.items():
+        if gdf.empty:
+            continue
+        filtered = gdf[gdf['stop_id'].isin(all_stop_ids)].copy()
+        if not filtered.empty:
+            result[rt] = filtered
+    return result
+
+
+PEAK_PERIODS    = {'peak_only', 'all_day'}
+OFFPEAK_PERIODS = {'offpeak_only', 'all_day'}
+
+# Initialise filtered dicts to empty — populated below only when requested.
+pt_lines_peak = pt_lines_offpeak = {}
+pt_segs_peak = pt_segs_offpeak = {}
+pt_stops_peak = pt_stops_offpeak = {}
+rl_lines_peak = rl_lines_offpeak = {}
+rl_segs_peak = rl_segs_offpeak = {}
+rl_stops_peak = rl_stops_offpeak = {}
+
+if WRITE_PEAK:
+    pt_lines_peak     = _filter_lines_by_period(pt_lines_by_type, PEAK_PERIODS)
+    pt_segs_peak      = _filter_segments_by_period(pt_segments_by_type, PEAK_PERIODS)
+    pt_stops_peak     = _filter_stops_for_lines(pt_lines_peak,    pt_stops_by_type)
+    rl_lines_peak     = _filter_lines_by_period(rail_lines_by_type, PEAK_PERIODS)
+    rl_segs_peak      = _filter_segments_by_period(rail_segments_by_type, PEAK_PERIODS)
+    rl_stops_peak     = _filter_stops_for_lines(rl_lines_peak,    rail_stops_by_type)
+
+if WRITE_OFFPEAK:
+    pt_lines_offpeak  = _filter_lines_by_period(pt_lines_by_type, OFFPEAK_PERIODS)
+    pt_segs_offpeak   = _filter_segments_by_period(pt_segments_by_type, OFFPEAK_PERIODS)
+    pt_stops_offpeak  = _filter_stops_for_lines(pt_lines_offpeak, pt_stops_by_type)
+    rl_lines_offpeak  = _filter_lines_by_period(rail_lines_by_type, OFFPEAK_PERIODS)
+    rl_segs_offpeak   = _filter_segments_by_period(rail_segments_by_type, OFFPEAK_PERIODS)
+    rl_stops_offpeak  = _filter_stops_for_lines(rl_lines_offpeak, rail_stops_by_type)
+
+# Write peak / off-peak GeoPackages
+_period_write_list = []
+if WRITE_PEAK:
+    _period_write_list += [
+        ('PT-Feeder lines peak',       pt_lines_peak,     pt_lines_peak_path),
+        ('PT-Feeder segments peak',    pt_segs_peak,      pt_segments_peak_path),
+        ('PT-Feeder stops peak',       pt_stops_peak,     pt_stops_peak_path),
+        ('Rail lines peak',            rl_lines_peak,     rl_lines_peak_path),
+        ('Rail segments peak',         rl_segs_peak,      rl_segments_peak_path),
+        ('Rail stops peak',            rl_stops_peak,     rl_stops_peak_path),
+    ]
+if WRITE_OFFPEAK:
+    _period_write_list += [
+        ('PT-Feeder lines offpeak',    pt_lines_offpeak,  pt_lines_offpeak_path),
+        ('PT-Feeder segments offpeak', pt_segs_offpeak,   pt_segments_offpeak_path),
+        ('PT-Feeder stops offpeak',    pt_stops_offpeak,  pt_stops_offpeak_path),
+        ('Rail lines offpeak',         rl_lines_offpeak,  rl_lines_offpeak_path),
+        ('Rail segments offpeak',      rl_segs_offpeak,   rl_segments_offpeak_path),
+        ('Rail stops offpeak',         rl_stops_offpeak,  rl_stops_offpeak_path),
+    ]
+
+if _period_write_list:
+    for label, data, path in _period_write_list:
+        print(f"  {label} → {path}")
+        _write_layers(data, path)
+else:
+    print("  Skipping peak/off-peak GeoPackage writes (not selected)")
+
+
+# ---------------------------------------------------------------------------
+# Step 9b — write QGIS project files (.qgz) with styled layers
+# ---------------------------------------------------------------------------
+
+print("\n[9b] Writing QGIS project files ...")
+
+def _collect_line_layers(by_type, gpkg_filename, label_map, suffix='Lines'):
+    """Collect line layer descriptors for a QGZ project."""
+    layers = []
+    counter = 0
     for rt, gdf in sorted(by_type.items()):
         if gdf.empty:
             continue
         layer_name = LAYER_NAMES.get(rt, f'type_{rt}')
-        _layer_counter += 1
-        _qgz_layers.append({
-            'layer_id':      f'{layer_name}_lines_{_layer_counter:04d}',
+        counter += 1
+        layers.append({
+            'layer_id':      f'{layer_name}_lines_{counter:04d}',
             'gpkg_relpath':  f'./{gpkg_filename}',
             'layer_name':    layer_name,
-            'display_name':  f'{label_map.get(rt, layer_name)} Lines',
+            'display_name':  f'{label_map.get(rt, layer_name)} {suffix}',
             'geom_type':     'line',
             'colour':        LINE_COLOURS.get(rt, '#888888'),
             'line_style':    LINE_STYLE.get(rt, 'solid'),
         })
+    return layers
 
-def _add_stop_layers(by_type, gpkg_filename, label_map, mode_class_tag):
-    """Register stop layers for the QGZ project."""
-    global _layer_counter
+def _collect_stop_layers(by_type, gpkg_filename, label_map, mode_class_tag):
+    """Collect stop layer descriptors for a QGZ project."""
+    layers = []
+    counter = 0
     for rt, gdf in sorted(by_type.items()):
         if gdf.empty:
             continue
@@ -1907,9 +3110,9 @@ def _add_stop_layers(by_type, gpkg_filename, label_map, mode_class_tag):
         else:
             fill = LINE_COLOURS.get(rt, '#888888')
             outline = '#000000'
-        _layer_counter += 1
-        _qgz_layers.append({
-            'layer_id':        f'{layer_name}_stops_{_layer_counter:04d}',
+        counter += 1
+        layers.append({
+            'layer_id':        f'{layer_name}_stops_{counter:04d}',
             'gpkg_relpath':    f'./{gpkg_filename}',
             'layer_name':      layer_name,
             'display_name':    f'{label_map.get(rt, layer_name)} Stops',
@@ -1917,34 +3120,92 @@ def _add_stop_layers(by_type, gpkg_filename, label_map, mode_class_tag):
             'fill_colour':     fill,
             'outline_colour':  outline,
         })
+    return layers
 
-# PT-Feeder QGZ: stops below, lines on top
-_pt_qgz_layers = []
-_add_stop_layers(pt_stops_by_type,    PT_FEEDER_STOPS_FILE,   PT_FEEDER_LINE_TYPES,  'pt_feeder')
-_pt_qgz_layers = list(_qgz_layers)  # snapshot
-_qgz_layers.clear(); _layer_counter = 0
+def _write_qgz(out_dir, qgz_filename, layer_list):
+    """Build and write a QGZ file from a list of layer descriptors."""
+    qgz_path = os.path.join(out_dir, qgz_filename)
+    _build_qgz(qgz_path, layer_list)
+    print(f"  Wrote {qgz_path} ({len(layer_list)} layer(s))")
+    return qgz_path
 
-_add_line_layers(pt_lines_by_type,  PT_FEEDER_LINES_FILE,  PT_FEEDER_LINE_TYPES)
-_pt_qgz_layers += list(_qgz_layers)
-_qgz_layers.clear(); _layer_counter = 0
+def _build_lines_qgz(out_dir, qgz_filename, lines_by_type, lines_gpkg,
+                      stops_by_type, stops_gpkg, label_map, mode_class_tag):
+    """Build a QGZ with stops below and lines on top."""
+    layers  = _collect_stop_layers(stops_by_type, stops_gpkg, label_map, mode_class_tag)
+    layers += _collect_line_layers(lines_by_type, lines_gpkg, label_map, suffix='Lines')
+    return _write_qgz(out_dir, qgz_filename, layers)
 
-_qgz_path_pt = os.path.join(_pt_out_dir, PT_FEEDER_PROJECT_FILE)
-_build_qgz(_qgz_path_pt, _pt_qgz_layers)
-print(f"  Wrote {_qgz_path_pt} ({len(_pt_qgz_layers)} layer(s))")
+def _build_segments_qgz(out_dir, qgz_filename, segs_by_type, segs_gpkg,
+                         stops_by_type, stops_gpkg, label_map, mode_class_tag):
+    """Build a QGZ with stops below and segments on top."""
+    layers  = _collect_stop_layers(stops_by_type, stops_gpkg, label_map, mode_class_tag)
+    layers += _collect_line_layers(segs_by_type, segs_gpkg, label_map, suffix='Segments')
+    return _write_qgz(out_dir, qgz_filename, layers)
 
-# Rail QGZ: stops below, lines on top
-_rl_qgz_layers = []
-_add_stop_layers(rail_stops_by_type,  RAIL_STOPS_FILE,        RAIL_LINE_TYPES,       'rail')
-_rl_qgz_layers = list(_qgz_layers)
-_qgz_layers.clear(); _layer_counter = 0
+# --- PT-Feeder QGZ files ---
+if WRITE_FULLDAY:
+    _build_lines_qgz(_pt_out_dir, PT_FEEDER_PROJECT_FILE,
+                      pt_lines_by_type, PT_FEEDER_LINES_FILE,
+                      pt_stops_by_type, PT_FEEDER_STOPS_FILE,
+                      PT_FEEDER_LINE_TYPES, 'pt_feeder')
 
-_add_line_layers(rail_lines_by_type, RAIL_LINES_FILE,      RAIL_LINE_TYPES)
-_rl_qgz_layers += list(_qgz_layers)
-_qgz_layers.clear(); _layer_counter = 0
+    _build_segments_qgz(_pt_out_dir, PT_FEEDER_SEGMENTS_PROJECT_FILE,
+                         pt_segments_by_type, PT_FEEDER_SEGMENTS_FILE,
+                         pt_stops_by_type, PT_FEEDER_STOPS_FILE,
+                         PT_FEEDER_LINE_TYPES, 'pt_feeder')
 
-_qgz_path_rl = os.path.join(_rail_out_dir, RAIL_PROJECT_FILE)
-_build_qgz(_qgz_path_rl, _rl_qgz_layers)
-print(f"  Wrote {_qgz_path_rl} ({len(_rl_qgz_layers)} layer(s))")
+# PT-Feeder peak / off-peak QGZ
+if WRITE_PEAK:
+    _build_lines_qgz(_pt_peak_dir, PT_FEEDER_LINES_PEAK_PROJECT_FILE,
+                      pt_lines_peak, PT_FEEDER_LINES_PEAK_FILE,
+                      pt_stops_peak, PT_FEEDER_STOPS_PEAK_FILE,
+                      PT_FEEDER_LINE_TYPES, 'pt_feeder')
+    _build_segments_qgz(_pt_peak_dir, PT_FEEDER_SEGMENTS_PEAK_PROJECT_FILE,
+                         pt_segs_peak, PT_FEEDER_SEGMENTS_PEAK_FILE,
+                         pt_stops_peak, PT_FEEDER_STOPS_PEAK_FILE,
+                         PT_FEEDER_LINE_TYPES, 'pt_feeder')
+if WRITE_OFFPEAK:
+    _build_lines_qgz(_pt_offpeak_dir, PT_FEEDER_LINES_OFFPEAK_PROJECT_FILE,
+                      pt_lines_offpeak, PT_FEEDER_LINES_OFFPEAK_FILE,
+                      pt_stops_offpeak, PT_FEEDER_STOPS_OFFPEAK_FILE,
+                      PT_FEEDER_LINE_TYPES, 'pt_feeder')
+    _build_segments_qgz(_pt_offpeak_dir, PT_FEEDER_SEGMENTS_OFFPEAK_PROJECT_FILE,
+                         pt_segs_offpeak, PT_FEEDER_SEGMENTS_OFFPEAK_FILE,
+                         pt_stops_offpeak, PT_FEEDER_STOPS_OFFPEAK_FILE,
+                         PT_FEEDER_LINE_TYPES, 'pt_feeder')
+
+# --- Rail QGZ files ---
+if WRITE_FULLDAY:
+    _build_lines_qgz(_rail_out_dir, RAIL_PROJECT_FILE,
+                      rail_lines_by_type, RAIL_LINES_FILE,
+                      rail_stops_by_type, RAIL_STOPS_FILE,
+                      RAIL_LINE_TYPES, 'rail')
+
+    _build_segments_qgz(_rail_out_dir, RAIL_SEGMENTS_PROJECT_FILE,
+                         rail_segments_by_type, RAIL_SEGMENTS_FILE,
+                         rail_stops_by_type, RAIL_STOPS_FILE,
+                         RAIL_LINE_TYPES, 'rail')
+
+# Rail peak / off-peak QGZ
+if WRITE_PEAK:
+    _build_lines_qgz(_rail_peak_dir, RAIL_LINES_PEAK_PROJECT_FILE,
+                      rl_lines_peak, RAIL_LINES_PEAK_FILE,
+                      rl_stops_peak, RAIL_STOPS_PEAK_FILE,
+                      RAIL_LINE_TYPES, 'rail')
+    _build_segments_qgz(_rail_peak_dir, RAIL_SEGMENTS_PEAK_PROJECT_FILE,
+                         rl_segs_peak, RAIL_SEGMENTS_PEAK_FILE,
+                         rl_stops_peak, RAIL_STOPS_PEAK_FILE,
+                         RAIL_LINE_TYPES, 'rail')
+if WRITE_OFFPEAK:
+    _build_lines_qgz(_rail_offpeak_dir, RAIL_LINES_OFFPEAK_PROJECT_FILE,
+                      rl_lines_offpeak, RAIL_LINES_OFFPEAK_FILE,
+                      rl_stops_offpeak, RAIL_STOPS_OFFPEAK_FILE,
+                      RAIL_LINE_TYPES, 'rail')
+    _build_segments_qgz(_rail_offpeak_dir, RAIL_SEGMENTS_OFFPEAK_PROJECT_FILE,
+                         rl_segs_offpeak, RAIL_SEGMENTS_OFFPEAK_FILE,
+                         rl_stops_offpeak, RAIL_STOPS_OFFPEAK_FILE,
+                         RAIL_LINE_TYPES, 'rail')
 
 
 # ---------------------------------------------------------------------------
@@ -1953,19 +3214,25 @@ print(f"  Wrote {_qgz_path_rl} ({len(_rl_qgz_layers)} layer(s))")
 
 print("\n[10] Validation ...")
 
-tag_pt_stops  = "PASS" if n_pt_stops  > 0 else "FAIL (empty)"
-tag_pt_lines = "PASS" if n_pt_lines > 0 else "FAIL (empty)"
-tag_rl_stops  = "PASS" if n_rail_stops  > 0 else "FAIL (empty)"
-tag_rl_lines = "PASS" if n_rail_lines > 0 else "FAIL (empty)"
+tag_pt_stops    = "PASS" if n_pt_stops    > 0 else "FAIL (empty)"
+tag_pt_lines    = "PASS" if n_pt_lines    > 0 else "FAIL (empty)"
+tag_pt_segments = "PASS" if n_pt_segments > 0 else "FAIL (empty)"
+tag_rl_stops    = "PASS" if n_rail_stops    > 0 else "FAIL (empty)"
+tag_rl_lines    = "PASS" if n_rail_lines    > 0 else "FAIL (empty)"
+tag_rl_segments = "PASS" if n_rail_segments > 0 else "FAIL (empty)"
 
 # Null geometry check across all layers
 def _null_geom_count(by_type):
     return sum(gdf['geometry'].isna().sum() for gdf in by_type.values() if not gdf.empty)
 
-bad_pt_geom = _null_geom_count(pt_lines_by_type)
-bad_rl_geom = _null_geom_count(rail_lines_by_type)
-tag_pt_geom = "PASS" if bad_pt_geom == 0 else f"FAIL ({bad_pt_geom} null geometries)"
-tag_rl_geom = "PASS" if bad_rl_geom == 0 else f"FAIL ({bad_rl_geom} null geometries)"
+bad_pt_geom     = _null_geom_count(pt_lines_by_type)
+bad_rl_geom     = _null_geom_count(rail_lines_by_type)
+bad_pt_seg_geom = _null_geom_count(pt_segments_by_type)
+bad_rl_seg_geom = _null_geom_count(rail_segments_by_type)
+tag_pt_geom     = "PASS" if bad_pt_geom == 0 else f"FAIL ({bad_pt_geom} null geometries)"
+tag_rl_geom     = "PASS" if bad_rl_geom == 0 else f"FAIL ({bad_rl_geom} null geometries)"
+tag_pt_seg_geom = "PASS" if bad_pt_seg_geom == 0 else f"FAIL ({bad_pt_seg_geom} null geometries)"
+tag_rl_seg_geom = "PASS" if bad_rl_seg_geom == 0 else f"FAIL ({bad_rl_seg_geom} null geometries)"
 
 # Direction_id check
 def _bad_dir_count(by_type):
@@ -1980,14 +3247,18 @@ bad_dir_rl = _bad_dir_count(rail_lines_by_type)
 tag_dir_pt = "PASS" if bad_dir_pt == 0 else f"WARN ({bad_dir_pt} unexpected direction_id values)"
 tag_dir_rl = "PASS" if bad_dir_rl == 0 else f"WARN ({bad_dir_rl} unexpected direction_id values)"
 
-print(f"  PT-Feeder stops non-empty   : {tag_pt_stops}")
-print(f"  PT-Feeder lines non-empty   : {tag_pt_lines}")
-print(f"  PT-Feeder line geometries   : {tag_pt_geom}")
-print(f"  PT-Feeder direction_id valid: {tag_dir_pt}")
-print(f"  Rail stops non-empty        : {tag_rl_stops}")
-print(f"  Rail lines non-empty        : {tag_rl_lines}")
-print(f"  Rail line geometries        : {tag_rl_geom}")
-print(f"  Rail direction_id valid     : {tag_dir_rl}")
+print(f"  PT-Feeder stops non-empty      : {tag_pt_stops}")
+print(f"  PT-Feeder lines non-empty      : {tag_pt_lines}")
+print(f"  PT-Feeder segments non-empty   : {tag_pt_segments}")
+print(f"  PT-Feeder line geometries      : {tag_pt_geom}")
+print(f"  PT-Feeder segment geometries   : {tag_pt_seg_geom}")
+print(f"  PT-Feeder direction_id valid   : {tag_dir_pt}")
+print(f"  Rail stops non-empty           : {tag_rl_stops}")
+print(f"  Rail lines non-empty           : {tag_rl_lines}")
+print(f"  Rail segments non-empty        : {tag_rl_segments}")
+print(f"  Rail line geometries           : {tag_rl_geom}")
+print(f"  Rail segment geometries        : {tag_rl_seg_geom}")
+print(f"  Rail direction_id valid        : {tag_dir_rl}")
 
 
 # ---------------------------------------------------------------------------
@@ -2012,10 +3283,40 @@ def _rt_breakdown(by_type, label_map):
     return lines or ["  (no data)"]
 
 
+_mode_label_report = {'all': 'All (PT-Feeder + Rail)', 'pt_feeder': 'PT-Feeder only', 'rail': 'Rail only'}
+_period_parts = []
+if WRITE_FULLDAY:  _period_parts.append('full-day')
+if WRITE_PEAK:     _period_parts.append('peak')
+if WRITE_OFFPEAK:  _period_parts.append('off-peak')
+_period_label_report = ' + '.join(_period_parts) if _period_parts else '(none)'
+
+_output_files_report = []
+if WRITE_FULLDAY:
+    _output_files_report += [
+        f"  {pt_stops_path}", f"  {pt_lines_path}", f"  {pt_segments_path}",
+        f"  {rl_stops_path}", f"  {rl_lines_path}", f"  {rl_segments_path}",
+    ]
+if WRITE_PEAK:
+    _output_files_report += [
+        f"  {pt_lines_peak_path}", f"  {pt_segments_peak_path}", f"  {pt_stops_peak_path}",
+        f"  {rl_lines_peak_path}", f"  {rl_segments_peak_path}", f"  {rl_stops_peak_path}",
+    ]
+if WRITE_OFFPEAK:
+    _output_files_report += [
+        f"  {pt_lines_offpeak_path}", f"  {pt_segments_offpeak_path}", f"  {pt_stops_offpeak_path}",
+        f"  {rl_lines_offpeak_path}", f"  {rl_segments_offpeak_path}", f"  {rl_stops_offpeak_path}",
+    ]
+_output_files_report.append("  + QGIS .qgz project files for each written GeoPackage")
+
 report_lines = [
     "=" * 70,
     "NETWORK BUILD REPORT — catchment_build_network.py",
     "=" * 70,
+    "",
+    "PIPELINE CONFIGURATION",
+    f"  Mode selection     : {_mode_label_report.get(BUILD_MODES, BUILD_MODES)}",
+    f"  Time-period output : {_period_label_report}",
+    f"  Geometry source    : {'ZVV Geometry' if USE_ZVV_GEOMETRY else 'Simplified (straight-line)'}",
     "",
     "CONFIGURATION",
     f"  CATCHMENT_METHOD : {settings.CATCHMENT_METHOD}",
@@ -2025,20 +3326,17 @@ report_lines = [
     f"  Weekday filter   : ≥{WEEKDAY_MIN_DAYS}/5 weekdays",
     "",
     "OUTPUT FILES",
-    f"  {pt_stops_path}",
-    f"  {pt_lines_path}",
-    f"  {rl_stops_path}",
-    f"  {rl_lines_path}",
-    f"  {_qgz_path_pt}  (QGIS project — PT-feeder)",
-    f"  {_qgz_path_rl}  (QGIS project — Rail)",
+] + _output_files_report + [
     "",
     "RECORD COUNTS",
-    f"  {'Layer':<35}  {'Features':>8}",
-    f"  {'-'*35}  {'-'*8}",
-    f"  {'pt_feeder_stops (all layers)':<35}  {n_pt_stops:>8,}",
-    f"  {'pt_feeder_lines (all layers)':<35}  {n_pt_lines:>8,}",
-    f"  {'rail_stops (all layers)':<35}  {n_rail_stops:>8,}",
-    f"  {'rail_lines (all layers)':<35}  {n_rail_lines:>8,}",
+    f"  {'Layer':<40}  {'Features':>8}",
+    f"  {'-'*40}  {'-'*8}",
+    f"  {'pt_feeder_stops (all layers)':<40}  {n_pt_stops:>8,}",
+    f"  {'pt_feeder_lines (all layers)':<40}  {n_pt_lines:>8,}",
+    f"  {'pt_feeder_segments (all layers)':<40}  {n_pt_segments:>8,}",
+    f"  {'rail_stops (all layers)':<40}  {n_rail_stops:>8,}",
+    f"  {'rail_lines (all layers)':<40}  {n_rail_lines:>8,}",
+    f"  {'rail_segments (all layers)':<40}  {n_rail_segments:>8,}",
     "",
     "PT-FEEDER LINE TYPE BREAKDOWN",
     f"  {'rt':<6}  {'Mode':<25}  {'Layer':<22}  {'Lines':>6}",
@@ -2067,7 +3365,8 @@ report_lines = [
     f"  Min cluster width          : {PEAK_MIN_CLUSTER_BINS} bins ({PEAK_MIN_CLUSTER_BINS * PEAK_BIN_WIDTH_MIN} min)",
     f"  Validation min overlap     : {PEAK_MIN_OVERLAP:.0%}",
     f"  Classification threshold   : {PEAK_CLASSIFICATION_THRESHOLD:.0%}",
-    f"  Min deps per window        : {VARIANT_MIN_DEPARTURES_IN_WINDOW} (relaxed to {VARIANT_RELAXED_MIN_DEPARTURES} when ≥{VARIANT_RELAXED_MIN_DEPARTURES} deps in both AM and PM)",
+    f"  Min deps per window (CV)   : {VARIANT_MIN_DEPARTURES_IN_WINDOW} (variant classification headway CV)",
+    f"  Min deps per window (freq) : {VARIANT_FREQ_MIN_DEPARTURES} (frequency computation)",
     f"  Weekday filter             : service_ids running on ≥{WEEKDAY_MIN_DAYS} of Mon–Fri",
     "  Method                     : median inter-departure gap (interior gaps, boundary gaps dropped)",
     "  Columns                    : freq_am_peak_dep_hr, freq_pm_peak_dep_hr, freq_offpeak_dep_hr",
@@ -2076,22 +3375,43 @@ report_lines = [
     "  Column                     : service_period (all_day / peak_only / offpeak_only / unknown)",
     "",
     "GEOMETRY",
-    "  Straight-line stop-to-stop segments (shapes.txt not used)",
+    f"  USE_ZVV_GEOMETRY       : {USE_ZVV_GEOMETRY}",
+    f"  ZVV geometry available : {_zvv_geometry_available}",
+    "  Source (matched)       : ZVV transit lines GeoPackage (actual route alignment)",
+    "  Source (unmatched)     : straight-line stop-to-stop fallback",
+    f"  Spatial match tolerance: {ZVV_MATCH_TOLERANCE_M}m (crosswalk), "
+    f"{SBAHN_SNAP_TOLERANCE_M}m (S-Bahn snap)",
+    f"  S-Bahn sinuosity gate  : {SBAHN_MIN_SINUOSITY}x – {SBAHN_MAX_SINUOSITY}x",
+    "",
+    "SEGMENTS",
+    "  Each segment = one stop-to-stop edge from a variant's stop sequence",
+    "  travel_time_min : median scheduled travel time (rounded to .0 / .5 min)",
+    "  InVehWait_min   : median dwell at from_stop (rounded to .0 / .5 min)",
+    "  Coordinates     : from_stop_E/N, to_stop_E/N (EPSG:2056)",
+    "",
+    "PEAK / OFF-PEAK NETWORKS",
+    f"  Peak outputs written    : {'Yes' if WRITE_PEAK else 'No (skipped)'}",
+    f"  Off-peak outputs written: {'Yes' if WRITE_OFFPEAK else 'No (skipped)'}",
+    "  Peak    : service_period in {peak_only, all_day}",
+    "  Off-peak: service_period in {offpeak_only, all_day}",
     "",
     "STYLING",
-    "  colour / line_style columns written to line layers",
-    "  fill_colour / outline_colour columns written to stop layers",
+    "  Styling applied via QGZ project files (no colour columns in GeoPackage)",
     "  QGIS .qgz project files with pre-configured symbology per output dir",
     "",
     "VALIDATION",
-    f"  PT-Feeder stops non-empty   : {tag_pt_stops}",
-    f"  PT-Feeder lines non-empty   : {tag_pt_lines}",
-    f"  PT-Feeder line geometries   : {tag_pt_geom}",
-    f"  PT-Feeder direction_id valid: {tag_dir_pt}",
-    f"  Rail stops non-empty        : {tag_rl_stops}",
-    f"  Rail lines non-empty        : {tag_rl_lines}",
-    f"  Rail line geometries        : {tag_rl_geom}",
-    f"  Rail direction_id valid     : {tag_dir_rl}",
+    f"  PT-Feeder stops non-empty      : {tag_pt_stops}",
+    f"  PT-Feeder lines non-empty      : {tag_pt_lines}",
+    f"  PT-Feeder segments non-empty   : {tag_pt_segments}",
+    f"  PT-Feeder line geometries      : {tag_pt_geom}",
+    f"  PT-Feeder segment geometries   : {tag_pt_seg_geom}",
+    f"  PT-Feeder direction_id valid   : {tag_dir_pt}",
+    f"  Rail stops non-empty           : {tag_rl_stops}",
+    f"  Rail lines non-empty           : {tag_rl_lines}",
+    f"  Rail segments non-empty        : {tag_rl_segments}",
+    f"  Rail line geometries           : {tag_rl_geom}",
+    f"  Rail segment geometries        : {tag_rl_seg_geom}",
+    f"  Rail direction_id valid        : {tag_dir_rl}",
     "",
     "RUNTIME",
     f"  Total elapsed                : {elapsed:.1f} seconds",
