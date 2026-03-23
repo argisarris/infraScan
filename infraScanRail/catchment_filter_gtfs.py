@@ -3,12 +3,12 @@
 # GTFS stop coordinates are always WGS84 (EPSG:4326) and are reprojected to EPSG:2056
 # before spatial filtering.
 
+import json
 import os
 import shutil
 import time
 from datetime import datetime, timedelta
 
-import numpy as np
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
@@ -19,7 +19,7 @@ import settings
 _start_time = time.time()
 
 # ---------------------------------------------------------------------------
-# Input / output folder names — adjust here to filter a different GTFS source
+# Input folder default — may be overridden by _configure_pipeline() at runtime
 # ---------------------------------------------------------------------------
 GTFS_INPUT_FOLDER  = 'GTFS_FP2026_CH_raw'
 GTFS_OUTPUT_FOLDER = 'GTFS_FP2026_ZH'
@@ -43,6 +43,15 @@ RAIL_ROUTE_TYPES = {
     106: 'Regional Rail',
     109: 'S-Bahn / Suburban Rail',
 }
+
+# ---------------------------------------------------------------------------
+# Retention policies — how each route type's trips are clipped spatially
+#   'full'      : keep all stops of any trip touching the canton (106, 109)
+#   'border+1'  : envelope around canton stops + 1 stop padding each side (102, 103)
+#   'border-1'  : only stops within the canton (PT feeders)
+# ---------------------------------------------------------------------------
+FULL_ROUTE_TYPES      = {106, 109}
+BORDER_PLUS1_ROUTE_TYPES = {102, 103}
 
 # Combined set used for the route-type filter pass
 ALL_RETAINED_ROUTE_TYPES = {**PT_FEEDER_ROUTE_TYPES, **RAIL_ROUTE_TYPES}
@@ -68,6 +77,420 @@ GTFS_CRS     = 'EPSG:4326'
 # many weekday days across the full timetable year. Removes one-off events,
 # single-weekend specials, and very short construction-period services.
 MIN_WEEKDAY_ACTIVE_DAYS = 20
+
+# ---------------------------------------------------------------------------
+# Boundary GeoPackage paths
+# ---------------------------------------------------------------------------
+CANTONS_GPKG       = paths.CANTON_BOUNDARIES_GPKG
+BEZIRKE_GPKG       = paths.BEZIRKE_BOUNDARIES_GPKG
+MUNICIPALITIES_GPKG = paths.MUNICIPAL_BOUNDARIES_GPKG
+
+# Timetable year — extracted from the input folder name for the default
+# output folder suggestion. Falls back to 'GTFS' if not parseable.
+_TIMETABLE_YEAR_TAG = 'FP2026'
+
+
+# ===========================================================================
+# Pipeline Configuration TUI
+# ===========================================================================
+
+def _load_boundary_names(gpkg_path, objektart_filter=None):
+    """Load a boundary GeoPackage and return sorted list of unique 'name' values.
+
+    Parameters
+    ----------
+    gpkg_path : str
+        Path to the GeoPackage file.
+    objektart_filter : str or None
+        If given, only rows where ``objektart == objektart_filter`` are kept.
+        Needed for the municipalities file which also contains 'Kantonsgebiet'
+        and 'Kommunanz' rows.
+
+    Returns
+    -------
+    list[str]
+        Sorted unique names.
+    """
+    layers = gpd.list_layers(gpkg_path)
+    gdf = gpd.read_file(gpkg_path, layer=layers.iloc[0]['name'])
+    if objektart_filter is not None and 'objektart' in gdf.columns:
+        gdf = gdf[gdf['objektart'] == objektart_filter]
+    return sorted(gdf['name'].dropna().unique().tolist())
+
+
+def _select_names_interactive(available_names, entity_label):
+    """Let the user pick one or more names from *available_names* via partial
+    name search.
+
+    The user types comma-separated search terms.  Each term is matched
+    case-insensitively against *available_names*.  Exact matches are accepted
+    directly; partial matches are listed for the user to refine.
+
+    Returns
+    -------
+    list[str]
+        The selected names (may be empty if the user types nothing).
+    """
+    print(f"\n   Available {entity_label} ({len(available_names)} total).")
+    print(f"   Type comma-separated names (or partial names) to search & select.")
+    print(f"   Leave empty to skip.\n")
+
+    selected = []
+    while True:
+        raw = input(f"   Search / select {entity_label}: ").strip()
+        if not raw:
+            break
+
+        terms = [t.strip() for t in raw.split(',') if t.strip()]
+        batch = []
+        for term in terms:
+            # Exact match (case-insensitive)
+            exact = [n for n in available_names if n.lower() == term.lower()]
+            if exact:
+                batch.extend(exact)
+                continue
+
+            # Partial match
+            partial = [n for n in available_names if term.lower() in n.lower()]
+            if len(partial) == 0:
+                print(f"     No match for '{term}'.")
+            elif len(partial) == 1:
+                batch.append(partial[0])
+                print(f"     Matched: {partial[0]}")
+            else:
+                print(f"     Multiple matches for '{term}':")
+                for i, name in enumerate(partial, 1):
+                    print(f"       {i}) {name}")
+                pick = input(f"     Enter numbers (comma-separated) or 'all': ").strip()
+                if pick.lower() == 'all':
+                    batch.extend(partial)
+                else:
+                    for p in pick.split(','):
+                        p = p.strip()
+                        if p.isdigit() and 1 <= int(p) <= len(partial):
+                            batch.append(partial[int(p) - 1])
+
+        # Deduplicate while preserving order
+        for name in batch:
+            if name not in selected:
+                selected.append(name)
+
+        if selected:
+            print(f"     Currently selected: {selected}")
+            more = input(f"   Add more {entity_label}? (y/n) [n]: ").strip().lower()
+            if more != 'y':
+                break
+
+    return selected
+
+
+def _configure_pipeline():
+    """Prompt the user for spatial filtering configuration.
+
+    Returns a dict with keys:
+        gtfs_input_folder  : str   – subfolder name under GTFS_TRANSIT_DIR
+        gtfs_output_folder : str   – subfolder name under GTFS_TRANSIT_DIR
+        admin_level        : str   – 'national' | 'cantonal' | 'bezirke' | 'municipal'
+        primary_names      : list  – selected entity names at the primary admin level
+        subdivision_names  : dict  – {'bezirke': [...], 'municipal': [...]}
+        buffer_m           : float – buffer distance in metres around dissolved boundary
+    """
+    print("=" * 70)
+    print("catchment_filter_gtfs.py — PIPELINE CONFIGURATION")
+    print("=" * 70)
+
+    # --- A. GTFS Input Folder ------------------------------------------------
+    print("\nA. GTFS INPUT FOLDER")
+    print(f"   Base path: {paths.GTFS_TRANSIT_DIR}")
+    # List available subfolders
+    gtfs_base = os.path.join(paths.MAIN, paths.GTFS_TRANSIT_DIR)
+    if os.path.isdir(gtfs_base):
+        subfolders = sorted([
+            d for d in os.listdir(gtfs_base)
+            if os.path.isdir(os.path.join(gtfs_base, d))
+        ])
+        if subfolders:
+            print(f"   Available subfolders:")
+            for i, sf in enumerate(subfolders, 1):
+                print(f"     {i}) {sf}")
+    else:
+        subfolders = []
+
+    while True:
+        gtfs_input = input(
+            f"\n   Enter GTFS input folder name [{GTFS_INPUT_FOLDER}]: "
+        ).strip() or GTFS_INPUT_FOLDER
+        full_input = os.path.join(gtfs_base, gtfs_input)
+        if os.path.isdir(full_input):
+            break
+        # Allow numeric selection from the listed subfolders
+        if gtfs_input.isdigit() and 1 <= int(gtfs_input) <= len(subfolders):
+            gtfs_input = subfolders[int(gtfs_input) - 1]
+            break
+        print(f"   Folder not found: {full_input}")
+        print(f"   Please enter an existing subfolder name.")
+
+    # --- B. Administrative Level ---------------------------------------------
+    print("\nB. ADMINISTRATIVE LEVEL — Primary Spatial Boundary")
+    print("   1) National    — All of Switzerland")
+    print("   2) Cantonal    — Choose one or more cantons")
+    print("   3) Bezirke     — Choose one or more districts (Bezirke)")
+    print("   4) Municipal   — Choose one or more municipalities (Gemeinden)")
+
+    while True:
+        level_choice = input("\n   Select administrative level (1-4) [2]: ").strip() or "2"
+        if level_choice in ['1', '2', '3', '4']:
+            break
+        print("   Invalid selection. Please enter 1, 2, 3, or 4.")
+
+    level_map = {'1': 'national', '2': 'cantonal', '3': 'bezirke', '4': 'municipal'}
+    admin_level = level_map[level_choice]
+
+    # --- B2. Select entities at the chosen level -----------------------------
+    primary_names = []
+    area_label = ''  # for output folder suggestion
+
+    if admin_level == 'national':
+        area_label = 'CH'
+        print("   → National boundary selected (all cantons).")
+
+    elif admin_level == 'cantonal':
+        print("\n   Loading canton names ...")
+        canton_names = _load_boundary_names(
+            os.path.join(paths.MAIN, CANTONS_GPKG)
+        )
+        primary_names = _select_names_interactive(canton_names, 'cantons')
+        if not primary_names:
+            raise ValueError("No cantons selected. Aborting.")
+        area_label = '_'.join(primary_names) if len(primary_names) <= 3 else f"{len(primary_names)}cantons"
+
+    elif admin_level == 'bezirke':
+        print("\n   Loading Bezirke names ...")
+        bezirke_names = _load_boundary_names(
+            os.path.join(paths.MAIN, BEZIRKE_GPKG)
+        )
+        primary_names = _select_names_interactive(bezirke_names, 'Bezirke')
+        if not primary_names:
+            raise ValueError("No Bezirke selected. Aborting.")
+        area_label = '_'.join(primary_names) if len(primary_names) <= 3 else f"{len(primary_names)}bezirke"
+
+    elif admin_level == 'municipal':
+        print("\n   Loading municipality names ...")
+        municipal_names = _load_boundary_names(
+            os.path.join(paths.MAIN, MUNICIPALITIES_GPKG),
+            objektart_filter='Gemeindegebiet',
+        )
+        primary_names = _select_names_interactive(municipal_names, 'municipalities')
+        if not primary_names:
+            raise ValueError("No municipalities selected. Aborting.")
+        area_label = '_'.join(primary_names) if len(primary_names) <= 3 else f"{len(primary_names)}municipalities"
+
+    # Sanitise area_label for folder name (replace spaces, special chars)
+    area_label = area_label.replace(' ', '').replace('/', '-').replace('\\', '-')
+
+    # --- C. Additional Subdivisions ------------------------------------------
+    subdivision_names = {'bezirke': [], 'municipal': []}
+
+    if admin_level in ('cantonal', 'bezirke'):
+        print("\nC. ADDITIONAL SUBDIVISIONS")
+        print("   You may add finer-grained areas to be unioned with the primary boundary.")
+
+        if admin_level == 'cantonal':
+            # Offer Bezirke
+            add_bez = input("\n   Add additional Bezirke outside the selected cantons? (y/n) [n]: ").strip().lower()
+            if add_bez == 'y':
+                print("   Loading Bezirke names ...")
+                bezirke_names = _load_boundary_names(
+                    os.path.join(paths.MAIN, BEZIRKE_GPKG)
+                )
+                subdivision_names['bezirke'] = _select_names_interactive(bezirke_names, 'Bezirke')
+
+            # Offer Municipalities
+            add_mun = input("\n   Add additional municipalities outside the selected cantons? (y/n) [n]: ").strip().lower()
+            if add_mun == 'y':
+                print("   Loading municipality names ...")
+                municipal_names = _load_boundary_names(
+                    os.path.join(paths.MAIN, MUNICIPALITIES_GPKG),
+                    objektart_filter='Gemeindegebiet',
+                )
+                subdivision_names['municipal'] = _select_names_interactive(municipal_names, 'municipalities')
+
+        elif admin_level == 'bezirke':
+            # Offer Municipalities
+            add_mun = input("\n   Add additional municipalities outside the selected Bezirke? (y/n) [n]: ").strip().lower()
+            if add_mun == 'y':
+                print("   Loading municipality names ...")
+                municipal_names = _load_boundary_names(
+                    os.path.join(paths.MAIN, MUNICIPALITIES_GPKG),
+                    objektart_filter='Gemeindegebiet',
+                )
+                subdivision_names['municipal'] = _select_names_interactive(municipal_names, 'municipalities')
+
+    elif admin_level == 'national':
+        print("\n   (Subdivisions not applicable at national level — skipped.)")
+    else:  # municipal
+        print("\n   (No finer subdivision available below municipal level — skipped.)")
+
+    # --- D. Boundary Buffer --------------------------------------------------
+    print("\nD. BOUNDARY BUFFER")
+    print("   Optional buffer (in metres) around the dissolved boundary.")
+    print("   Useful for capturing stops just outside the boundary that serve the area.")
+
+    while True:
+        buf_str = input("\n   Buffer distance in metres [0]: ").strip() or "0"
+        try:
+            buffer_m = float(buf_str)
+            if buffer_m < 0:
+                print("   Buffer must be >= 0.")
+                continue
+            break
+        except ValueError:
+            print("   Please enter a valid number.")
+
+    # --- E. GTFS Output Folder -----------------------------------------------
+    default_output = f"GTFS_{_TIMETABLE_YEAR_TAG}_{area_label}"
+    print("\nE. GTFS OUTPUT FOLDER")
+    print(f"   Base path: {paths.GTFS_TRANSIT_DIR}")
+    gtfs_output = input(
+        f"\n   Enter output folder name [{default_output}]: "
+    ).strip() or default_output
+
+    # --- Summary -------------------------------------------------------------
+    level_labels = {
+        'national':  'NATIONAL (all of Switzerland)',
+        'cantonal':  f"CANTONAL: {primary_names}",
+        'bezirke':   f"BEZIRKE: {primary_names}",
+        'municipal': f"MUNICIPAL: {primary_names}",
+    }
+    print("\n" + "-" * 70)
+    print("  CONFIGURATION SUMMARY")
+    print("-" * 70)
+    print(f"  GTFS input folder  : {gtfs_input}")
+    print(f"  Admin level        : {level_labels[admin_level]}")
+    if subdivision_names['bezirke']:
+        print(f"  + Bezirke          : {subdivision_names['bezirke']}")
+    if subdivision_names['municipal']:
+        print(f"  + Municipalities   : {subdivision_names['municipal']}")
+    print(f"  Boundary buffer    : {buffer_m:.0f} m")
+    print(f"  GTFS output folder : {gtfs_output}")
+    print("-" * 70)
+
+    return {
+        'gtfs_input_folder':  gtfs_input,
+        'gtfs_output_folder': gtfs_output,
+        'admin_level':        admin_level,
+        'primary_names':      primary_names,
+        'subdivision_names':  subdivision_names,
+        'buffer_m':           buffer_m,
+    }
+
+
+def _build_boundary_polygon(cfg):
+    """Dissolve and union all selected boundaries into a single polygon.
+
+    Parameters
+    ----------
+    cfg : dict
+        Output of ``_configure_pipeline()``.
+
+    Returns
+    -------
+    tuple (shapely geometry, CRS)
+        The dissolved boundary polygon in CODEBASE_CRS, and the raw CRS
+        as read from the primary GeoPackage (for reporting).
+    """
+    parts = []       # list of GeoDataFrames to union
+    raw_crs = None   # CRS of the first-read file (for report)
+
+    def _load_and_filter(gpkg_path, names=None, objektart_filter=None):
+        nonlocal raw_crs
+        layers = gpd.list_layers(gpkg_path)
+        gdf = gpd.read_file(gpkg_path, layer=layers.iloc[0]['name'])
+        if raw_crs is None:
+            raw_crs = gdf.crs
+        if objektart_filter and 'objektart' in gdf.columns:
+            gdf = gdf[gdf['objektart'] == objektart_filter]
+        if names is not None:
+            gdf = gdf[gdf['name'].isin(names)]
+        return gdf
+
+    admin = cfg['admin_level']
+
+    # --- Primary boundary ---
+    if admin == 'national':
+        primary = _load_and_filter(
+            os.path.join(paths.MAIN, CANTONS_GPKG)
+        )
+    elif admin == 'cantonal':
+        primary = _load_and_filter(
+            os.path.join(paths.MAIN, CANTONS_GPKG),
+            names=cfg['primary_names'],
+        )
+    elif admin == 'bezirke':
+        primary = _load_and_filter(
+            os.path.join(paths.MAIN, BEZIRKE_GPKG),
+            names=cfg['primary_names'],
+        )
+    elif admin == 'municipal':
+        primary = _load_and_filter(
+            os.path.join(paths.MAIN, MUNICIPALITIES_GPKG),
+            names=cfg['primary_names'],
+            objektart_filter='Gemeindegebiet',
+        )
+    else:
+        raise ValueError(f"Unknown admin level: {admin}")
+
+    if primary.empty:
+        raise ValueError(
+            f"No boundary rows matched for admin_level={admin}, "
+            f"names={cfg['primary_names']}."
+        )
+    parts.append(primary)
+
+    # --- Subdivision: additional Bezirke ---
+    sub_bez = cfg['subdivision_names'].get('bezirke', [])
+    if sub_bez:
+        bez_gdf = _load_and_filter(
+            os.path.join(paths.MAIN, BEZIRKE_GPKG),
+            names=sub_bez,
+        )
+        if not bez_gdf.empty:
+            parts.append(bez_gdf)
+            print(f"  + Unioning {len(bez_gdf)} additional Bezirke")
+
+    # --- Subdivision: additional Municipalities ---
+    sub_mun = cfg['subdivision_names'].get('municipal', [])
+    if sub_mun:
+        mun_gdf = _load_and_filter(
+            os.path.join(paths.MAIN, MUNICIPALITIES_GPKG),
+            names=sub_mun,
+            objektart_filter='Gemeindegebiet',
+        )
+        if not mun_gdf.empty:
+            parts.append(mun_gdf)
+            print(f"  + Unioning {len(mun_gdf)} additional municipalities")
+
+    # --- Dissolve all parts into a single polygon ---
+    combined = pd.concat(parts, ignore_index=True)
+    dissolved = combined.dissolve().to_crs(CODEBASE_CRS)
+    polygon = dissolved.geometry.iloc[0]
+
+    # --- Apply buffer if requested ---
+    buffer_m = cfg.get('buffer_m', 0)
+    if buffer_m > 0:
+        polygon = polygon.buffer(buffer_m)
+        print(f"  Applied {buffer_m:.0f} m buffer to boundary")
+
+    print(f"  Boundary dissolved and reprojected to {CODEBASE_CRS}")
+    print(f"  Boundary envelope: {polygon.bounds}")
+
+    return polygon, raw_crs
+
+
+# Run configuration and apply to module-level constants
+_pipeline_cfg   = _configure_pipeline()
+GTFS_INPUT_FOLDER  = _pipeline_cfg['gtfs_input_folder']
+GTFS_OUTPUT_FOLDER = _pipeline_cfg['gtfs_output_folder']
 
 
 # ===========================================================================
@@ -121,7 +544,14 @@ os.chdir(paths.MAIN)  # All path constants in paths.py are relative to MAIN
 print("=" * 70)
 print("catchment_filter_gtfs.py")
 print(f"  CATCHMENT_METHOD : {settings.CATCHMENT_METHOD}")
-print(f"  CATCHMENT_CANTON : {settings.CATCHMENT_CANTON}")
+print(f"  Admin level      : {_pipeline_cfg['admin_level']}")
+if _pipeline_cfg['primary_names']:
+    print(f"  Primary selection: {_pipeline_cfg['primary_names']}")
+if _pipeline_cfg['subdivision_names']['bezirke']:
+    print(f"  + Bezirke        : {_pipeline_cfg['subdivision_names']['bezirke']}")
+if _pipeline_cfg['subdivision_names']['municipal']:
+    print(f"  + Municipalities : {_pipeline_cfg['subdivision_names']['municipal']}")
+print(f"  Boundary buffer  : {_pipeline_cfg['buffer_m']:.0f} m")
 print(f"  GTFS source      : {os.path.join(paths.GTFS_TRANSIT_DIR, GTFS_INPUT_FOLDER)}")
 print(f"  GTFS output      : {os.path.join(paths.GTFS_TRANSIT_DIR, GTFS_OUTPUT_FOLDER)}")
 print(f"  Spatial CRS      : {CODEBASE_CRS}")
@@ -136,46 +566,11 @@ print(f"[0] Created output directory: {_gtfs_output_dir}")
 
 
 # ===========================================================================
-# Step 1 — boundary preparation
+# Step 1 — boundary preparation (driven by TUI configuration)
 # ===========================================================================
 
-print(f"\n[1] Loading cantonal boundary from: {paths.CANTON_BOUNDARIES_GPKG}")
-
-# Inspect available layers
-available_layers = gpd.list_layers(paths.CANTON_BOUNDARIES_GPKG)
-print(f"  Available layers in GeoPackage:")
-for _, row in available_layers.iterrows():
-    print(f"    - {row['name']}")
-
-# Load first (or only) layer
-layer_name = available_layers.iloc[0]['name']
-print(f"  Using layer: '{layer_name}'")
-cantons_raw = gpd.read_file(paths.CANTON_BOUNDARIES_GPKG, layer=layer_name)
-
-print(f"  Columns: {list(cantons_raw.columns)}")
-print(f"  CRS as read from GeoPackage: {cantons_raw.crs}")
-
-canton_col = 'name'
-print(f"  Canton name column: '{canton_col}'")
-print(f"  Sample canton name values: {sorted(cantons_raw[canton_col].dropna().unique().tolist())}")
-
-# Filter to the target canton
-canton_mask = cantons_raw[canton_col].isin(settings.CATCHMENT_CANTON)
-canton_rows = cantons_raw[canton_mask]
-if canton_rows.empty:
-    raise ValueError(
-        f"No rows found where column '{canton_col}' matches {settings.CATCHMENT_CANTON}.\n"
-        f"Available values: {sorted(cantons_raw[canton_col].dropna().unique().tolist())}\n"
-        f"Check CATCHMENT_CANTON in settings.py."
-    )
-
-boundary_raw_crs = cantons_raw.crs
-
-# Dissolve to single polygon, reproject to codebase CRS — no buffer
-canton_boundary = canton_rows.dissolve().to_crs(CODEBASE_CRS)
-canton_polygon = canton_boundary.geometry.iloc[0]
-print(f"  Canton boundary dissolved and reprojected to {CODEBASE_CRS}")
-print(f"  Boundary envelope: {canton_polygon.bounds}")
+print(f"\n[1] Building spatial boundary from pipeline configuration ...")
+canton_polygon, boundary_raw_crs = _build_boundary_polygon(_pipeline_cfg)
 
 
 # ===========================================================================
@@ -214,7 +609,7 @@ print(f"\n  Timetable period (from calendar.txt): {TIMETABLE_START} to {TIMETABL
 
 
 # ===========================================================================
-# Step 2.5 — service duration filter (Tier 1)
+# Step 3 — service duration filter (Tier 1)
 #
 # Compute effective weekday active days per service_id using calendar.txt +
 # calendar_dates.txt, and drop service_ids below MIN_WEEKDAY_ACTIVE_DAYS.
@@ -222,7 +617,7 @@ print(f"\n  Timetable period (from calendar.txt): {TIMETABLE_START} to {TIMETABL
 # construction-period services before any downstream processing.
 # ===========================================================================
 
-print(f"\n[2.5] Service duration filter (Tier 1): min {MIN_WEEKDAY_ACTIVE_DAYS} weekday active days ...")
+print(f"\n[3] Service duration filter (Tier 1): min {MIN_WEEKDAY_ACTIVE_DAYS} weekday active days ...")
 
 def _compute_weekday_active_days(cal_df, cal_dates_df, tt_start, tt_end):
     """Return a Series mapping service_id → number of effective weekday (Mon–Fri)
@@ -293,7 +688,6 @@ _tt_end   = TIMETABLE_END.replace('-', '')
 
 # Use raw calendar/dates (before any filtering)
 _weekday_active = _compute_weekday_active_days(calendar_raw, cal_dates_raw, _tt_start, _tt_end)
-_n_before = len(calendar_raw)
 _dropped_sids = set(_weekday_active[_weekday_active < MIN_WEEKDAY_ACTIVE_DAYS].index)
 _kept_sids = set(_weekday_active[_weekday_active >= MIN_WEEKDAY_ACTIVE_DAYS].index)
 
@@ -325,10 +719,10 @@ _tier1_stats = {
 
 
 # ===========================================================================
-# Step 3 — route type filtering (always before spatial filtering)
+# Step 4 — route type filtering (always before spatial filtering)
 # ===========================================================================
 
-print("\n[3] Route-type filtering ...")
+print("\n[4] Route-type filtering ...")
 routes_raw['route_type_int'] = pd.to_numeric(routes_raw['route_type'], errors='coerce')
 routes = routes_raw[routes_raw['route_type_int'].isin(ALL_RETAINED_ROUTE_TYPES)].copy()
 
@@ -351,10 +745,14 @@ print(f"  Trips after route-type cascade: {len(trips_typed):,} / {len(trips_raw)
 
 
 # ===========================================================================
-# Step 4 — spatial filtering: stops within canton
+# Step 5 — spatial filtering: stops within study area boundary
 # ===========================================================================
 
-print(f"\n[4] Spatial filtering of stops to {settings.CATCHMENT_CANTON} ...")
+_area_desc = (
+    'Switzerland' if _pipeline_cfg['admin_level'] == 'national'
+    else ', '.join(_pipeline_cfg['primary_names'])
+)
+print(f"\n[5] Spatial filtering of stops to {_area_desc} ...")
 
 stops['stop_lon_f'] = pd.to_numeric(stops['stop_lon'], errors='coerce')
 stops['stop_lat_f'] = pd.to_numeric(stops['stop_lat'], errors='coerce')
@@ -381,74 +779,154 @@ print(f"  Stops within canton: {len(stops_filtered):,} / {len(stops):,}")
 
 
 # ===========================================================================
-# Step 5 — filter stop_times to retained stops
+# Step 6 — assign retention policy to each trip
 # ===========================================================================
 
-print("\n[5] Filtering stop_times to retained stops ...")
-stop_times = stop_times_raw[stop_times_raw['stop_id'].isin(retained_stop_ids)].copy()
-print(f"  stop_times rows retained: {len(stop_times):,} / {len(stop_times_raw):,}")
+print("\n[6] Assigning retention policy per trip ...")
 
+# Build route_type_int → retention policy mapping
+def _retention_policy(rt):
+    if rt in FULL_ROUTE_TYPES:
+        return 'full'
+    if rt in BORDER_PLUS1_ROUTE_TYPES:
+        return 'border+1'
+    return 'border-1'
 
-# ===========================================================================
-# Step 6 — filter trips: keep any trip with at least one stop within canton,
-#           truncating out-of-canton stages (stop_times already clipped in Step 5)
-# ===========================================================================
+_route_policy = routes[['route_id']].copy()
+_route_policy['route_type_int'] = pd.to_numeric(
+    routes['route_type'], errors='coerce'
+).astype('Int64')
+_route_policy['retention_policy'] = _route_policy['route_type_int'].apply(_retention_policy)
 
-print("\n[6] Filtering trips — truncating cross-boundary trips at canton border ...")
-
-# Trips that have at least one stop within the canton (after route-type filter)
-trips_with_canton_stops = set(
-    stop_times[stop_times['trip_id'].isin(trips_typed['trip_id'])]['trip_id']
+trips_typed = trips_typed.merge(
+    _route_policy[['route_id', 'retention_policy']], on='route_id', how='left'
 )
+trips_typed['retention_policy'] = trips_typed['retention_policy'].fillna('border-1')
+
+for pol in ['full', 'border+1', 'border-1']:
+    n = (trips_typed['retention_policy'] == pol).sum()
+    print(f"  {pol:<10}: {n:,} trips")
+
+
+# ===========================================================================
+# Step 7 — filter stop_times & trips per retention policy
+# ===========================================================================
+
+print("\n[7] Filtering stop_times per retention policy ...")
+
+# Pre-filter stop_times to only typed trips (route-type + Tier 1 filtered)
+typed_trip_ids = set(trips_typed['trip_id'])
+st_typed = stop_times_raw[stop_times_raw['trip_id'].isin(typed_trip_ids)].copy()
+
+# Ensure stop_sequence is numeric for ordering
+st_typed['stop_sequence_int'] = pd.to_numeric(st_typed['stop_sequence'], errors='coerce')
+
+# Tag each stop_time row with whether the stop is inside the canton
+st_typed['_in_canton'] = st_typed['stop_id'].isin(retained_stop_ids)
+
+# Build trip → policy lookup
+_trip_policy = trips_typed.set_index('trip_id')['retention_policy']
+st_typed['_policy'] = st_typed['trip_id'].map(_trip_policy)
+
+# --- border-1: only canton stops ------------------------------------------
+mask_bm1 = st_typed['_policy'] == 'border-1'
+st_bm1 = st_typed.loc[mask_bm1 & st_typed['_in_canton']].copy()
+print(f"  border-1  : {len(st_bm1):,} stop_time rows")
+
+# --- full: all stops of trips that touch the canton -----------------------
+mask_full = st_typed['_policy'] == 'full'
+_full_trips_touching = set(
+    st_typed.loc[mask_full & st_typed['_in_canton'], 'trip_id']
+)
+st_full = st_typed.loc[mask_full & st_typed['trip_id'].isin(_full_trips_touching)].copy()
+print(f"  full      : {len(st_full):,} stop_time rows  "
+      f"({len(_full_trips_touching):,} trips touch canton)")
+
+# --- border+1: envelope [min_canton_idx-1 .. max_canton_idx+1] ------------
+mask_bp1 = st_typed['_policy'] == 'border+1'
+st_bp1_all = st_typed.loc[mask_bp1].copy()
+
+# For each trip, find the min and max stop_sequence of in-canton stops
+_canton_seqs = (
+    st_bp1_all.loc[st_bp1_all['_in_canton']]
+    .groupby('trip_id')['stop_sequence_int']
+    .agg(['min', 'max'])
+    .rename(columns={'min': '_seq_min', 'max': '_seq_max'})
+)
+# Only trips that have at least one canton stop
+st_bp1_all = st_bp1_all.merge(_canton_seqs, on='trip_id', how='inner')
+
+# Find per-trip the actual sequence values one step before min and one after max
+# We need the largest sequence < _seq_min and the smallest sequence > _seq_max
+def _envelope_bounds(group):
+    """Return (lower_bound, upper_bound) sequence values for the envelope."""
+    seq_min = group['_seq_min'].iloc[0]
+    seq_max = group['_seq_max'].iloc[0]
+    seqs = group['stop_sequence_int'].sort_values()
+    # One stop before the first canton stop
+    before = seqs[seqs < seq_min]
+    lower = before.iloc[-1] if len(before) > 0 else seq_min
+    # One stop after the last canton stop
+    after = seqs[seqs > seq_max]
+    upper = after.iloc[0] if len(after) > 0 else seq_max
+    return pd.Series({'_env_lo': lower, '_env_hi': upper})
+
+_env_bounds = st_bp1_all.groupby('trip_id').apply(_envelope_bounds, include_groups=False)
+st_bp1_all = st_bp1_all.merge(_env_bounds, on='trip_id', how='left')
+
+st_bp1 = st_bp1_all.loc[
+    (st_bp1_all['stop_sequence_int'] >= st_bp1_all['_env_lo']) &
+    (st_bp1_all['stop_sequence_int'] <= st_bp1_all['_env_hi'])
+].copy()
+print(f"  border+1  : {len(st_bp1):,} stop_time rows  "
+      f"({len(_canton_seqs):,} trips touch canton)")
+
+# --- combine all three groups ---------------------------------------------
+_helper_cols = ['stop_sequence_int', '_in_canton', '_policy',
+                '_seq_min', '_seq_max', '_env_lo', '_env_hi']
+for _df in (st_bm1, st_full, st_bp1):
+    _df.drop(columns=[c for c in _helper_cols if c in _df.columns],
+             inplace=True, errors='ignore')
+
+stop_times = pd.concat([st_bm1, st_full, st_bp1], ignore_index=True)
+print(f"  Total stop_times retained : {len(stop_times):,} / {len(stop_times_raw):,}")
+
+# Derive the set of retained trips (any trip present in stop_times)
+trips_with_canton_stops = set(stop_times['trip_id'])
 trips = trips_typed[trips_typed['trip_id'].isin(trips_with_canton_stops)].copy()
+print(f"  Trips retained            : {len(trips):,} / {len(trips_typed):,}")
 
-trip_total_counts    = stop_times_raw.groupby('trip_id')['stop_id'].count()
-trip_retained_counts = (
-    stop_times_raw[stop_times_raw['stop_id'].isin(retained_stop_ids)]
-    .groupby('trip_id')['stop_id'].count()
-)
-fully_within_ids = set(trip_total_counts.index[
-    trip_total_counts == trip_retained_counts.reindex(trip_total_counts.index, fill_value=0)
-])
-n_fully_within = trips_typed['trip_id'].isin(fully_within_ids).sum()
-n_truncated = len(trips) - n_fully_within
-
-print(f"  Trips retained (typed set)  : {len(trips_typed):,}")
-print(f"  Trips with ≥1 canton stop   : {len(trips):,}")
-print(f"    of which fully within     : {n_fully_within:,}")
-print(f"    of which truncated        : {n_truncated:,}  (out-of-canton stages dropped)")
-
-# stop_times is already clipped to canton stops from Step 5;
-# restrict further to only the retained trip IDs
-stop_times = stop_times[stop_times['trip_id'].isin(trips_with_canton_stops)].copy()
-print(f"  stop_times after truncation : {len(stop_times):,} rows")
+# Expand retained_stop_ids to include out-of-canton stops now referenced
+extra_stop_ids = set(stop_times['stop_id']) - retained_stop_ids
+if extra_stop_ids:
+    print(f"  Extra out-of-canton stops added: {len(extra_stop_ids):,}")
 
 
 # ===========================================================================
-# Step 7 — filter routes to those with at least one retained trip
+# Step 8 — filter routes to those with at least one retained trip
 # ===========================================================================
 
-print("\n[7] Filtering routes to those with retained trips ...")
+print("\n[8] Filtering routes to those with retained trips ...")
 active_route_ids = set(trips['route_id'])
 routes = routes[routes['route_id'].isin(active_route_ids)].copy()
 print(f"  Routes retained: {len(routes):,}")
 
 
 # ===========================================================================
-# Step 8 — filter agencies
+# Step 9 — filter agencies
 # ===========================================================================
 
-print("\n[8] Filtering agencies to those operating retained routes ...")
+print("\n[9] Filtering agencies to those operating retained routes ...")
 active_agency_ids = set(routes['agency_id'].dropna())
 agency = agency_raw[agency_raw['agency_id'].isin(active_agency_ids)].copy()
 print(f"  Agencies retained: {len(agency):,} / {len(agency_raw):,}")
 
 
 # ===========================================================================
-# Step 9 — filter calendar and calendar_dates
+# Step 10 — filter calendar and calendar_dates
 # ===========================================================================
 
-print("\n[9] Filtering calendar and calendar_dates to retained service IDs ...")
+print("\n[10] Filtering calendar and calendar_dates to retained service IDs ...")
 retained_service_ids = set(trips['service_id'])
 
 calendar = calendar_raw[calendar_raw['service_id'].isin(retained_service_ids)].copy()
@@ -458,17 +936,20 @@ print(f"  calendar_dates rows retained: {len(cal_dates):,} / {len(cal_dates_raw)
 
 
 # ===========================================================================
-# Step 10 — optional files
+# Step 11 — optional files
 # ===========================================================================
 
-print("\n[10] Processing optional GTFS files ...")
+print("\n[11] Processing optional GTFS files ...")
 skipped_optional = []
+
+# Use the expanded stop set (canton + out-of-canton stops from full/border+1 trips)
+all_retained_stop_ids = retained_stop_ids | extra_stop_ids
 
 transfers, transfers_present = _load_optional('transfers.txt')
 if transfers_present:
     transfers = transfers[
-        transfers['from_stop_id'].isin(retained_stop_ids) &
-        transfers['to_stop_id'].isin(retained_stop_ids)
+        transfers['from_stop_id'].isin(all_retained_stop_ids) &
+        transfers['to_stop_id'].isin(all_retained_stop_ids)
     ].copy()
     print(f"    transfers.txt retained: {len(transfers):,} rows")
 else:
@@ -484,20 +965,47 @@ else:
 
 
 # ===========================================================================
-# Step 11 — write output
+# Step 12 — write output
 # ===========================================================================
 
-print(f"\n[11] Writing filtered GTFS to: {_gtfs_output_dir}")
+print(f"\n[12] Writing filtered GTFS to: {_gtfs_output_dir}")
+
+# Expand stops_filtered with out-of-canton stops referenced by full/border+1 trips.
+# Also include their parent stations (location_type=1) so that
+# catchment_build_network.py can resolve parent-station coordinates.
+if extra_stop_ids:
+    extra_stops = stops[stops['stop_id'].isin(extra_stop_ids)].copy()
+    # Find parent stations of these extra stops (if not already retained)
+    existing_stop_ids = retained_stop_ids | extra_stop_ids
+    if 'parent_station' in extra_stops.columns:
+        parent_ids = set(extra_stops['parent_station'].dropna()) - existing_stop_ids
+        if parent_ids:
+            extra_parents = stops[stops['stop_id'].isin(parent_ids)].copy()
+            extra_stops = pd.concat([extra_stops, extra_parents], ignore_index=True)
+    # Add Swiss coordinate columns for the extra stops
+    extra_geo = gpd.GeoDataFrame(
+        extra_stops,
+        geometry=[Point(lon, lat) for lon, lat in
+                  zip(pd.to_numeric(extra_stops['stop_lon'], errors='coerce'),
+                      pd.to_numeric(extra_stops['stop_lat'], errors='coerce'))],
+        crs=GTFS_CRS,
+    ).to_crs(CODEBASE_CRS)
+    extra_stops['stop_N'] = extra_geo.geometry.y
+    extra_stops['stop_E'] = extra_geo.geometry.x
+    extra_stops = extra_stops.drop(columns=['stop_lon_f', 'stop_lat_f'], errors='ignore')
+    stops_filtered = pd.concat([stops_filtered, extra_stops], ignore_index=True)
+    print(f"  stops_filtered expanded with {len(extra_stops):,} out-of-canton stops (incl. parent stations)")
 
 # Write mode_class sidecar before stripping the column from routes
 mode_class = routes[['route_id', 'mode_class']].copy()
 _write(mode_class, 'mode_class.txt')
 
-# Strip mode_class before writing standard GTFS routes.txt
+# Strip mode_class and retention_policy before writing standard GTFS files
 routes_gtfs = routes.drop(columns=['mode_class'])
+trips_gtfs = trips.drop(columns=['retention_policy'], errors='ignore')
 _write(stops_filtered,  'stops.txt')
 _write(routes_gtfs,     'routes.txt')
-_write(trips,           'trips.txt')
+_write(trips_gtfs,      'trips.txt')
 _write(stop_times,      'stop_times.txt')
 _write(calendar,        'calendar.txt')
 _write(cal_dates,       'calendar_dates.txt')
@@ -508,12 +1016,26 @@ if transfers_present:
 if feed_info_present:
     _write(feed_info, 'feed_info.txt')
 
+# Write pipeline configuration sidecar so catchment_build_network.py can
+# auto-detect the GTFS folder and area description.
+_sidecar = {
+    'gtfs_output_folder': GTFS_OUTPUT_FOLDER,
+    'admin_level':        _pipeline_cfg['admin_level'],
+    'primary_names':      _pipeline_cfg['primary_names'],
+    'subdivision_names':  _pipeline_cfg['subdivision_names'],
+    'buffer_m':           _pipeline_cfg['buffer_m'],
+}
+_sidecar_path = _out_path('filter_config.json')
+with open(_sidecar_path, 'w', encoding='utf-8') as _f:
+    json.dump(_sidecar, _f, indent=2, ensure_ascii=False)
+print(f"  Wrote filter_config.json")
+
 
 # ===========================================================================
-# Step 12 — validation check
+# Step 13 — validation check
 # ===========================================================================
 
-print("\n[12] Running self-consistency validation ...")
+print("\n[13] Running self-consistency validation ...")
 
 # Re-load written outputs for a clean check
 stops_check      = pd.read_csv(_out_path('stops.txt'),      dtype=str)
@@ -547,10 +1069,10 @@ print(f"  trips → service IDs      : {tag3}")
 
 
 # ===========================================================================
-# Step 13 — filter report
+# Step 14 — filter report
 # ===========================================================================
 
-print(f"\n[13] Writing filter_report.txt ...")
+print(f"\n[14] Writing filter_report.txt ...")
 
 # Route-type breakdown of retained routes
 routes_check['route_type_int'] = pd.to_numeric(routes_check['route_type'], errors='coerce')
@@ -563,11 +1085,14 @@ report_lines = [
     "",
     "CONFIGURATION",
     f"  CATCHMENT_METHOD : {settings.CATCHMENT_METHOD}",
-    f"  CATCHMENT_CANTON : {settings.CATCHMENT_CANTON}",
-    f"  Matched against column '{canton_col}' in CANTON_BOUNDARIES_GPKG",
+    f"  Admin level      : {_pipeline_cfg['admin_level']}",
+    f"  Primary selection: {_pipeline_cfg['primary_names'] or '(all)'}",
+    f"  + Bezirke        : {_pipeline_cfg['subdivision_names']['bezirke'] or '(none)'}",
+    f"  + Municipalities : {_pipeline_cfg['subdivision_names']['municipal'] or '(none)'}",
+    f"  Boundary buffer  : {_pipeline_cfg['buffer_m']:.0f} m",
     "",
     "COORDINATE REFERENCE SYSTEMS",
-    f"  CRS of cantonal boundary as read from GeoPackage : {boundary_raw_crs}",
+    f"  CRS of boundary as read from GeoPackage          : {boundary_raw_crs}",
     f"  CRS used for all spatial operations              : {CODEBASE_CRS}",
     f"  (EPSG:2056 confirmed as codebase standard — see catchment_pt.py,",
     f"   data_import.py, generate_infrastructure.py, and others)",
@@ -575,20 +1100,21 @@ report_lines = [
     "RECORD COUNTS",
     f"  {'File':<20}  {'Original':>10}  {'Retained':>10}",
     f"  {'-'*20}  {'-'*10}  {'-'*10}",
-    f"  {'stops.txt':<20}  {orig_counts['stops']:>10,}  {len(stops_filtered):>10,}",
+    f"  {'stops.txt':<20}  {orig_counts['stops']:>10,}  {len(stops_filtered):>10,}  ({len(extra_stop_ids):,} out-of-canton)",
     f"  {'trips.txt':<20}  {orig_counts['trips']:>10,}  {len(trips):>10,}",
     f"  {'routes.txt':<20}  {orig_counts['routes']:>10,}  {len(routes_gtfs):>10,}",
     f"  {'agency.txt':<20}  {orig_counts['agencies']:>10,}  {len(agency):>10,}",
     "",
     "ROUTE-TYPE BREAKDOWN (retained routes)",
-    f"  {'route_type':<12}  {'Mode':<20}  {'Class':<12}  {'Count':>6}",
-    f"  {'-'*12}  {'-'*20}  {'-'*12}  {'-'*6}",
+    f"  {'route_type':<12}  {'Mode':<20}  {'Class':<12}  {'Policy':<10}  {'Count':>6}",
+    f"  {'-'*12}  {'-'*20}  {'-'*12}  {'-'*10}  {'-'*6}",
 ]
 for rt, count in route_type_counts.items():
     rt_int = int(rt) if pd.notna(rt) else None
     label  = ALL_RETAINED_ROUTE_TYPES.get(rt_int, 'Unknown') if rt_int is not None else 'Unknown'
     cls    = 'rail' if rt_int in RAIL_ROUTE_TYPES else 'pt_feeder'
-    report_lines.append(f"  {rt_int:<12}  {label:<20}  {cls:<12}  {count:>6,}")
+    pol    = _retention_policy(rt_int) if rt_int is not None else 'border-1'
+    report_lines.append(f"  {rt_int:<12}  {label:<20}  {cls:<12}  {pol:<10}  {count:>6,}")
 
 report_lines += [
     "",
@@ -609,12 +1135,15 @@ for f in OPTIONAL_FILES:
 
 report_lines += [
     "",
+    "SPATIAL RETENTION POLICIES",
+    f"  full      (RT 106, 109) : keep all stops of trips touching canton",
+    f"  border+1  (RT 102, 103) : canton stops + 1 stop padding each side",
+    f"  border-1  (PT feeders)  : only stops within the canton",
+    "",
     "TRIP FILTERING NOTE",
-    "  Cross-boundary trips are truncated at the canton border: any trip",
-    "  with at least one stop within the canton is retained, but stop_times",
-    "  rows for out-of-canton stops are removed. This preserves accurate",
-    "  line geometry within the canton. Trips with no canton stops at all",
-    "  are dropped entirely.",
+    "  Trips are retained if they have at least one stop within the canton.",
+    "  Spatial clipping depends on the retention policy assigned to each",
+    "  trip's route type (see above). Trips with no canton stops are dropped.",
     "",
     "CROSS-EVALUATION NOTE",
     "  OD_type = 'pt_catchment_perimeter' and perimeter_demand are retained",
