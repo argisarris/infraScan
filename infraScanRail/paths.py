@@ -35,6 +35,11 @@ BUS_LINES_DIR = r"data/Network/Buslines"
 FEEDER_LINES_DIR = r"data/Network/Feeder_Lines"
 RAIL_PROCESSED_DIR = r"data/Network/processed"
 
+CATCHMENT_AREA_DIR = r"data/Catchment_Area"
+CATCHMENT_AREA_BOUNDARY_GPKG = r"data/Catchment_Area/catchment_area_boundary.gpkg"
+POPULATION_CSV_2023 = r"data/Spatial_Data/Land_Use/Population/Inhabitants_2023_CH.csv"
+EMPLOYMENT_CSV_2023 = r"data/Spatial_Data/Land_Use/Employment/Employment_FTE_2023_CH.csv"
+
 CONSTRUCTION_COSTS =  r"data/costs/construction_cost.csv"
 TOTAL_COST_WITH_GEOMETRY = r"data/costs/total_costs_with_geometry.csv"
 TOTAL_COST_RAW = r"data/costs/total_costs_raw.csv"

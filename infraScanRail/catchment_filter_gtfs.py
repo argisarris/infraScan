@@ -68,7 +68,7 @@ REQUIRED_FILES = [
 ]
 
 # Optional GTFS files handled explicitly
-OPTIONAL_FILES = ['transfers.txt', 'feed_info.txt']
+OPTIONAL_FILES = ['transfers.txt', 'feed_info.txt', 'frequencies.txt']
 
 CODEBASE_CRS = 'EPSG:2056'
 GTFS_CRS     = 'EPSG:4326'
@@ -572,6 +572,23 @@ print(f"[0] Created output directory: {_gtfs_output_dir}")
 print(f"\n[1] Building spatial boundary from pipeline configuration ...")
 canton_polygon, boundary_raw_crs = _build_boundary_polygon(_pipeline_cfg)
 
+# Export boundary polygon as GeoPackage — single source of truth for downstream scripts
+_catchment_area_dir = os.path.join(paths.MAIN, 'data', 'Catchment_Area')
+os.makedirs(_catchment_area_dir, exist_ok=True)
+_boundary_gdf = gpd.GeoDataFrame(
+    {
+        'name':        ['catchment_area_boundary'],
+        'admin_level': [_pipeline_cfg['admin_level']],
+        'primary':     [', '.join(_pipeline_cfg['primary_names'])],
+        'buffer_m':    [_pipeline_cfg['buffer_m']],
+    },
+    geometry=[canton_polygon],
+    crs=CODEBASE_CRS,
+)
+_boundary_export_path = os.path.join(_catchment_area_dir, 'catchment_area_boundary.gpkg')
+_boundary_gdf.to_file(_boundary_export_path, driver='GPKG')
+print(f"  Saved catchment area boundary: {_boundary_export_path}")
+
 
 # ===========================================================================
 # Step 2 — load required GTFS files
@@ -963,6 +980,16 @@ else:
     skipped_optional.append('feed_info.txt')
     print("    feed_info.txt: not present — skipped")
 
+frequencies, frequencies_present = _load_optional('frequencies.txt')
+if frequencies_present:
+    _freq_before = len(frequencies)
+    retained_trip_ids = set(trips['trip_id'])
+    frequencies = frequencies[frequencies['trip_id'].isin(retained_trip_ids)].copy()
+    print(f"    frequencies.txt retained: {len(frequencies):,} / {_freq_before:,} rows")
+else:
+    skipped_optional.append('frequencies.txt')
+    print("    frequencies.txt: not present — skipped")
+
 
 # ===========================================================================
 # Step 12 — write output
@@ -1015,6 +1042,8 @@ if transfers_present:
     _write(transfers, 'transfers.txt')
 if feed_info_present:
     _write(feed_info, 'feed_info.txt')
+if frequencies_present:
+    _write(frequencies, 'frequencies.txt')
 
 # Write pipeline configuration sidecar so catchment_build_network.py can
 # auto-detect the GTFS folder and area description.
