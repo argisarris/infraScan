@@ -60,6 +60,14 @@ RAIL_PROJECT_FILE               = 'rail_lines.qgz'
 PT_FEEDER_SEGMENTS_PROJECT_FILE = 'pt_feeder_segments.qgz'
 RAIL_SEGMENTS_PROJECT_FILE      = 'rail_segments.qgz'
 
+# All-day only filtered output files
+PT_FEEDER_LINES_ALLDAY_FILE       = 'pt_feeder_lines_allday.gpkg'
+PT_FEEDER_SEGMENTS_ALLDAY_FILE    = 'pt_feeder_segments_allday.gpkg'
+PT_FEEDER_STOPS_ALLDAY_FILE       = 'pt_feeder_stops_allday.gpkg'
+RAIL_LINES_ALLDAY_FILE            = 'rail_lines_allday.gpkg'
+RAIL_SEGMENTS_ALLDAY_FILE         = 'rail_segments_allday.gpkg'
+RAIL_STOPS_ALLDAY_FILE            = 'rail_stops_allday.gpkg'
+
 # Peak / off-peak filtered output files
 PT_FEEDER_LINES_PEAK_FILE       = 'pt_feeder_lines_peak.gpkg'
 PT_FEEDER_LINES_OFFPEAK_FILE    = 'pt_feeder_lines_offpeak.gpkg'
@@ -73,6 +81,11 @@ RAIL_SEGMENTS_PEAK_FILE         = 'rail_segments_peak.gpkg'
 RAIL_SEGMENTS_OFFPEAK_FILE      = 'rail_segments_offpeak.gpkg'
 RAIL_STOPS_PEAK_FILE            = 'rail_stops_peak.gpkg'
 RAIL_STOPS_OFFPEAK_FILE         = 'rail_stops_offpeak.gpkg'
+
+PT_FEEDER_LINES_ALLDAY_PROJECT_FILE       = 'pt_feeder_lines_allday.qgz'
+PT_FEEDER_SEGMENTS_ALLDAY_PROJECT_FILE    = 'pt_feeder_segments_allday.qgz'
+RAIL_LINES_ALLDAY_PROJECT_FILE            = 'rail_lines_allday.qgz'
+RAIL_SEGMENTS_ALLDAY_PROJECT_FILE         = 'rail_segments_allday.qgz'
 
 PT_FEEDER_LINES_PEAK_PROJECT_FILE       = 'pt_feeder_lines_peak.qgz'
 PT_FEEDER_LINES_OFFPEAK_PROJECT_FILE    = 'pt_feeder_lines_offpeak.qgz'
@@ -116,7 +129,7 @@ LINE_MIN_HOUR_SPREAD        = 2     # min distinct hours per direction
 # Variant classification thresholds
 VARIANT_MIN_TRIP_SHARE           = 0.10  # min fraction of direction's trips
 VARIANT_MIN_HOUR_SPREAD          = 2     # min distinct hours variant appears in
-VARIANT_HEADWAY_CV_MAX           = 0.40  # max coefficient of variation of inter-departure gaps
+VARIANT_HEADWAY_CV_MAX           = 0.42  # max coefficient of variation of inter-departure gaps
 VARIANT_MIN_DEPARTURES_IN_WINDOW = 3     # min departures in a window to compute frequency
 VARIANT_FREQ_MIN_DEPARTURES      = 2     # min departures in a window for frequency computation
 
@@ -166,7 +179,7 @@ BUILD_MODES = 'all'
 # NOTE: default value — overridden by _configure_pipeline() at runtime.
 USE_ZVV_GEOMETRY       = True
 
-ZVV_LINES_GPKG         = os.path.join('data', 'Spatial_Data', 'Transit_Lines',
+ZVV_LINES_GPKG         = os.path.join('data', 'Spatial_Data', 'Transit_Network',
                                       'ZVV_Lines_2026.gpkg')
 ZVV_SEGMENT_LAYER      = 'ZVV_LINIEN_L'
 ZVV_SBAHN_LAYER        = 'ZVV_S_BAHN_LINIEN_L'
@@ -210,7 +223,7 @@ LINE_COLOURS = {
     700:  '#0000FF',  # Bus                 — blue
     702:  '#0000FF',  # Express Bus         — blue
     715:  '#0000FF',  # On-demand Bus       — blue
-    1000: '#0000FF',  # Ship                — blue dashed
+    1000: "#0099FF",  # Ship                — blue dashed
     1400: '#000000',  # Funicular           — black dashed
 }
 
@@ -1011,8 +1024,25 @@ def _detect_dominant_period(route_trip_ids, sid_active_sets):
     return dominant_trips
 
 
-def _is_circular(stop_id_seq):
-    return len(stop_id_seq) >= 3 and stop_id_seq[0] == stop_id_seq[-1]
+def _is_circular(stop_id_seq, single_direction=False):
+    """Detect circular (loop) routes.
+
+    Primary check: first stop equals last stop.
+    Secondary check (only when *single_direction* is True): the last stop
+    equals one of the first two intermediate stops.  This catches GTFS loop
+    routes whose terminus is encoded as a nearby platform/quay with a
+    different parent-station ID (e.g. "Bahnhof" → "Bhf West").
+    """
+    if len(stop_id_seq) < 3:
+        return False
+    if stop_id_seq[0] == stop_id_seq[-1]:
+        return True
+    # Secondary: last stop appears near the start of the sequence
+    if single_direction and len(stop_id_seq) >= 4:
+        early_stops = set(stop_id_seq[1:3])  # indices 1 and 2
+        if stop_id_seq[-1] in early_stops:
+            return True
+    return False
 
 
 def _to_minutes_str(t):
@@ -1068,18 +1098,35 @@ def _detect_peak_windows(route_trip_ids):
     if not weekday_trips:
         return fallback
 
-    sub = stop_times[stop_times['trip_id'].isin(weekday_trips)].copy()
-    if sub.empty:
+    # Dual-path: schedule-based trips from stop_times, frequency-based from headway bands
+    sched_trips = weekday_trips - _freq_trip_ids
+    freq_trips  = weekday_trips & _freq_trip_ids
+
+    parts = []
+    if sched_trips:
+        sub = stop_times[stop_times['trip_id'].isin(sched_trips)].copy()
+        if not sub.empty:
+            fs = sub.loc[sub.groupby('trip_id')['stop_sequence_int'].idxmin()].copy()
+            fs = fs.merge(
+                trips_all[['trip_id', 'route_id', 'direction_id']],
+                on='trip_id', how='left'
+            )
+            parts.append(fs)
+    if freq_trips:
+        freq_deps = _expand_freq_departures(freq_trips, time_col, AM_PEAK_START, PM_PEAK_END)
+        if not freq_deps.empty:
+            parts.append(freq_deps)
+
+    if not parts:
         return fallback
 
     # Deduplicate first-stop departures (same logic as _get_window_departures)
     # so that peak detection and frequency computation see the same counts.
-    _first_all = sub.loc[sub.groupby('trip_id')['stop_sequence_int'].idxmin()].copy()
-    _first_all = _first_all.merge(
-        trips_all[['trip_id', 'route_id', 'direction_id']],
-        on='trip_id', how='left'
-    )
+    _first_all = pd.concat(parts, ignore_index=True)
     _first_all = _dedup_first_stops(_first_all, time_col)
+
+    # Keep sub for the fallback longest-variant detection (schedule-based only)
+    sub = stop_times[stop_times['trip_id'].isin(weekday_trips)].copy()
 
     midpoint = _to_minutes_str(HALFDAY_MIDPOINT)
     day_start = _to_minutes_str(AM_PEAK_START)   # 360 (06:00)
@@ -1286,10 +1333,69 @@ def _dedup_first_stops(first_stops, time_col):
     return df
 
 
+def _expand_freq_departures(trip_ids, time_col, window_start, window_end):
+    """Generate synthetic first-stop departures for frequency-based trips.
+
+    For each trip_id that has entries in frequencies.txt, expands the headway
+    bands into individual departure times.  Only departures within the
+    half-open window [window_start, window_end) are returned.
+
+    Returns a DataFrame with the same schema as first_stops (columns include
+    time_col, 'stop_id', 'route_id', 'direction_id') or an empty DataFrame.
+    """
+    freq_trips = trip_ids & _freq_trip_ids
+    if not freq_trips:
+        return pd.DataFrame()
+
+    w_start = _to_minutes_str(window_start) if isinstance(window_start, str) else window_start
+    w_end   = _to_minutes_str(window_end)   if isinstance(window_end,   str) else window_end
+    if w_start is None or w_end is None:
+        return pd.DataFrame()
+
+    # Get the first stop_id for each frequency-based trip (template stop)
+    sub = stop_times[stop_times['trip_id'].isin(freq_trips)].copy()
+    if sub.empty:
+        return pd.DataFrame()
+    first_stops = sub.loc[sub.groupby('trip_id')['stop_sequence_int'].idxmin()].copy()
+    first_stops = first_stops.merge(
+        trips_all[['trip_id', 'route_id', 'direction_id']],
+        on='trip_id', how='left'
+    )
+
+    rows = []
+    for _, row in first_stops.iterrows():
+        tid = row['trip_id']
+        bands = _freq_lookup.get(tid, [])
+        for band_idx, (band_start, band_end, headway_min) in enumerate(bands):
+            if headway_min <= 0:
+                continue
+            dep_idx = 0
+            t = band_start
+            while t < band_end:
+                if w_start <= t < w_end:
+                    rows.append({
+                        'trip_id':      f"{tid}__freq_{band_idx}_{dep_idx}",
+                        time_col:       _minutes_to_time_str(t),
+                        'stop_id':      row['stop_id'],
+                        'route_id':     row.get('route_id', ''),
+                        'direction_id': row.get('direction_id', ''),
+                    })
+                dep_idx += 1
+                t += headway_min
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
 def _get_window_departures(trip_ids, time_col, window_start, window_end):
     """Get deduplicated first-stop departures within a half-open time window [window_start, window_end)
     for a set of trip_ids. Only includes weekday trips. Returns a DataFrame.
-    Returns an empty DataFrame if no weekday trips exist (no weekend fallback)."""
+    Returns an empty DataFrame if no weekday trips exist (no weekend fallback).
+
+    Dual-path: schedule-based trips are handled via stop_times as before;
+    frequency-based trips (those in _freq_trip_ids) are expanded from
+    frequencies.txt headway bands via _expand_freq_departures().
+    """
     weekday_trips = set(
         trips_all.loc[
             trips_all['trip_id'].isin(trip_ids) &
@@ -1300,22 +1406,37 @@ def _get_window_departures(trip_ids, time_col, window_start, window_end):
     if not weekday_trips:
         return pd.DataFrame()
 
-    sub = stop_times[stop_times['trip_id'].isin(weekday_trips)].copy()
-    first_stops = sub.loc[sub.groupby('trip_id')['stop_sequence_int'].idxmin()].copy()
+    # Split into schedule-based and frequency-based trips
+    schedule_trips = weekday_trips - _freq_trip_ids
+    freq_trips     = weekday_trips & _freq_trip_ids
 
-    # Merge route_id and direction_id for dedup pass 3
-    first_stops = first_stops.merge(
-        trips_all[['trip_id', 'route_id', 'direction_id']],
-        on='trip_id', how='left'
-    )
+    parts = []
 
-    first_stops = _dedup_first_stops(first_stops, time_col)
+    # Path A: schedule-based trips — existing logic
+    if schedule_trips:
+        sub = stop_times[stop_times['trip_id'].isin(schedule_trips)].copy()
+        first_stops = sub.loc[sub.groupby('trip_id')['stop_sequence_int'].idxmin()].copy()
+        first_stops = first_stops.merge(
+            trips_all[['trip_id', 'route_id', 'direction_id']],
+            on='trip_id', how='left'
+        )
+        in_window = first_stops[
+            (first_stops[time_col] >= window_start) & (first_stops[time_col] < window_end)
+        ].copy()
+        parts.append(in_window)
 
-    in_window = first_stops[
-        (first_stops[time_col] >= window_start) & (first_stops[time_col] < window_end)
-    ].copy()
+    # Path B: frequency-based trips — expand from headway bands
+    if freq_trips:
+        freq_deps = _expand_freq_departures(freq_trips, time_col, window_start, window_end)
+        if not freq_deps.empty:
+            parts.append(freq_deps)
 
-    return in_window
+    if not parts:
+        return pd.DataFrame()
+
+    combined = pd.concat(parts, ignore_index=True)
+    combined = _dedup_first_stops(combined, time_col)
+    return combined
 
 
 def _snap_to_standard_freq(raw_freq):
@@ -1597,18 +1718,50 @@ def _configure_pipeline():
     """Prompt the user for pipeline configuration choices.
 
     Returns a dict with keys:
-        build_modes      : 'all' | 'pt_feeder' | 'rail'
-        use_zvv_geometry : bool
-        write_fullday    : bool
-        write_peak       : bool
-        write_offpeak    : bool
+        gtfs_input_folder  : str   – subfolder name under GTFS_TRANSIT_DIR
+        output_folder      : str   – subfolder name used for both PT-Feeder and Rail output
+        build_modes        : 'all' | 'pt_feeder' | 'rail'
+        use_zvv_geometry   : bool
+        write_fullday      : bool
+        write_allday       : bool
+        write_peak         : bool
+        write_offpeak      : bool
     """
     print("=" * 70)
     print("catchment_build_network.py — PIPELINE CONFIGURATION")
     print("=" * 70)
 
-    # --- A. Mode Selection ---------------------------------------------------
-    print("\nA. MODE SELECTION")
+    # --- A. GTFS Input Folder ------------------------------------------------
+    print("\nA. GTFS INPUT FOLDER")
+    print(f"   Base path: {paths.GTFS_TRANSIT_DIR}")
+    gtfs_base = os.path.join(paths.MAIN, paths.GTFS_TRANSIT_DIR)
+    if os.path.isdir(gtfs_base):
+        subfolders = sorted([
+            d for d in os.listdir(gtfs_base)
+            if os.path.isdir(os.path.join(gtfs_base, d))
+        ])
+        if subfolders:
+            print(f"   Available subfolders:")
+            for i, sf in enumerate(subfolders, 1):
+                print(f"     {i}) {sf}")
+    else:
+        subfolders = []
+
+    while True:
+        gtfs_input = input(
+            f"\n   Enter GTFS input folder name [{GTFS_INPUT_FOLDER}]: "
+        ).strip() or GTFS_INPUT_FOLDER
+        full_input = os.path.join(gtfs_base, gtfs_input)
+        if os.path.isdir(full_input):
+            break
+        if gtfs_input.isdigit() and 1 <= int(gtfs_input) <= len(subfolders):
+            gtfs_input = subfolders[int(gtfs_input) - 1]
+            break
+        print(f"   Folder not found: {full_input}")
+        print(f"   Please enter an existing subfolder name.")
+
+    # --- B. Mode Selection ---------------------------------------------------
+    print("\nB. MODE SELECTION")
     print("   Which mode groups should be built?")
     print("   1) All         - Build both PT-Feeder and Rail (default)")
     print("   2) PT-Feeder   - Only PT-Feeder modes (tram, bus, metro, ship, funicular)")
@@ -1623,32 +1776,31 @@ def _configure_pipeline():
     mode_map = {'1': 'all', '2': 'pt_feeder', '3': 'rail'}
     build_modes = mode_map[mode_choice]
 
-    # --- B. Time-Period Outputs ----------------------------------------------
-    print("\nB. TIME-PERIOD OUTPUTS")
+    # --- C. Time-Period Outputs ----------------------------------------------
+    print("\nC. TIME-PERIOD OUTPUTS")
     print("   Which time-period GeoPackages & QGZ files should be written?")
-    print("   1) All              - Full-day + peak + off-peak (default)")
-    print("   2) Full-day only    - No peak/off-peak split")
-    print("   3) Peak + off-peak  - No full-day output")
-    print("   4) Peak only")
-    print("   5) Off-peak only")
+    print("   1) All            - Full-day + all-day + peak + off-peak (default)")
+    print("   2) All day only   - Services that function constantly throughout the day")
+    print("   3) Peak only      - Network during peak hours")
+    print("   4) Off-peak only  - Network during off-peak hours")
 
     while True:
-        period_choice = input("\n   Select time-period output (1-5) [1]: ").strip() or "1"
-        if period_choice in ['1', '2', '3', '4', '5']:
+        period_choice = input("\n   Select time-period output (1-4) [1]: ").strip() or "1"
+        if period_choice in ['1', '2', '3', '4']:
             break
-        print("   Invalid selection. Please enter 1, 2, 3, 4, or 5.")
+        print("   Invalid selection. Please enter 1, 2, 3, or 4.")
 
+    #                  (fullday, allday, peak, offpeak)
     period_map = {
-        '1': (True,  True,  True),   # full-day, peak, off-peak
-        '2': (True,  False, False),
-        '3': (False, True,  True),
-        '4': (False, True,  False),
-        '5': (False, False, True),
+        '1': (True,  True,  True,  True),
+        '2': (False, True,  False, False),
+        '3': (False, False, True,  False),
+        '4': (False, False, False, True),
     }
-    write_fullday, write_peak, write_offpeak = period_map[period_choice]
+    write_fullday, write_allday, write_peak, write_offpeak = period_map[period_choice]
 
-    # --- C. Geometry Source ---------------------------------------------------
-    print("\nC. GEOMETRY SOURCE")
+    # --- D. Geometry Source ---------------------------------------------------
+    print("\nD. GEOMETRY SOURCE")
     print("   Which geometry should be used for line features?")
     print("   1) ZVV Geometry - Use actual ZVV route alignments where available,")
     print("                     straight-line fallback for unmatched segments (default)")
@@ -1662,39 +1814,58 @@ def _configure_pipeline():
 
     use_zvv_geometry = (geom_choice == '1')
 
+    # --- E. Output Folder ----------------------------------------------------
+    default_output = gtfs_input.replace('GTFS_', '', 1) + '_network' if gtfs_input.startswith('GTFS_') else gtfs_input + '_network'
+    print("\nE. OUTPUT FOLDER")
+    print(f"   PT-Feeder base: {paths.FEEDER_LINES_DIR}")
+    print(f"   Rail base:      {paths.RAIL_PROCESSED_DIR}")
+    output_folder = input(
+        f"\n   Enter output folder name [{default_output}]: "
+    ).strip() or default_output
+
     # --- Summary -------------------------------------------------------------
     mode_labels = {'all': 'ALL', 'pt_feeder': 'PT-FEEDER ONLY', 'rail': 'RAIL ONLY'}
     period_labels = {
-        '1': 'FULL-DAY + PEAK + OFF-PEAK',
-        '2': 'FULL-DAY ONLY',
-        '3': 'PEAK + OFF-PEAK (no full-day)',
-        '4': 'PEAK ONLY',
-        '5': 'OFF-PEAK ONLY',
+        '1': 'ALL (FULL-DAY + ALL-DAY + PEAK + OFF-PEAK)',
+        '2': 'ALL-DAY ONLY',
+        '3': 'PEAK ONLY',
+        '4': 'OFF-PEAK ONLY',
     }
     geom_labels = {'1': 'ZVV GEOMETRY', '2': 'SIMPLIFIED (straight-line)'}
 
     print("\n" + "-" * 70)
+    print("  CONFIGURATION SUMMARY")
+    print("-" * 70)
+    print(f"  GTFS input folder  : {gtfs_input}")
     print(f"  Mode selection     : {mode_labels[build_modes]}")
     print(f"  Time-period output : {period_labels[period_choice]}")
     print(f"  Geometry source    : {geom_labels[geom_choice]}")
+    print(f"  Output folder      : {output_folder}")
     print("-" * 70)
 
     return {
-        'build_modes':      build_modes,
-        'use_zvv_geometry': use_zvv_geometry,
-        'write_fullday':    write_fullday,
-        'write_peak':       write_peak,
-        'write_offpeak':    write_offpeak,
+        'gtfs_input_folder': gtfs_input,
+        'output_folder':     output_folder,
+        'build_modes':       build_modes,
+        'use_zvv_geometry':  use_zvv_geometry,
+        'write_fullday':     write_fullday,
+        'write_allday':      write_allday,
+        'write_peak':        write_peak,
+        'write_offpeak':     write_offpeak,
     }
 
 
 # Run configuration and apply to module-level constants
-_pipeline_cfg   = _configure_pipeline()
-BUILD_MODES     = _pipeline_cfg['build_modes']
-USE_ZVV_GEOMETRY = _pipeline_cfg['use_zvv_geometry']
-WRITE_FULLDAY   = _pipeline_cfg['write_fullday']
-WRITE_PEAK      = _pipeline_cfg['write_peak']
-WRITE_OFFPEAK   = _pipeline_cfg['write_offpeak']
+_pipeline_cfg        = _configure_pipeline()
+GTFS_INPUT_FOLDER    = _pipeline_cfg['gtfs_input_folder']
+PT_FEEDER_OUTPUT_FOLDER = _pipeline_cfg['output_folder']
+RAIL_OUTPUT_FOLDER   = _pipeline_cfg['output_folder']
+BUILD_MODES          = _pipeline_cfg['build_modes']
+USE_ZVV_GEOMETRY     = _pipeline_cfg['use_zvv_geometry']
+WRITE_FULLDAY        = _pipeline_cfg['write_fullday']
+WRITE_ALLDAY         = _pipeline_cfg['write_allday']
+WRITE_PEAK           = _pipeline_cfg['write_peak']
+WRITE_OFFPEAK        = _pipeline_cfg['write_offpeak']
 
 
 # ---------------------------------------------------------------------------
@@ -1705,8 +1876,10 @@ os.chdir(paths.MAIN)
 
 _pt_out_dir       = os.path.join(paths.FEEDER_LINES_DIR,   PT_FEEDER_OUTPUT_FOLDER)
 _rail_out_dir     = os.path.join(paths.RAIL_PROCESSED_DIR,  RAIL_OUTPUT_FOLDER)
+_pt_allday_dir    = os.path.join(_pt_out_dir,   'All_Day')
 _pt_peak_dir      = os.path.join(_pt_out_dir,   'Peak')
 _pt_offpeak_dir   = os.path.join(_pt_out_dir,   'Off_Peak')
+_rail_allday_dir  = os.path.join(_rail_out_dir,  'All_Day')
 _rail_peak_dir    = os.path.join(_rail_out_dir,  'Peak')
 _rail_offpeak_dir = os.path.join(_rail_out_dir,  'Off_Peak')
 
@@ -1716,6 +1889,14 @@ pt_segments_path  = os.path.join(_pt_out_dir,   PT_FEEDER_SEGMENTS_FILE)
 rl_stops_path     = os.path.join(_rail_out_dir,  RAIL_STOPS_FILE)
 rl_lines_path     = os.path.join(_rail_out_dir,  RAIL_LINES_FILE)
 rl_segments_path  = os.path.join(_rail_out_dir,  RAIL_SEGMENTS_FILE)
+
+# All-day paths — written into All_Day subdirectories
+pt_lines_allday_path       = os.path.join(_pt_allday_dir,    PT_FEEDER_LINES_ALLDAY_FILE)
+pt_segments_allday_path    = os.path.join(_pt_allday_dir,    PT_FEEDER_SEGMENTS_ALLDAY_FILE)
+pt_stops_allday_path       = os.path.join(_pt_allday_dir,    PT_FEEDER_STOPS_ALLDAY_FILE)
+rl_lines_allday_path       = os.path.join(_rail_allday_dir,  RAIL_LINES_ALLDAY_FILE)
+rl_segments_allday_path    = os.path.join(_rail_allday_dir,  RAIL_SEGMENTS_ALLDAY_FILE)
+rl_stops_allday_path       = os.path.join(_rail_allday_dir,  RAIL_STOPS_ALLDAY_FILE)
 
 # Peak / off-peak paths — written into Peak / Off_Peak subdirectories
 pt_lines_peak_path       = os.path.join(_pt_peak_dir,      PT_FEEDER_LINES_PEAK_FILE)
@@ -1743,6 +1924,9 @@ print("=" * 70)
 
 _ensure_dir(_pt_out_dir)
 _ensure_dir(_rail_out_dir)
+if WRITE_ALLDAY:
+    _ensure_dir(_pt_allday_dir)
+    _ensure_dir(_rail_allday_dir)
 if WRITE_PEAK:
     _ensure_dir(_pt_peak_dir)
     _ensure_dir(_rail_peak_dir)
@@ -1764,6 +1948,7 @@ stop_times     = _load('stop_times.txt')
 mode_class     = _load('mode_class.txt')
 calendar       = _load('calendar.txt')
 calendar_dates = _load('calendar_dates.txt')
+frequencies_df = _load('frequencies.txt')      # optional — frequency-based GTFS
 
 if any(x is None for x in [stops, routes_all, trips_all, stop_times, mode_class, calendar]):
     raise FileNotFoundError(
@@ -1771,6 +1956,25 @@ if any(x is None for x in [stops, routes_all, trips_all, stop_times, mode_class,
         f"{os.path.join(paths.GTFS_TRANSIT_DIR, GTFS_INPUT_FOLDER)}. "
         "Run catchment_filter_gtfs.py first."
     )
+
+# Build frequency lookup: trip_id → list of (start_time, end_time, headway_secs)
+# Used by the dual-path logic to expand frequency-based departures on-the-fly.
+_freq_trip_ids = set()            # trip_ids that have frequency entries
+_freq_lookup   = defaultdict(list)  # trip_id → [(start_minutes, end_minutes, headway_minutes)]
+if frequencies_df is not None and len(frequencies_df) > 0:
+    for _, row in frequencies_df.iterrows():
+        tid = row['trip_id']
+        start_min = _to_minutes_str(row['start_time'])
+        end_min   = _to_minutes_str(row['end_time'])
+        headway_s = float(row['headway_secs'])
+        if start_min is None or end_min is None or headway_s <= 0:
+            continue
+        _freq_trip_ids.add(tid)
+        _freq_lookup[tid].append((start_min, end_min, headway_s / 60.0))
+    print(f"  frequencies.txt: {len(frequencies_df):,} entries for "
+          f"{len(_freq_trip_ids):,} frequency-based trips")
+else:
+    print("  frequencies.txt: not present — all trips are schedule-based")
 
 # Service IDs that run on at least WEEKDAY_MIN_DAYS out of Mon–Fri
 # Derive timetable validity period from calendar.txt date ranges
@@ -2127,19 +2331,36 @@ def _classify_variants(dir_group, allowed_trip_ids=None, relax_cv=False):
         if share < VARIANT_MIN_TRIP_SHARE:
             continue
 
-        # Get first-stop departure times for these trips
-        sub = stop_times[stop_times['trip_id'].isin(trip_ids)].copy()
-        if sub.empty:
+        # Get first-stop departure times for these trips.
+        # Dual-path: schedule-based trips use stop_times directly;
+        # frequency-based trips are expanded from headway bands.
+        sched_ids = trip_ids - _freq_trip_ids
+        freq_ids  = trip_ids & _freq_trip_ids
+
+        parts = []
+        if sched_ids:
+            sub = stop_times[stop_times['trip_id'].isin(sched_ids)].copy()
+            if not sub.empty:
+                fs = sub.loc[sub.groupby('trip_id')['stop_sequence_int'].idxmin()].copy()
+                fs = fs.merge(
+                    trips_all[['trip_id', 'route_id', 'direction_id']],
+                    on='trip_id', how='left'
+                )
+                parts.append(fs)
+        if freq_ids:
+            # Expand frequency-based trips across the full operational window
+            freq_deps = _expand_freq_departures(
+                freq_ids, time_col_global, AM_PEAK_START, PM_PEAK_END)
+            if not freq_deps.empty:
+                parts.append(freq_deps)
+
+        if not parts:
             continue
-        first_stops = sub.loc[sub.groupby('trip_id')['stop_sequence_int'].idxmin()].copy()
+        first_stops = pd.concat(parts, ignore_index=True)
 
         # Full dedup (pass 1: exact time+stop_id, pass 2: terminal merge
         # within TERMINAL_MERGE_MINUTES per route+direction) — matches the
         # dedup that _compute_frequencies sees via _get_window_departures.
-        first_stops = first_stops.merge(
-            trips_all[['trip_id', 'route_id', 'direction_id']],
-            on='trip_id', how='left'
-        )
         first_stops = _dedup_first_stops(first_stops, time_col_global)
 
         dep_times = first_stops[time_col_global].apply(_to_minutes_str).dropna().sort_values().tolist()
@@ -2498,7 +2719,7 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
                 if geom is None:
                     continue
 
-                circular        = _is_circular(seq)
+                circular        = _is_circular(seq, single_direction=(len(directions) == 1))
                 _variant_windows = dir_windows.get(direction_id)
                 freqs           = _compute_frequencies(variant_trip_ids, windows=_variant_windows,
                                                        min_departures=VARIANT_FREQ_MIN_DEPARTURES)
@@ -2631,12 +2852,20 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
     # Swiss PT services always operate bidirectionally.  Routes with only
     # one direction surviving indicate geographic filter artefacts or
     # incomplete GTFS data; they are removed entirely.
+    # Exception: circular routes (first stop == last stop) legitimately have
+    # only one direction_id because the outbound and return are the same trip.
     _single_dir_dropped = 0
     for rt in list(line_records.keys()):
-        _route_dirs = defaultdict(set)  # route_id → set of direction_ids
+        _route_dirs = defaultdict(set)       # route_id → set of direction_ids
+        _route_circular = defaultdict(bool)   # route_id → True if any variant is circular
         for rec in line_records[rt]:
             _route_dirs[rec['route_id']].add(rec['direction_id'])
-        _drop_routes = {rid for rid, dirs in _route_dirs.items() if len(dirs) < 2}
+            if rec.get('is_circular', False):
+                _route_circular[rec['route_id']] = True
+        _drop_routes = {
+            rid for rid, dirs in _route_dirs.items()
+            if len(dirs) < 2 and not _route_circular[rid]
+        }
         if _drop_routes:
             _before = len(line_records[rt])
             line_records[rt] = [
@@ -3014,16 +3243,25 @@ def _filter_stops_for_lines(lines_by_type, stops_by_type):
     return result
 
 
+ALLDAY_PERIODS  = {'all_day'}
 PEAK_PERIODS    = {'peak_only', 'all_day'}
 OFFPEAK_PERIODS = {'offpeak_only', 'all_day'}
 
 # Initialise filtered dicts to empty — populated below only when requested.
-pt_lines_peak = pt_lines_offpeak = {}
-pt_segs_peak = pt_segs_offpeak = {}
-pt_stops_peak = pt_stops_offpeak = {}
-rl_lines_peak = rl_lines_offpeak = {}
-rl_segs_peak = rl_segs_offpeak = {}
-rl_stops_peak = rl_stops_offpeak = {}
+pt_lines_allday = pt_lines_peak = pt_lines_offpeak = {}
+pt_segs_allday = pt_segs_peak = pt_segs_offpeak = {}
+pt_stops_allday = pt_stops_peak = pt_stops_offpeak = {}
+rl_lines_allday = rl_lines_peak = rl_lines_offpeak = {}
+rl_segs_allday = rl_segs_peak = rl_segs_offpeak = {}
+rl_stops_allday = rl_stops_peak = rl_stops_offpeak = {}
+
+if WRITE_ALLDAY:
+    pt_lines_allday   = _filter_lines_by_period(pt_lines_by_type, ALLDAY_PERIODS)
+    pt_segs_allday    = _filter_segments_by_period(pt_segments_by_type, ALLDAY_PERIODS)
+    pt_stops_allday   = _filter_stops_for_lines(pt_lines_allday,  pt_stops_by_type)
+    rl_lines_allday   = _filter_lines_by_period(rail_lines_by_type, ALLDAY_PERIODS)
+    rl_segs_allday    = _filter_segments_by_period(rail_segments_by_type, ALLDAY_PERIODS)
+    rl_stops_allday   = _filter_stops_for_lines(rl_lines_allday,  rail_stops_by_type)
 
 if WRITE_PEAK:
     pt_lines_peak     = _filter_lines_by_period(pt_lines_by_type, PEAK_PERIODS)
@@ -3041,8 +3279,17 @@ if WRITE_OFFPEAK:
     rl_segs_offpeak   = _filter_segments_by_period(rail_segments_by_type, OFFPEAK_PERIODS)
     rl_stops_offpeak  = _filter_stops_for_lines(rl_lines_offpeak, rail_stops_by_type)
 
-# Write peak / off-peak GeoPackages
+# Write all-day / peak / off-peak GeoPackages
 _period_write_list = []
+if WRITE_ALLDAY:
+    _period_write_list += [
+        ('PT-Feeder lines allday',     pt_lines_allday,   pt_lines_allday_path),
+        ('PT-Feeder segments allday',  pt_segs_allday,    pt_segments_allday_path),
+        ('PT-Feeder stops allday',     pt_stops_allday,   pt_stops_allday_path),
+        ('Rail lines allday',          rl_lines_allday,   rl_lines_allday_path),
+        ('Rail segments allday',       rl_segs_allday,    rl_segments_allday_path),
+        ('Rail stops allday',          rl_stops_allday,   rl_stops_allday_path),
+    ]
 if WRITE_PEAK:
     _period_write_list += [
         ('PT-Feeder lines peak',       pt_lines_peak,     pt_lines_peak_path),
@@ -3155,6 +3402,17 @@ if WRITE_FULLDAY:
                          pt_stops_by_type, PT_FEEDER_STOPS_FILE,
                          PT_FEEDER_LINE_TYPES, 'pt_feeder')
 
+# PT-Feeder all-day QGZ
+if WRITE_ALLDAY:
+    _build_lines_qgz(_pt_allday_dir, PT_FEEDER_LINES_ALLDAY_PROJECT_FILE,
+                      pt_lines_allday, PT_FEEDER_LINES_ALLDAY_FILE,
+                      pt_stops_allday, PT_FEEDER_STOPS_ALLDAY_FILE,
+                      PT_FEEDER_LINE_TYPES, 'pt_feeder')
+    _build_segments_qgz(_pt_allday_dir, PT_FEEDER_SEGMENTS_ALLDAY_PROJECT_FILE,
+                         pt_segs_allday, PT_FEEDER_SEGMENTS_ALLDAY_FILE,
+                         pt_stops_allday, PT_FEEDER_STOPS_ALLDAY_FILE,
+                         PT_FEEDER_LINE_TYPES, 'pt_feeder')
+
 # PT-Feeder peak / off-peak QGZ
 if WRITE_PEAK:
     _build_lines_qgz(_pt_peak_dir, PT_FEEDER_LINES_PEAK_PROJECT_FILE,
@@ -3185,6 +3443,17 @@ if WRITE_FULLDAY:
     _build_segments_qgz(_rail_out_dir, RAIL_SEGMENTS_PROJECT_FILE,
                          rail_segments_by_type, RAIL_SEGMENTS_FILE,
                          rail_stops_by_type, RAIL_STOPS_FILE,
+                         RAIL_LINE_TYPES, 'rail')
+
+# Rail all-day QGZ
+if WRITE_ALLDAY:
+    _build_lines_qgz(_rail_allday_dir, RAIL_LINES_ALLDAY_PROJECT_FILE,
+                      rl_lines_allday, RAIL_LINES_ALLDAY_FILE,
+                      rl_stops_allday, RAIL_STOPS_ALLDAY_FILE,
+                      RAIL_LINE_TYPES, 'rail')
+    _build_segments_qgz(_rail_allday_dir, RAIL_SEGMENTS_ALLDAY_PROJECT_FILE,
+                         rl_segs_allday, RAIL_SEGMENTS_ALLDAY_FILE,
+                         rl_stops_allday, RAIL_STOPS_ALLDAY_FILE,
                          RAIL_LINE_TYPES, 'rail')
 
 # Rail peak / off-peak QGZ
@@ -3286,6 +3555,7 @@ def _rt_breakdown(by_type, label_map):
 _mode_label_report = {'all': 'All (PT-Feeder + Rail)', 'pt_feeder': 'PT-Feeder only', 'rail': 'Rail only'}
 _period_parts = []
 if WRITE_FULLDAY:  _period_parts.append('full-day')
+if WRITE_ALLDAY:   _period_parts.append('all-day')
 if WRITE_PEAK:     _period_parts.append('peak')
 if WRITE_OFFPEAK:  _period_parts.append('off-peak')
 _period_label_report = ' + '.join(_period_parts) if _period_parts else '(none)'
@@ -3295,6 +3565,11 @@ if WRITE_FULLDAY:
     _output_files_report += [
         f"  {pt_stops_path}", f"  {pt_lines_path}", f"  {pt_segments_path}",
         f"  {rl_stops_path}", f"  {rl_lines_path}", f"  {rl_segments_path}",
+    ]
+if WRITE_ALLDAY:
+    _output_files_report += [
+        f"  {pt_lines_allday_path}", f"  {pt_segments_allday_path}", f"  {pt_stops_allday_path}",
+        f"  {rl_lines_allday_path}", f"  {rl_segments_allday_path}", f"  {rl_stops_allday_path}",
     ]
 if WRITE_PEAK:
     _output_files_report += [
@@ -3314,6 +3589,8 @@ report_lines = [
     "=" * 70,
     "",
     "PIPELINE CONFIGURATION",
+    f"  GTFS input folder  : {GTFS_INPUT_FOLDER}",
+    f"  Output folder      : {PT_FEEDER_OUTPUT_FOLDER}",
     f"  Mode selection     : {_mode_label_report.get(BUILD_MODES, BUILD_MODES)}",
     f"  Time-period output : {_period_label_report}",
     f"  Geometry source    : {'ZVV Geometry' if USE_ZVV_GEOMETRY else 'Simplified (straight-line)'}",
@@ -3322,8 +3599,10 @@ report_lines = [
     f"  CATCHMENT_METHOD : {settings.CATCHMENT_METHOD}",
     f"  CATCHMENT_CANTON : {settings.CATCHMENT_CANTON}",
     f"  GTFS source      : {os.path.join(paths.GTFS_TRANSIT_DIR, GTFS_INPUT_FOLDER)}",
+    f"  Output folder    : {PT_FEEDER_OUTPUT_FOLDER}",
     f"  Spatial CRS      : {CODEBASE_CRS}",
     f"  Weekday filter   : ≥{WEEKDAY_MIN_DAYS}/5 weekdays",
+    f"  Freq-based trips : {len(_freq_trip_ids):,} trips from frequencies.txt",
     "",
     "OUTPUT FILES",
 ] + _output_files_report + [
@@ -3389,9 +3668,11 @@ report_lines = [
     "  InVehWait_min   : median dwell at from_stop (rounded to .0 / .5 min)",
     "  Coordinates     : from_stop_E/N, to_stop_E/N (EPSG:2056)",
     "",
-    "PEAK / OFF-PEAK NETWORKS",
+    "ALL-DAY / PEAK / OFF-PEAK NETWORKS",
+    f"  All-day outputs written : {'Yes' if WRITE_ALLDAY else 'No (skipped)'}",
     f"  Peak outputs written    : {'Yes' if WRITE_PEAK else 'No (skipped)'}",
     f"  Off-peak outputs written: {'Yes' if WRITE_OFFPEAK else 'No (skipped)'}",
+    "  All-day : service_period in {all_day}",
     "  Peak    : service_period in {peak_only, all_day}",
     "  Off-peak: service_period in {offpeak_only, all_day}",
     "",
