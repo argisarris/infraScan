@@ -6,7 +6,7 @@ rail_network = 'AK_2035'
 
 #CACHE
 use_cache_network = False
-use_cache_pt_catchment = True
+use_cache_pt_catchment = False
 use_cache_developments = False
 use_cache_catchmentOD = False
 use_cache_stationsOD = False
