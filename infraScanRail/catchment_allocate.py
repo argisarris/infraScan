@@ -12,7 +12,9 @@
 #   Data outputs  -> data/Catchment_Area/            (shared Step 1)
 #                    data/Catchment_Area/Municipal/   (municipal method)
 #                    data/Catchment_Area/PT_Feeder/   (PT-feeder method)
-#   Plot outputs  -> plots/Catchment_Area/            (all plots)
+#   Plot outputs  -> plots/Catchment_Area/            (shared Step 1 plots)
+#                    plots/Catchment_Area/Municipal/  (municipal method)
+#                    plots/Catchment_Area/PT_Feeder/  (PT-feeder method)
 
 import os
 import time
@@ -25,11 +27,11 @@ import pandas as pd
 import rasterio
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
-from rasterio.features import rasterize
 from rasterio.transform import from_origin
 from scipy.spatial import cKDTree
-from shapely.geometry import Point, Polygon
+from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
+from shapely.prepared import prep
 
 import paths
 import settings
@@ -80,12 +82,15 @@ CATCHMENT_DATA_DIR  = paths.CATCHMENT_AREA_DIR               # data/Catchment_Ar
 CATCHMENT_PLOT_DIR  = os.path.join('plots', 'Catchment_Area') # plots/Catchment_Area
 MUNICIPAL_DATA_DIR  = os.path.join(CATCHMENT_DATA_DIR, 'Municipal')
 PT_FEEDER_DATA_DIR  = os.path.join(CATCHMENT_DATA_DIR, 'PT_Feeder')
+MUNICIPAL_PLOT_DIR  = os.path.join(CATCHMENT_PLOT_DIR, 'Municipal')
+PT_FEEDER_PLOT_DIR  = os.path.join(CATCHMENT_PLOT_DIR, 'PT_Feeder')
 
 
 def _ensure_dirs():
     """Create all output directories."""
     for d in [CATCHMENT_DATA_DIR, CATCHMENT_PLOT_DIR,
-              MUNICIPAL_DATA_DIR, PT_FEEDER_DATA_DIR]:
+              MUNICIPAL_DATA_DIR, PT_FEEDER_DATA_DIR,
+              MUNICIPAL_PLOT_DIR, PT_FEEDER_PLOT_DIR]:
         os.makedirs(d, exist_ok=True)
 
 
@@ -126,71 +131,69 @@ def _load_employment_grid(boundary):
 
 
 def _load_grid(df, boundary, label):
-    """Shared loader for population / employment CSVs."""
-    # Swiss CSVs may use comma as decimal separator (e.g. "5,376" = 5.376).
-    # Replace commas before numeric conversion so these are not lost.
+    """Shared loader for population / employment CSVs.
+
+    Cells are included if their centroid is strictly inside the boundary OR
+    if at least 50 % of the 100×100 m cell area intersects the boundary
+    (edge-cell rule).  A fast centroid pre-filter limits the expensive area
+    check to cells within one cell-width of the boundary.
+    """
+    # Swiss CSVs may use comma as decimal separator (e.g. "5,376" → 5.376).
     for col in ['E_KOORD', 'N_KOORD', 'NUMMER']:
         df[col] = pd.to_numeric(
             df[col].astype(str).str.replace(',', '.', regex=False),
             errors='coerce',
         )
+    if 'CLASS' in df.columns:
+        df['CLASS'] = pd.to_numeric(df['CLASS'], errors='coerce')
     df = df.dropna(subset=['E_KOORD', 'N_KOORD', 'NUMMER'])
     df = df[df['NUMMER'] > 0].copy()
 
-    # Compute cell centroids (bottom-left corner + 50m)
+    # Compute cell centroids (bottom-left corner + 50 m)
     df['cx'] = df['E_KOORD'] + 50
     df['cy'] = df['N_KOORD'] + 50
     geometry = gpd.points_from_xy(df['cx'], df['cy'])
     gdf = gpd.GeoDataFrame(df, geometry=geometry, crs=CODEBASE_CRS)
 
-    # Clip to study area
+    # Step 1: fast pre-filter — drop cells more than one cell-width outside
     from shapely.prepared import prep
+    from shapely.geometry import box as _cell_box
+    prep_expanded = prep(boundary.buffer(CELL_SIZE_M))
+    gdf = gdf[gdf.geometry.apply(prep_expanded.contains)].copy()
+
+    # Step 2: centroid strictly inside → keep unconditionally
     prep_boundary = prep(boundary)
-    mask = gdf.geometry.apply(lambda pt: prep_boundary.contains(pt))
-    gdf = gdf[mask].copy()
-    print(f"    {label}: {len(gdf):,} cells within study area")
+    inside_mask = gdf.geometry.apply(prep_boundary.contains)
+    inside = gdf[inside_mask]
+
+    # Step 3: edge cells — keep if ≥50 % of cell area intersects boundary
+    edge_gdf = gdf[~inside_mask]
+    cell_area = CELL_SIZE_M * CELL_SIZE_M
+    if len(edge_gdf) > 0:
+        keep_idx = [
+            idx for idx, row in edge_gdf.iterrows()
+            if _cell_box(row['E_KOORD'], row['N_KOORD'],
+                         row['E_KOORD'] + CELL_SIZE_M,
+                         row['N_KOORD'] + CELL_SIZE_M
+                         ).intersection(boundary).area / cell_area >= 0.5
+        ]
+        gdf = pd.concat([inside, edge_gdf.loc[keep_idx]]).copy()
+    else:
+        gdf = inside.copy()
+
+    print(f"    {label}: {len(gdf):,} cells within study area (≥50 % overlap)")
 
     area_tag = '_'.join(settings.CATCHMENT_CANTON).replace(' ', '')
 
-    # Save filtered CSV
+    # Save filtered CSV (include CLASS if present)
+    save_cols = ['RELI', 'E_KOORD', 'N_KOORD', 'NUMMER']
+    if 'CLASS' in gdf.columns:
+        save_cols.append('CLASS')
     csv_path = os.path.join(CATCHMENT_DATA_DIR, f'{label}_2023_{area_tag}.csv')
-    gdf[['RELI', 'E_KOORD', 'N_KOORD', 'NUMMER']].to_csv(csv_path, index=False, sep=';')
+    gdf[save_cols].to_csv(csv_path, index=False, sep=';')
     print(f"    Saved filtered CSV -> {csv_path}")
 
-    # Write GeoTIFF
-    _write_grid_tif(gdf, label)
-
     return gdf
-
-
-def _write_grid_tif(gdf, label):
-    """Rasterise a filtered grid GeoDataFrame into a single-band GeoTIFF."""
-    e_min = int(gdf['E_KOORD'].min())
-    e_max = int(gdf['E_KOORD'].max()) + CELL_SIZE_M
-    n_min = int(gdf['N_KOORD'].min())
-    n_max = int(gdf['N_KOORD'].max()) + CELL_SIZE_M
-
-    width  = (e_max - e_min) // CELL_SIZE_M
-    height = (n_max - n_min) // CELL_SIZE_M
-
-    raster = np.zeros((height, width), dtype=np.float32)
-
-    for _, row in gdf.iterrows():
-        col = int((row['E_KOORD'] - e_min) // CELL_SIZE_M)
-        r   = int((n_max - row['N_KOORD'] - CELL_SIZE_M) // CELL_SIZE_M)
-        if 0 <= r < height and 0 <= col < width:
-            raster[r, col] = row['NUMMER']
-
-    transform = from_origin(e_min, n_max, CELL_SIZE_M, CELL_SIZE_M)
-    tif_path = os.path.join(CATCHMENT_DATA_DIR, f'{label}_2023.tif')
-
-    with rasterio.open(tif_path, 'w', driver='GTiff',
-                       height=height, width=width, count=1,
-                       dtype='float32', crs=CODEBASE_CRS,
-                       transform=transform, nodata=0) as dst:
-        dst.write(raster, 1)
-
-    print(f"    Saved GeoTIFF -> {tif_path}  ({width}x{height})")
 
 
 def _cumulate_per_municipality(pop_grid, empl_grid, boundary):
@@ -290,10 +293,10 @@ def _plot_municipal_distributions(summary_df, boundary):
     Uses the same discrete FSO class breaks as the raster plots so that the
     municipal and raster maps share a common visual language.
     Saved to plots/Catchment_Area/.
+    For MultiPolygon boundaries a separate plot is produced per component.
     """
     print("  Plotting municipal distributions ...")
 
-    # Cumulated bins reflecting total pop/empl per municipality
     pop_cfg = dict(
         bins   = [0, 2000, 5000, 10000, 20000, 50000, np.inf],
         labels = ['1–2,000', '2,001–5,000', '5,001–10,000',
@@ -305,10 +308,18 @@ def _plot_municipal_distributions(summary_df, boundary):
         bins   = [0, 500, 1500, 5000, 20000, np.inf],
         labels = ['1–500', '501–1,500', '1,501–5,000',
                   '5,001–20,000', 'more than 20,000'],
-        colors = ['#C7E9C0', '#74C476', '#238B45', '#31A354', '#2C7FB8', '#253494'],
+        colors = ['#C7E9C0', '#74C476', '#238B45', '#2C7FB8', '#253494'],
         col_header = 'Total full-time equivalents',
     )
-    grey = '#D3D3D3'
+
+    # Load lakes once for all plots in this function
+    lakes = None
+    if os.path.exists(paths.LAKES_SHP):
+        lakes = gpd.read_file(paths.LAKES_SHP).to_crs(CODEBASE_CRS)
+        lakes = lakes[lakes.geometry.intersects(boundary)].copy()
+
+    components = (list(boundary.geoms)
+                  if boundary.geom_type == 'MultiPolygon' else [boundary])
 
     for col, title_word, cfg in [
         ('total_population', 'Population', pop_cfg),
@@ -318,57 +329,76 @@ def _plot_municipal_distributions(summary_df, boundary):
         labels = cfg['labels']
         colors = cfg['colors']
 
-        # Assign each municipality to a class (0-indexed into labels/colors).
-        # Use pd.cut so the open-ended top bin (np.inf) is handled correctly.
-        vals = summary_df[col].fillna(0).values
-        class_idx = (pd.cut(vals, bins=bins, labels=False, right=True)
-                       .clip(0, len(labels) - 1)
-                       .astype(int))
+        for part_idx, component in enumerate(components):
+            part_suffix = f'_part{part_idx + 1}' if len(components) > 1 else ''
 
-        fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+            clipped_summary = gpd.clip(summary_df, component)
+            vals      = clipped_summary[col].fillna(0).values
+            zero_mask = vals <= 0
+            # fillna(0) before astype(int) handles the NaN pd.cut returns
+            # for exact-zero values (which fall below the open lower bin edge)
+            class_idx = (pd.Series(pd.cut(vals, bins=bins, labels=False, right=True))
+                           .clip(0, len(labels) - 1)
+                           .fillna(0)
+                           .astype(int)
+                           .values)
 
-        # Plot grey background for zero/missing first
-        zero_mask = vals <= 0
-        if zero_mask.any():
-            summary_df[zero_mask].plot(ax=ax, color=grey,
-                                       edgecolor='grey', linewidth=0.4)
+            fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+            ax.set_facecolor('#E8E8E8')   # grey outside the catchment
 
-        for ci, color in enumerate(colors):
-            mask = (class_idx == ci) & (~zero_mask)
-            if not mask.any():
-                continue
-            summary_df[mask].plot(ax=ax, color=color,
-                                  edgecolor='grey', linewidth=0.4)
+            # White fill for catchment interior (zero-value munis show as white)
+            comp_gdf = gpd.GeoDataFrame(geometry=[component], crs=CODEBASE_CRS)
+            comp_gdf.plot(ax=ax, color='white', edgecolor='none', zorder=0)
 
-        # Catchment area boundary
-        boundary_gdf = gpd.GeoDataFrame(geometry=[boundary], crs=CODEBASE_CRS)
-        boundary_gdf.boundary.plot(ax=ax, color='black', linewidth=1.8,
+            for ci, color in enumerate(colors):
+                mask = (class_idx == ci) & (~zero_mask)
+                if not mask.any():
+                    continue
+                clipped_summary[mask].plot(ax=ax, color=color,
+                                           edgecolor='grey', linewidth=0.4,
+                                           zorder=1)
+
+            # Lakes above fill, below boundary line
+            if lakes is not None and not lakes.empty:
+                lakes_clip = gpd.clip(lakes, component)
+                if not lakes_clip.empty:
+                    lakes_clip.plot(ax=ax, color='#A8D8EA', edgecolor='none',
+                                    zorder=4)
+
+            # Catchment area boundary
+            comp_gdf.boundary.plot(ax=ax, color='black', linewidth=1.8,
                                    linestyle='--', zorder=5)
 
-        # Legend (0 first, then data classes, then boundary)
-        legend_handles = [Patch(facecolor=grey, edgecolor='none', label='0')]
-        for color, lbl in zip(colors, labels):
-            legend_handles.append(Patch(facecolor=color, edgecolor='none', label=lbl))
-        legend_handles.append(Line2D([0], [0], color='black', linewidth=1.8,
-                                     linestyle='--', label='Catchment area boundary'))
+            bx_min, by_min, bx_max, by_max = component.bounds
+            pad = 200
+            ax.set_xlim(bx_min - pad, bx_max + pad)
+            ax.set_ylim(by_min - pad, by_max + pad)
 
-        ax.legend(handles=legend_handles,
-                  title=cfg['col_header'],
-                  title_fontsize=8,
-                  fontsize=7,
-                  loc='upper right',
-                  framealpha=0.9)
+            legend_handles = []
+            for color, lbl in zip(colors, labels):
+                legend_handles.append(
+                    Patch(facecolor=color, edgecolor='none', label=lbl))
+            legend_handles.append(
+                Line2D([0], [0], color='black', linewidth=1.8,
+                       linestyle='--', label='Catchment area boundary'))
 
-        ax.set_title(f'{title_word} per Municipality', fontsize=14)
-        ax.set_xlabel('E [m]')
-        ax.set_ylabel('N [m]')
-        ax.set_aspect('equal')
+            ax.legend(handles=legend_handles,
+                      title=cfg['col_header'],
+                      title_fontsize=8,
+                      fontsize=7,
+                      loc='upper right',
+                      framealpha=0.9)
 
-        fname = f'plot_{title_word.lower()}_by_municipality.pdf'
-        out_path = os.path.join(CATCHMENT_PLOT_DIR, fname)
-        fig.savefig(out_path, bbox_inches='tight', dpi=150)
-        plt.close(fig)
-        print(f"    Saved -> {out_path}")
+            ax.set_title(f'{title_word} per Municipality', fontsize=14)
+            ax.set_xlabel('E [m]')
+            ax.set_ylabel('N [m]')
+            ax.set_aspect('equal')
+
+            fname = f'plot_{title_word.lower()}_by_municipality{part_suffix}.pdf'
+            out_path = os.path.join(CATCHMENT_PLOT_DIR, fname)
+            fig.savefig(out_path, bbox_inches='tight', dpi=150)
+            plt.close(fig)
+            print(f"    Saved -> {out_path}")
 
 
 def _plot_raster_map(gdf, label, boundary):
@@ -376,44 +406,38 @@ def _plot_raster_map(gdf, label, boundary):
     styled to match the corresponding map.geo.admin FSO layer.
 
     Population  → FSO "Population Statistics: Inhabitants"
-                  6 discrete classes + grey for 0, yellow→red palette
+                  6 discrete classes, yellow→red palette
     Employment  → FSO "Enterprise Statistics: Employment (FTE)"
-                  5 discrete classes + grey for 0, yellow→green→blue palette
+                  5 discrete classes, yellow→green→blue palette
 
-    Cells are drawn as 100 m × 100 m square patches matching the raster grid.
+    Cells are drawn as 100 m × 100 m square patches.
+    Grey axes background outside the catchment; white interior for zero cells.
     Saved to plots/Catchment_Area/.
+    For MultiPolygon boundaries a separate plot is produced per component.
     """
     print(f"  Plotting {label} raster map ...")
 
     is_pop = (label == 'population')
 
-    # --- FSO-aligned discrete class breaks and exact hex colours ---
     if is_pop:
-        # FSO Population Statistics: Inhabitants (per ha / 100 m cell)
         bins   = [0, 3, 6, 15, 40, 120, np.inf]
         labels = ['1–3', '4–6', '7–15', '16–40', '41–120', 'more than 120']
         colors = ['#FFFFB2', '#FECC5C', '#FD8D3C', '#F03B20', '#BD0026', '#800026']
         col_header = 'Inhabitants per ha'
         title      = 'Population'
     else:
-        # FSO Enterprise Statistics: Employment FTE (per ha / 100 m cell)
         bins   = [0, 40, 75, 150, 300, np.inf]
         labels = ['0.1–40', '40.1–75', '75.1–150', '150.1–300', 'more than 300']
         colors = ['#C7E9C0', '#74C476', '#238B45', '#2C7FB8', '#253494']
         col_header = 'Full-time equivalents per ha'
         title      = 'Employment (FTE)'
 
-    grey = '#D3D3D3'
     n_classes = len(labels)
 
-    # Assign each cell to a 0-based class index.
-    # np.digitize with bins[1:] returns 0 for val < first break, 1 for first bin, etc.
-    # That result is already the correct 0-based index — just clip for safety.
     vals = gdf['NUMMER'].values
     class_idx = np.digitize(vals, bins[1:], right=False)
     class_idx = np.clip(class_idx, 0, n_classes - 1)
 
-    # Build square polygon geometry: bottom-left = (E_KOORD, N_KOORD), size = CELL_SIZE_M
     from shapely.geometry import box as _box
     squares = [
         _box(row['E_KOORD'], row['N_KOORD'],
@@ -426,66 +450,92 @@ def _plot_raster_map(gdf, label, boundary):
         crs=CODEBASE_CRS,
     )
 
-    # Load municipal boundaries for overlay — clip to study area so that
-    # adjacent municipality lines do not extend beyond the catchment boundary
-    muni = gpd.read_file(paths.MUNICIPAL_BOUNDARIES_GPKG)
-    muni = muni.to_crs(CODEBASE_CRS)
+    # Load municipal boundaries once (pre-filter to full boundary extent)
+    muni = gpd.read_file(paths.MUNICIPAL_BOUNDARIES_GPKG).to_crs(CODEBASE_CRS)
     if 'objektart' in muni.columns:
         muni = muni[muni['objektart'] == 'Gemeindegebiet']
     muni = muni[muni.geometry.intersects(boundary)].copy()
-    muni = gpd.clip(muni, boundary)
 
-    fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+    # Load lakes once
+    lakes = None
+    if os.path.exists(paths.LAKES_SHP):
+        lakes = gpd.read_file(paths.LAKES_SHP).to_crs(CODEBASE_CRS)
+        lakes = lakes[lakes.geometry.intersects(boundary)].copy()
 
-    # Plot grey background covering the full study area for zero-value cells
-    boundary_gdf = gpd.GeoDataFrame(geometry=[boundary], crs=CODEBASE_CRS)
-    boundary_gdf.plot(ax=ax, color=grey, edgecolor='none')
+    components = (list(boundary.geoms)
+                  if boundary.geom_type == 'MultiPolygon' else [boundary])
 
-    # Plot each class as filled squares (no edge to avoid grid lines at small scale)
-    for ci, (color, lbl) in enumerate(zip(colors, labels)):
-        mask = plot_gdf['class_idx'] == ci
-        if not mask.any():
-            continue
-        plot_gdf[mask].plot(ax=ax, color=color, edgecolor='none', linewidth=0)
+    for part_idx, component in enumerate(components):
+        part_suffix = f'_part{part_idx + 1}' if len(components) > 1 else ''
 
-    # Municipal boundaries as thin dark grey lines
-    # Drop point artefacts that arise where clipped municipalities only touch the
-    # catchment boundary at a single point — their .boundary is a MultiPoint which
-    # matplotlib renders as filled circles on the border.
-    muni_lines = muni.boundary.explode(index_parts=False)
-    muni_lines = muni_lines[~muni_lines.geom_type.isin(['Point', 'MultiPoint'])]
-    muni_lines.plot(ax=ax, color='#404040', linewidth=0.3, zorder=4)
+        fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+        ax.set_facecolor('#E8E8E8')   # grey outside the catchment
 
-    # Catchment area boundary
-    boundary_gdf.boundary.plot(ax=ax, color='black', linewidth=1.8,
+        # White fill for catchment interior (zero-value cells show as white)
+        comp_gdf = gpd.GeoDataFrame(geometry=[component], crs=CODEBASE_CRS)
+        comp_gdf.plot(ax=ax, color='white', edgecolor='none', zorder=0)
+
+        # Clip and plot cell squares for this component
+        plot_comp = gpd.clip(plot_gdf, component)
+        for ci, (color, lbl) in enumerate(zip(colors, labels)):
+            mask = plot_comp['class_idx'] == ci
+            if not mask.any():
+                continue
+            plot_comp[mask].plot(ax=ax, color=color, edgecolor='none',
+                                 linewidth=0, zorder=1)
+
+        # Municipal boundaries (clipped to component)
+        muni_comp  = gpd.clip(muni, component)
+        muni_lines = muni_comp.boundary.explode(index_parts=False)
+        muni_lines = muni_lines[
+            ~muni_lines.geom_type.isin(['Point', 'MultiPoint'])]
+        muni_lines.plot(ax=ax, color='#404040', linewidth=0.3, zorder=3)
+
+        # Lakes above municipal lines, below catchment boundary
+        if lakes is not None and not lakes.empty:
+            lakes_clip = gpd.clip(lakes, component)
+            if not lakes_clip.empty:
+                lakes_clip.plot(ax=ax, color='#A8D8EA', edgecolor='none',
+                                zorder=4)
+
+        # Catchment boundary
+        comp_gdf.boundary.plot(ax=ax, color='black', linewidth=1.8,
                                linestyle='--', zorder=5)
 
-    # --- Legend (0 first, then data classes, then boundary) ---
-    legend_handles = [Patch(facecolor=grey, edgecolor='none', label='0')]
-    for color, lbl in zip(colors, labels):
-        legend_handles.append(Patch(facecolor=color, edgecolor='none', label=lbl))
-    legend_handles.append(Line2D([0], [0], color='#404040', linewidth=0.3,
-                                 label='Municipal boundary'))
-    legend_handles.append(Line2D([0], [0], color='black', linewidth=1.8,
-                                 linestyle='--', label='Catchment area boundary'))
+        legend_handles = []
+        for color, lbl in zip(colors, labels):
+            legend_handles.append(
+                Patch(facecolor=color, edgecolor='none', label=lbl))
+        legend_handles.append(
+            Line2D([0], [0], color='#404040', linewidth=0.3,
+                   label='Municipal boundary'))
+        legend_handles.append(
+            Line2D([0], [0], color='black', linewidth=1.8,
+                   linestyle='--', label='Catchment area boundary'))
 
-    leg = ax.legend(handles=legend_handles,
-                    title=col_header,
-                    title_fontsize=8,
-                    fontsize=7,
-                    loc='upper right',
-                    framealpha=0.9,
-                    ncol=1)
-    leg._legend_box.align = 'left'
+        leg = ax.legend(handles=legend_handles,
+                        title=col_header,
+                        title_fontsize=8,
+                        fontsize=7,
+                        loc='upper right',
+                        framealpha=0.9,
+                        ncol=1)
+        leg._legend_box.align = 'left'
 
-    ax.set_title(title, fontsize=13)
-    ax.set_xlabel('E [m]')
-    ax.set_ylabel('N [m]')
-    ax.set_aspect('equal')
+        bx_min, by_min, bx_max, by_max = component.bounds
+        pad = 200
+        ax.set_xlim(bx_min - pad, bx_max + pad)
+        ax.set_ylim(by_min - pad, by_max + pad)
 
-    out_path = os.path.join(CATCHMENT_PLOT_DIR, f'plot_{label}_raster.pdf')
-    fig.savefig(out_path, bbox_inches='tight', dpi=150)
-    plt.close(fig)
+        ax.set_title(title, fontsize=13)
+        ax.set_xlabel('E [m]')
+        ax.set_ylabel('N [m]')
+        ax.set_aspect('equal')
+
+        out_path = os.path.join(CATCHMENT_PLOT_DIR,
+                                f'plot_{label}_raster{part_suffix}.pdf')
+        fig.savefig(out_path, bbox_inches='tight', dpi=150)
+        plt.close(fig)
     print(f"    Saved -> {out_path}")
 
 
@@ -493,49 +543,195 @@ def _plot_raster_map(gdf, label, boundary):
 # STEP 2-MUN: MUNICIPAL METHOD
 # ===============================================================================
 
-def _run_municipal_method(boundary, pop_grid, empl_grid, rail_stations_for_diff=None):
-    """Replicate the existing canton_ZH flow: reads the hand-curated commune->station
-    lookup and aggregates commune OD to station OD.
+def _assign_stations_to_municipalities(muni_gdf, rail_stations, bfs_col, name_col):
+    """Assign each municipality to one rail station based on spatial proximity.
 
-    Additionally builds catchment geometry by dissolving municipality polygons per
-    station assignment, enabling comparison with the PT-Feeder method.
+    Logic per municipality:
+      - 0 stations inside polygon -> nearest station (Euclidean from centroid)
+      - 1 station inside polygon  -> auto-assign
+      - 2+ stations inside polygon -> interactive user prompt
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: [BFS_NR, NAME, station_id, station_name]
+    """
+    assignments = []
+
+    for _, row in muni_gdf.iterrows():
+        muni_name = row[name_col]
+        bfs_nr = row[bfs_col]
+        centroid = row.geometry.centroid
+
+        # Find stations whose point geometry falls within this municipality
+        mask = rail_stations.geometry.within(row.geometry)
+        stations_within = rail_stations[mask]
+
+        if len(stations_within) == 0:
+            # Nearest station by Euclidean distance from municipality centroid
+            dists = rail_stations.geometry.distance(centroid)
+            nearest_idx = dists.idxmin()
+            station = rail_stations.loc[nearest_idx]
+            sname = (str(station['stop_name'])
+                     if pd.notna(station.get('stop_name'))
+                     else f"Station {station['id_point']}")
+            assignments.append({
+                'BFS_NR': bfs_nr, 'NAME': muni_name,
+                'station_id': station['id_point'], 'station_name': sname,
+            })
+            print(f"    {muni_name}: no station inside "
+                  f"-> nearest = {sname} ({dists[nearest_idx]:.0f}m)")
+
+        elif len(stations_within) == 1:
+            station = stations_within.iloc[0]
+            sname = (str(station['stop_name'])
+                     if pd.notna(station.get('stop_name'))
+                     else f"Station {station['id_point']}")
+            assignments.append({
+                'BFS_NR': bfs_nr, 'NAME': muni_name,
+                'station_id': station['id_point'], 'station_name': sname,
+            })
+            print(f"    {muni_name}: 1 station -> {sname}")
+
+        else:
+            # Multiple stations - interactive prompt
+            sorted_st = stations_within.copy()
+            sorted_st['_dist'] = sorted_st.geometry.distance(centroid)
+            sorted_st = sorted_st.sort_values('_dist')
+
+            print(f"\n  Municipality '{muni_name}' has "
+                  f"{len(sorted_st)} stations:")
+            for i, (_, st) in enumerate(sorted_st.iterrows()):
+                sn = (str(st['stop_name'])
+                      if pd.notna(st.get('stop_name'))
+                      else f"Station {st['id_point']}")
+                print(f"    [{i + 1}] {sn} "
+                      f"({st['_dist']:.0f}m from centroid)")
+
+            while True:
+                choice = input(f"  Select station for '{muni_name}' "
+                               f"[1-{len(sorted_st)}]: ")
+                try:
+                    choice_idx = int(choice) - 1
+                    if 0 <= choice_idx < len(sorted_st):
+                        break
+                except ValueError:
+                    pass
+                print(f"  Invalid choice. Please enter a number "
+                      f"between 1 and {len(sorted_st)}.")
+
+            station = sorted_st.iloc[choice_idx]
+            sname = (str(station['stop_name'])
+                     if pd.notna(station.get('stop_name'))
+                     else f"Station {station['id_point']}")
+            assignments.append({
+                'BFS_NR': bfs_nr, 'NAME': muni_name,
+                'station_id': station['id_point'], 'station_name': sname,
+            })
+            print(f"    {muni_name}: user selected -> {sname}")
+
+    return pd.DataFrame(assignments)
+
+
+def _run_municipal_method(boundary, rail_stations):
+    """Automatic municipality-to-station assignment based on spatial proximity.
+
+    For each municipality in the study area:
+      - 0 stations inside -> assign nearest station (Euclidean from centroid)
+      - 1 station inside  -> auto-assign
+      - 2+ stations inside -> interactive prompt
+
+    Builds catchment geometry and exports station summary CSV.
 
     Returns
     -------
     gpd.GeoDataFrame or None
-        Municipal catchment polygons (for diff plot), or None if geometry cannot be built.
+        Municipal catchment polygons (for diff plot), or None on failure.
     """
-    from scoring import aggregate_commune_od_to_station_od
-
     print("\n--- Municipal Method ---")
-    print("  Loading commune OD matrix ...")
-    commune_od_df = pd.read_excel(paths.OD_KT_ZH_PATH)
 
-    print("  Loading commune->station lookup ...")
-    commune_station_df = pd.read_excel(paths.COMMUNE_TO_STATION_PATH)
+    # Load municipalities — only those whose centroid falls within the
+    # study-area boundary (drops peripheral municipalities that merely
+    # touch the edge and would otherwise be assigned to an internal station)
+    muni = gpd.read_file(paths.MUNICIPAL_BOUNDARIES_GPKG)
+    muni = muni.to_crs(CODEBASE_CRS)
+    if 'objektart' in muni.columns:
+        muni = muni[muni['objektart'] == 'Gemeindegebiet']
+    muni = muni[muni.geometry.centroid.within(boundary)].copy()
+    print(f"    {len(muni)} municipalities in study area (centroid within boundary)")
 
-    print("  Aggregating commune OD -> station OD ...")
-    station_od_matrix = aggregate_commune_od_to_station_od(commune_od_df, commune_station_df)
+    # Identify BFS column
+    bfs_col = None
+    for candidate in ['BFS_NR', 'bfs_nr', 'BFS_NUMMER', 'bfs_nummer',
+                       'GMDNR', 'gmdnr']:
+        if candidate in muni.columns:
+            bfs_col = candidate
+            break
+    if bfs_col is None:
+        for c in muni.columns:
+            if muni[c].dtype in ['int64', 'int32', 'float64'] \
+                    and c != 'geometry':
+                bfs_col = c
+                break
+    if bfs_col is None:
+        print("    WARNING: Cannot identify BFS column "
+              "- skipping municipal method")
+        return None
 
-    out_path = os.path.join(MUNICIPAL_DATA_DIR, 'od_matrix_stations_municipal.csv')
-    station_od_matrix.to_csv(out_path)
-    print(f"  Station OD matrix saved -> {out_path}")
-    print(f"  Shape: {station_od_matrix.shape}")
+    # Identify name column
+    name_col = None
+    for candidate in ['NAME', 'name', 'GMDNAME', 'gmdname',
+                       'GEMEINDENAME']:
+        if candidate in muni.columns:
+            name_col = candidate
+            break
+    if name_col is None:
+        name_col = bfs_col
 
-    # Also save to the legacy path for downstream compatibility
-    legacy_path = paths.OD_STATIONS_KT_ZH_PATH
-    os.makedirs(os.path.dirname(legacy_path), exist_ok=True)
-    station_od_matrix.to_csv(legacy_path)
+    # Clip rail stations to the study-area boundary (same filter applied to muni)
+    rail_stations = rail_stations[
+        rail_stations.geometry.within(boundary)].copy()
+    print(f"    {len(rail_stations)} rail stations within study area boundary")
 
-    # Build catchment geometry from commune->station assignment for comparison
-    print("  Building municipal catchment polygons for comparison ...")
+    # Assign stations to municipalities (load cached assignment if available)
+    assignment_csv = os.path.join(MUNICIPAL_DATA_DIR, 'station_assignment.csv')
+    assignment_df = None
+    if os.path.exists(assignment_csv):
+        print(f"  Existing station assignment found: {assignment_csv}")
+        while True:
+            choice = input("  Use existing assignment? [1] Yes  [2] Reassign: ").strip()
+            if choice == '1':
+                assignment_df = pd.read_csv(assignment_csv)
+                assignment_df['BFS_NR'] = pd.to_numeric(
+                    assignment_df['BFS_NR'], errors='coerce')
+                print(f"    Loaded {len(assignment_df)} assignments from cache")
+                break
+            elif choice == '2':
+                break
+            else:
+                print("  Please enter 1 or 2.")
+    if assignment_df is None:
+        print("  Assigning stations to municipalities ...")
+        assignment_df = _assign_stations_to_municipalities(
+            muni, rail_stations, bfs_col, name_col)
+        assignment_df.to_csv(assignment_csv, index=False)
+        print(f"    Assignment saved -> {assignment_csv}")
+    n_stations = assignment_df['station_id'].nunique()
+    print(f"    {len(assignment_df)} municipalities assigned to "
+          f"{n_stations} stations")
+
+    # Build catchment geometry
+    print("  Building municipal catchment polygons ...")
     muni_catchment = _build_municipal_catchment_geometry(
-        commune_station_df, boundary, pop_grid, empl_grid)
+        assignment_df, muni, bfs_col)
 
-    return muni_catchment
+    # Export station catchment summary CSV
+    _export_station_catchment_csv(assignment_df, rail_stations)
+
+    return muni_catchment, assignment_df, muni, bfs_col
 
 
-def _build_municipal_catchment_geometry(commune_station_df, boundary, pop_grid, empl_grid):
+def _build_municipal_catchment_geometry(assignment_df, muni_gdf, bfs_col):
     """Dissolve municipality polygons by their assigned station to create
     catchment areas for the municipal method.
 
@@ -544,65 +740,113 @@ def _build_municipal_catchment_geometry(commune_station_df, boundary, pop_grid, 
     gpd.GeoDataFrame
         Columns: [id_point, geometry] dissolved per station.
     """
-    muni = gpd.read_file(paths.MUNICIPAL_BOUNDARIES_GPKG)
-    muni = muni.to_crs(CODEBASE_CRS)
-    if 'objektart' in muni.columns:
-        muni = muni[muni['objektart'] == 'Gemeindegebiet']
-    muni = muni[muni.geometry.intersects(boundary)].copy()
+    muni_with_station = muni_gdf[[bfs_col, 'geometry']].copy()
+    muni_with_station[bfs_col] = pd.to_numeric(
+        muni_with_station[bfs_col], errors='coerce')
 
-    # Identify BFS column
-    bfs_col = None
-    for candidate in ['BFS_NR', 'bfs_nr', 'BFS_NUMMER', 'bfs_nummer', 'GMDNR', 'gmdnr']:
-        if candidate in muni.columns:
-            bfs_col = candidate
-            break
-    if bfs_col is None:
-        for c in muni.columns:
-            if muni[c].dtype in ['int64', 'int32', 'float64'] and c != 'geometry':
-                bfs_col = c
-                break
-    if bfs_col is None:
-        print("    WARNING: Cannot identify BFS column - skipping municipal geometry")
-        return None
+    lookup = assignment_df[['BFS_NR', 'station_id']].copy()
+    lookup['BFS_NR'] = pd.to_numeric(lookup['BFS_NR'], errors='coerce')
+    lookup = lookup.rename(columns={'BFS_NR': bfs_col})
 
-    # Identify the commune BFS code column in lookup
-    commune_bfs_col = None
-    for candidate in ['Commune_BFS_code', 'BFS_NR', 'bfs_nr', 'GMDNR']:
-        if candidate in commune_station_df.columns:
-            commune_bfs_col = candidate
-            break
-    if commune_bfs_col is None:
-        print("    WARNING: Cannot identify BFS column in lookup - skipping municipal geometry")
-        return None
-
-    # Merge municipality polygons with station assignment
-    lookup = commune_station_df[[commune_bfs_col, 'ID_point']].copy()
-    lookup = lookup.rename(columns={commune_bfs_col: bfs_col})
-    muni[bfs_col] = pd.to_numeric(muni[bfs_col], errors='coerce')
-    lookup[bfs_col] = pd.to_numeric(lookup[bfs_col], errors='coerce')
-
-    merged = muni.merge(lookup, on=bfs_col, how='left')
-    merged = merged.dropna(subset=['ID_point'])
-    merged['ID_point'] = merged['ID_point'].astype(int)
+    merged = muni_with_station.merge(lookup, on=bfs_col, how='left')
+    merged = merged.dropna(subset=['station_id'])
 
     # Dissolve by station
-    dissolved = merged.dissolve(by='ID_point', as_index=False)
-    dissolved = dissolved[['ID_point', 'geometry']].copy()
-    dissolved = dissolved.rename(columns={'ID_point': 'id_point'})
+    dissolved = merged.dissolve(by='station_id', as_index=False)
+    dissolved = dissolved[['station_id', 'geometry']].copy()
+    dissolved = dissolved.rename(columns={'station_id': 'id_point'})
 
-    # Save
+    # Save GeoPackage (downstream-compatible format)
     out_path = os.path.join(MUNICIPAL_DATA_DIR, 'catchement.gpkg')
-    # Format for downstream compatibility
     save_df = dissolved.copy()
     save_df['train_station'] = save_df['id_point']
     save_df = save_df.rename(columns={'id_point': 'id'})
-    save_df = save_df[['train_station', 'id', 'geometry']]
-    save_df.to_file(out_path, driver='GPKG')
-    print(f"    Municipal catchment saved -> {out_path}  ({len(dissolved)} stations)")
+    save_df[['train_station', 'id', 'geometry']].to_file(
+        out_path, driver='GPKG')
+    print(f"    Municipal catchment saved -> {out_path}  "
+          f"({len(dissolved)} stations)")
 
-    # Restore column name for return
-    dissolved_return = dissolved.copy()
-    return dissolved_return
+    return dissolved
+
+
+def _export_station_catchment_csv(assignment_df, rail_stations):
+    """Export station catchment summary CSV.
+
+    Columns: Station_Code, Station_Name, Pop, Empl, Municipalities.
+    Includes all stations; those with no assignment get 0 / 0 / '--'.
+    """
+    print("  Exporting station catchment summary ...")
+
+    # Read the per-municipality pop/empl summary produced by Step 1
+    summary_path = os.path.join(
+        CATCHMENT_DATA_DIR, 'municipal_pop_empl_summary.csv')
+    if os.path.exists(summary_path):
+        muni_summary = pd.read_csv(summary_path)
+        muni_summary['BFS_NR'] = pd.to_numeric(
+            muni_summary['BFS_NR'], errors='coerce')
+    else:
+        print("    WARNING: municipal_pop_empl_summary.csv not found "
+              "- pop/empl will be zero")
+        muni_summary = pd.DataFrame(
+            columns=['BFS_NR', 'NAME',
+                     'total_population', 'total_employment'])
+
+    # Merge assignment with pop/empl
+    assign = assignment_df.copy()
+    assign['BFS_NR'] = pd.to_numeric(assign['BFS_NR'], errors='coerce')
+    merged = assign.merge(
+        muni_summary[['BFS_NR', 'total_population', 'total_employment']],
+        on='BFS_NR', how='left',
+    ).fillna(0)
+
+    # Coerce numeric types to guard against non-numeric values from CSV load
+    merged['total_population'] = pd.to_numeric(
+        merged['total_population'], errors='coerce').fillna(0)
+    merged['total_employment'] = pd.to_numeric(
+        merged['total_employment'], errors='coerce').fillna(0)
+
+    # Aggregate by station
+    station_agg = merged.groupby(
+        ['station_id', 'station_name'], sort=False,
+    ).agg(
+        Pop=('total_population', 'sum'),
+        Empl=('total_employment', 'sum'),
+        Municipalities=('NAME',
+                        lambda x: ', '.join(sorted(x.astype(str)))),
+    ).reset_index()
+    station_agg = station_agg.rename(columns={
+        'station_id': 'Station_Code',
+        'station_name': 'Station_Name',
+    })
+    station_agg['Pop'] = station_agg['Pop'].astype(int)
+    station_agg['Empl'] = station_agg['Empl'].astype(int)
+
+    # Add unassigned stations
+    assigned_ids = set(assignment_df['station_id'].values)
+    unassigned = rail_stations[
+        ~rail_stations['id_point'].isin(assigned_ids)]
+    if len(unassigned) > 0:
+        names = unassigned['stop_name'].apply(
+            lambda x: str(x) if pd.notna(x) else '—')
+        unassigned_rows = pd.DataFrame({
+            'Station_Code': unassigned['id_point'].values,
+            'Station_Name': names.values,
+            'Pop': 0,
+            'Empl': 0,
+            'Municipalities': '—',
+        })
+        station_agg = pd.concat(
+            [station_agg, unassigned_rows], ignore_index=True)
+
+    station_agg = station_agg.sort_values(
+        'Station_Name').reset_index(drop=True)
+
+    out_path = os.path.join(
+        MUNICIPAL_DATA_DIR, 'station_catchment_summary.csv')
+    station_agg.to_csv(out_path, index=False, encoding='utf-8-sig')
+    n_with = (station_agg['Municipalities'] != '—').sum()
+    print(f"    Saved -> {out_path}  ({len(station_agg)} stations, "
+          f"{n_with} with catchment)")
 
 
 def _assign_cells_to_municipal_catchment(pop_grid, empl_grid, muni_catchment):
@@ -639,74 +883,224 @@ def _assign_cells_to_municipal_catchment(pop_grid, empl_grid, muni_catchment):
 
 
 def _plot_municipal_catchments(muni_catchment, pop_grid, empl_grid,
-                               rail_stations, boundary):
-    """Plot dissolved municipal catchment boundaries with grey pop/empl cells
-    inside and station markers (black = has catchment, red = no catchment)."""
+                               rail_stations, boundary,
+                               assignment_df=None, muni_gdf=None,
+                               bfs_col=None):
+    """Plot municipal catchment areas with graph-colouring.  Each coloured
+    area is a dissolved municipal catchment (one per assigned station).
+    Only cells with population or employment are filled."""
     if muni_catchment is None or muni_catchment.empty:
         print("  Skipping municipal catchment plot - no geometry available")
         return
     print("  Building municipal catchment plot ...")
 
-    fig, ax = plt.subplots(1, 1, figsize=(14, 12))
+    # Clip dissolved catchment geometries to the study area boundary
+    plot_catchments = gpd.clip(muni_catchment, boundary).reset_index(drop=True)
 
-    # Light grey background for study area
-    boundary_gdf = gpd.GeoDataFrame(geometry=[boundary], crs=CODEBASE_CRS)
-    boundary_gdf.plot(ax=ax, color='#F0F0F0', edgecolor='none')
+    # --- Adjacency graph of catchment areas ----------------------------------
+    G = nx.Graph()
+    for i in range(len(plot_catchments)):
+        G.add_node(plot_catchments.loc[i, 'id_point'])
 
-    # Catchment area outlines
-    muni_catchment.boundary.plot(ax=ax, color='#2C3E50', linewidth=1.0, zorder=3)
+    for i in range(len(plot_catchments)):
+        for j in range(i + 1, len(plot_catchments)):
+            geom_i = plot_catchments.loc[i, 'geometry']
+            geom_j = plot_catchments.loc[j, 'geometry']
+            if geom_i.intersects(geom_j):
+                inter = geom_i.intersection(geom_j)
+                if hasattr(inter, 'length') and inter.length > 0:
+                    G.add_edge(plot_catchments.loc[i, 'id_point'],
+                               plot_catchments.loc[j, 'id_point'])
 
-    # Grey cells: union of pop and empl grids
+    # --- Graph colouring -----------------------------------------------------
+    coloring = nx.coloring.greedy_color(G, strategy='largest_first')
+    n_colors = max(coloring.values()) + 1 if coloring else 1
+
+    base_palette = [
+        '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+        '#8c564b', '#e377c2', '#bcbd22', '#17becf', '#aec7e8',
+        '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5', '#c49c94',
+        '#f7b6d2', '#dbdb8d', '#9edae5', '#393b79', '#637939',
+    ]
+    palette = base_palette[:max(n_colors, 1)]
+    color_map = {sid: base_palette[cidx % len(base_palette)]
+                 for sid, cidx in coloring.items()}
+    max_deg = max(dict(G.degree()).values()) if G.degree() else 0
+    print(f"    Graph colouring: {n_colors} colours for "
+          f"{len(plot_catchments)} catchment areas "
+          f"(max adjacency {max_deg})")
+
+    # --- Build cell geometries -----------------------------------------------
     pop_relis = set(pop_grid['RELI'].values)
     empl_relis = set(empl_grid['RELI'].values)
     all_relis = pop_relis | empl_relis
     combined = pd.concat([
-        pop_grid[['RELI', 'E_KOORD', 'N_KOORD']],
-        empl_grid[['RELI', 'E_KOORD', 'N_KOORD']],
+        pop_grid[['RELI', 'E_KOORD', 'N_KOORD', 'geometry']],
+        empl_grid[['RELI', 'E_KOORD', 'N_KOORD', 'geometry']],
     ]).drop_duplicates(subset='RELI')
     combined = combined[combined['RELI'].isin(all_relis)].copy()
+    combined = gpd.GeoDataFrame(combined, geometry='geometry',
+                                crs=CODEBASE_CRS)
+
+    # Spatial join cells -> dissolved catchment polygons
+    joined = gpd.sjoin(
+        combined, plot_catchments[['id_point', 'geometry']],
+        how='left', predicate='within')
+    joined['color'] = joined['id_point'].map(color_map).fillna('#D3D3D3')
+
+    # Build square cell polygons
     cell_geoms = [
         Polygon([
-            (r['E_KOORD'], r['N_KOORD']),
-            (r['E_KOORD'] + CELL_SIZE_M, r['N_KOORD']),
-            (r['E_KOORD'] + CELL_SIZE_M, r['N_KOORD'] + CELL_SIZE_M),
-            (r['E_KOORD'], r['N_KOORD'] + CELL_SIZE_M),
+            (e, n), (e + CELL_SIZE_M, n),
+            (e + CELL_SIZE_M, n + CELL_SIZE_M), (e, n + CELL_SIZE_M),
         ])
-        for _, r in combined.iterrows()
+        for e, n in zip(joined['E_KOORD'], joined['N_KOORD'])
     ]
-    cells_gdf = gpd.GeoDataFrame(geometry=cell_geoms, crs=CODEBASE_CRS)
-    cells_gdf.plot(ax=ax, color='#A0A0A0', edgecolor='none', zorder=2)
+    cells_gdf = gpd.GeoDataFrame(
+        joined, geometry=cell_geoms, crs=CODEBASE_CRS)
 
-    # Station markers: black if has catchment, red if not
-    assigned_ids = set(muni_catchment['id_point'].astype(str).values)
-    has_catchment = rail_stations[rail_stations['id_point'].astype(str).isin(assigned_ids)]
-    no_catchment = rail_stations[~rail_stations['id_point'].astype(str).isin(assigned_ids)]
+    # --- Plot ----------------------------------------------------------------
+    fig, ax = plt.subplots(1, 1, figsize=(14, 12))
 
-    if len(has_catchment) > 0:
-        has_catchment.plot(ax=ax, color='black', markersize=20, marker='^', zorder=5)
-    if len(no_catchment) > 0:
-        no_catchment.plot(ax=ax, color='red', markersize=20, marker='^', zorder=5)
+    # Study area background
+    boundary_gdf = gpd.GeoDataFrame(geometry=[boundary], crs=CODEBASE_CRS)
+    boundary_gdf.plot(ax=ax, color='#F0F0F0', edgecolor='none')
+
+    # Coloured cells
+    for color, group in cells_gdf.groupby('color'):
+        group.plot(ax=ax, color=color, edgecolor='none', zorder=2)
+
+    # Catchment area borders
+    plot_catchments.boundary.plot(ax=ax, color='#2C3E50', linewidth=0.8,
+                                 zorder=4)
+
+    # Municipal borders — thin, light, dashed so individual municipalities
+    # within dissolved catchments remain traceable
+    muni_plot = gpd.read_file(paths.MUNICIPAL_BOUNDARIES_GPKG).to_crs(CODEBASE_CRS)
+    if 'objektart' in muni_plot.columns:
+        muni_plot = muni_plot[muni_plot['objektart'] == 'Gemeindegebiet']
+    muni_plot = muni_plot[muni_plot.geometry.intersects(boundary)].copy()
+    muni_plot = gpd.clip(muni_plot, boundary)
+    muni_lines = muni_plot.boundary.explode(index_parts=False)
+    muni_lines = muni_lines[~muni_lines.geom_type.isin(['Point', 'MultiPoint'])]
+    muni_lines.plot(ax=ax, color='#B0B0B0', linewidth=0.25,
+                    linestyle='--', zorder=3)
+
+    # Connecting lines: drawn when a municipality is not contiguous with the
+    # primary component of its dissolved catchment (islands) or when the
+    # assigned station falls outside the dissolved catchment entirely (cutoff).
+
+    # Pre-compute the primary component for each station:
+    # the sub-polygon of the dissolved catchment that contains the station point.
+    station_primary = {}  # station_id -> primary component geometry or None
+    station_pt_lookup = dict(zip(rail_stations['id_point'], rail_stations.geometry))
+    for _, crow in muni_catchment.iterrows():
+        sid = crow['id_point']
+        diss_geom = crow['geometry']
+        st_pt = station_pt_lookup.get(sid)
+        if st_pt is None or diss_geom is None:
+            station_primary[sid] = None
+            continue
+        components = (list(diss_geom.geoms)
+                      if diss_geom.geom_type == 'MultiPolygon'
+                      else [diss_geom])
+        station_primary[sid] = next(
+            (c for c in components if c.contains(st_pt)), None)
+
+    has_connect_lines = False
+    if assignment_df is not None and muni_gdf is not None and bfs_col is not None:
+        # Build lookup dict once to avoid per-row GDF boolean-index filtering
+        _bfs_num = pd.to_numeric(muni_gdf[bfs_col], errors='coerce')
+        muni_geom_lookup = dict(zip(_bfs_num, muni_gdf.geometry))
+
+        line_geoms = []
+        for _, arow in assignment_df.iterrows():
+            sid = arow['station_id']
+            bfs_numeric = pd.to_numeric(arow['BFS_NR'], errors='coerce')
+            muni_geom = muni_geom_lookup.get(bfs_numeric)
+            st_pt = station_pt_lookup.get(sid)
+            if muni_geom is None or st_pt is None:
+                continue
+            primary = station_primary.get(sid)
+            needs_line = (primary is None) or (not muni_geom.intersects(primary))
+            if needs_line:
+                line_geoms.append(LineString([
+                    (st_pt.x, st_pt.y),
+                    (muni_geom.centroid.x, muni_geom.centroid.y),
+                ]))
+
+        if line_geoms:
+            gpd.GeoDataFrame(geometry=line_geoms, crs=CODEBASE_CRS).plot(
+                ax=ax, color='black', linewidth=0.8, linestyle='-', zorder=5)
+            has_connect_lines = True
 
     # Study area boundary
-    boundary_gdf.boundary.plot(ax=ax, color='black', linewidth=1.8, linestyle='--', zorder=4)
+    boundary_gdf.boundary.plot(ax=ax, color='black', linewidth=1.8,
+                               linestyle='--', zorder=5)
 
+    # Clip view to study area bounds
+    bx_min, by_min, bx_max, by_max = boundary.bounds
+    pad = 200
+    ax.set_xlim(bx_min - pad, bx_max + pad)
+    ax.set_ylim(by_min - pad, by_max + pad)
+
+    # Lakes — above catchment fills, below stations; clipped to boundary
+    if os.path.exists(paths.LAKES_SHP):
+        lakes = gpd.read_file(paths.LAKES_SHP).to_crs(CODEBASE_CRS)
+        lakes = lakes[lakes.geometry.intersects(boundary)].copy()
+        if not lakes.empty:
+            gpd.clip(lakes, boundary).plot(
+                ax=ax, color='#A8D4F0', edgecolor='none', zorder=6)
+
+    # Station markers (circles) — only stations within boundary
+    prep_bnd = prep(boundary)
+    stations_in_boundary = rail_stations[
+        rail_stations.geometry.apply(lambda p: prep_bnd.contains(p))]
+    assigned_ids = set(plot_catchments['id_point'].astype(str).values)
+    has_catchment = stations_in_boundary[
+        stations_in_boundary['id_point'].astype(str).isin(assigned_ids)]
+    no_catchment = stations_in_boundary[
+        ~stations_in_boundary['id_point'].astype(str).isin(assigned_ids)]
+
+    if len(has_catchment) > 0:
+        ax.scatter(has_catchment.geometry.x, has_catchment.geometry.y,
+                   s=25, c='white', edgecolors='black', linewidths=0.8,
+                   marker='o', zorder=7)
+    if len(no_catchment) > 0:
+        ax.scatter(no_catchment.geometry.x, no_catchment.geometry.y,
+                   s=25, c='red', edgecolors='black', linewidths=0.8,
+                   marker='o', zorder=7)
+
+    # Legend
     legend_handles = [
-        Patch(facecolor='#A0A0A0', edgecolor='none', label='Pop / empl cells'),
-        Line2D([0], [0], color='#2C3E50', linewidth=1.0, label='Municipal catchment boundary'),
-        Line2D([0], [0], marker='^', color='w', markerfacecolor='black',
+        Patch(facecolor=palette[0], edgecolor='none',
+              label='Catchment area (coloured)'),
+        Line2D([0], [0], color='#2C3E50', linewidth=0.8,
+               label='Catchment boundary'),
+        Line2D([0], [0], color='#B0B0B0', linewidth=0.25, linestyle='--',
+               label='Municipal boundary'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='white',
+               markeredgecolor='black', markeredgewidth=0.8,
                markersize=8, label='Station (with catchment)'),
-        Line2D([0], [0], marker='^', color='w', markerfacecolor='red',
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='red',
+               markeredgecolor='black', markeredgewidth=0.8,
                markersize=8, label='Station (no catchment)'),
         Line2D([0], [0], color='black', linewidth=1.8, linestyle='--',
                label='Study area boundary'),
     ]
-    ax.legend(handles=legend_handles, loc='upper right', fontsize=8, framealpha=0.9)
+    if has_connect_lines:
+        legend_handles.insert(-1, Line2D(
+            [0], [0], color='black', linewidth=0.8,
+            label='External station assignment'))
+    ax.legend(handles=legend_handles, loc='upper right', fontsize=8,
+              framealpha=0.9)
     ax.set_title('Municipal Catchment Areas', fontsize=14)
     ax.set_xlabel('E [m]')
     ax.set_ylabel('N [m]')
     ax.set_aspect('equal')
 
-    out_path = os.path.join(CATCHMENT_PLOT_DIR, 'catchment_municipal_areas.pdf')
+    out_path = os.path.join(MUNICIPAL_PLOT_DIR,
+                            'catchment_municipal_areas.pdf')
     fig.savefig(out_path, bbox_inches='tight', dpi=150)
     plt.close(fig)
     print(f"    Saved -> {out_path}")
@@ -769,8 +1163,11 @@ def _plot_municipal_catchments_network(muni_catchment, rail_stations,
     boundary_gdf = gpd.GeoDataFrame(geometry=[boundary], crs=CODEBASE_CRS)
     boundary_gdf.plot(ax=ax, color='#F0F0F0', edgecolor='none')
 
+    # Clip catchment geometries to the study area boundary
+    clipped_catchment = gpd.clip(muni_catchment, boundary)
+
     # Catchment area outlines
-    muni_catchment.boundary.plot(ax=ax, color='#2C3E50', linewidth=1.0, zorder=3)
+    clipped_catchment.boundary.plot(ax=ax, color='#2C3E50', linewidth=1.0, zorder=2)
 
     # PT-feeder network lines coloured by mode
     mode_colours = {
@@ -779,29 +1176,51 @@ def _plot_municipal_catchments_network(muni_catchment, rail_stations,
         'on_demand_bus':'#0000FF',
         'tram':         '#FF66CC',
         'metro':        '#00246B',
-        'ship':         '#0099FF',
+        'ship':         '#004B8D',   # darker blue to distinguish from lake fill
         'funicular':    '#000000',
     }
     plotted_modes = []
     if not feeder_lines.empty:
         for mode_name, colour in mode_colours.items():
-            subset = feeder_lines[feeder_lines['mode'].str.lower() == mode_name]
+            subset = feeder_lines[
+                feeder_lines['mode'].fillna('').str.lower() == mode_name]
             if len(subset) > 0:
-                subset.plot(ax=ax, color=colour, linewidth=0.6, alpha=0.7, zorder=2)
+                subset.plot(ax=ax, color=colour, linewidth=0.6, alpha=0.7, zorder=3)
                 plotted_modes.append((mode_name, colour))
 
-    # Station markers
-    assigned_ids = set(muni_catchment['id_point'].astype(str).values)
-    has_catchment = rail_stations[rail_stations['id_point'].astype(str).isin(assigned_ids)]
-    no_catchment = rail_stations[~rail_stations['id_point'].astype(str).isin(assigned_ids)]
+    # Lakes — above feeder network, below stations; clipped to boundary
+    if os.path.exists(paths.LAKES_SHP):
+        lakes = gpd.read_file(paths.LAKES_SHP).to_crs(CODEBASE_CRS)
+        lakes = lakes[lakes.geometry.intersects(boundary)].copy()
+        if not lakes.empty:
+            gpd.clip(lakes, boundary).plot(
+                ax=ax, color='#A8D4F0', edgecolor='none', zorder=4)
+
+    # Station markers (circles) — only stations within boundary
+    prep_bnd_net = prep(boundary)
+    stations_in_bnd = rail_stations[
+        rail_stations.geometry.apply(lambda p: prep_bnd_net.contains(p))]
+    assigned_ids = set(clipped_catchment['id_point'].astype(str).values)
+    has_catchment = stations_in_bnd[stations_in_bnd['id_point'].astype(str).isin(assigned_ids)]
+    no_catchment = stations_in_bnd[~stations_in_bnd['id_point'].astype(str).isin(assigned_ids)]
 
     if len(has_catchment) > 0:
-        has_catchment.plot(ax=ax, color='black', markersize=20, marker='^', zorder=5)
+        ax.scatter(has_catchment.geometry.x, has_catchment.geometry.y,
+                   s=25, c='white', edgecolors='black', linewidths=0.8,
+                   marker='o', zorder=6)
     if len(no_catchment) > 0:
-        no_catchment.plot(ax=ax, color='red', markersize=20, marker='^', zorder=5)
+        ax.scatter(no_catchment.geometry.x, no_catchment.geometry.y,
+                   s=25, c='red', edgecolors='black', linewidths=0.8,
+                   marker='o', zorder=6)
 
     # Study area boundary
-    boundary_gdf.boundary.plot(ax=ax, color='black', linewidth=1.8, linestyle='--', zorder=4)
+    boundary_gdf.boundary.plot(ax=ax, color='black', linewidth=1.8, linestyle='--', zorder=5)
+
+    # Clip view to study area bounds
+    bx_min, by_min, bx_max, by_max = boundary.bounds
+    pad = 200
+    ax.set_xlim(bx_min - pad, bx_max + pad)
+    ax.set_ylim(by_min - pad, by_max + pad)
 
     # Legend
     legend_handles = [
@@ -817,9 +1236,11 @@ def _plot_municipal_catchments_network(muni_catchment, rail_stations,
             Line2D([0], [0], color=colour, linewidth=1.0, alpha=0.7,
                    label=mode_labels.get(mode_name, mode_name)))
     legend_handles += [
-        Line2D([0], [0], marker='^', color='w', markerfacecolor='black',
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='white',
+               markeredgecolor='black', markeredgewidth=0.8,
                markersize=8, label='Station (with catchment)'),
-        Line2D([0], [0], marker='^', color='w', markerfacecolor='red',
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='red',
+               markeredgecolor='black', markeredgewidth=0.8,
                markersize=8, label='Station (no catchment)'),
         Line2D([0], [0], color='black', linewidth=1.8, linestyle='--',
                label='Study area boundary'),
@@ -830,7 +1251,7 @@ def _plot_municipal_catchments_network(muni_catchment, rail_stations,
     ax.set_ylabel('N [m]')
     ax.set_aspect('equal')
 
-    out_path = os.path.join(CATCHMENT_PLOT_DIR, 'catchment_municipal_areas_network.pdf')
+    out_path = os.path.join(MUNICIPAL_PLOT_DIR, 'catchment_municipal_areas_network.pdf')
     fig.savefig(out_path, bbox_inches='tight', dpi=150)
     plt.close(fig)
     print(f"    Saved -> {out_path}")
@@ -885,7 +1306,7 @@ def _load_feeder_stops(boundary, temporal='all'):
     return all_stops
 
 
-def _load_rail_stations(boundary, temporal='all'):
+def _load_rail_stations(boundary, temporal='all', buffer=BUFFER_RAIL_M):
     """Load rail stations from the rail_stops GPKG produced by catchment_build_network.py.
     Maps stop_id -> ID_point by spatial join (100 m buffer) against the same
     rail_stops file — no external ZVV file required.
@@ -914,7 +1335,7 @@ def _load_rail_stations(boundary, temporal='all'):
     rail = pd.concat(frames, ignore_index=True)
     rail = gpd.GeoDataFrame(rail, geometry='geometry', crs=CODEBASE_CRS)
 
-    expanded = boundary.buffer(BUFFER_RAIL_M)
+    expanded = boundary.buffer(buffer) if buffer > 0 else boundary
     rail = rail[rail.geometry.within(expanded)].copy()
 
     rail['stop_id'] = rail['stop_id'].astype(str)
@@ -1514,7 +1935,7 @@ def _build_visualisation(allocation, grid, rail_stations, boundary, method_label
     ax.set_ylabel('N [m]')
     ax.set_aspect('equal')
 
-    out_path = os.path.join(CATCHMENT_PLOT_DIR,
+    out_path = os.path.join(PT_FEEDER_PLOT_DIR,
                             f'catchment_visualisation_{method_label.lower().replace(" ", "_")}.pdf')
     fig.savefig(out_path, bbox_inches='tight', dpi=150)
     plt.close(fig)
@@ -1667,6 +2088,10 @@ def _build_diff_plot(muni_catchment, pt_catchment, pt_allocation,
         pt_c = pt_c.rename(columns={'id': 'id_point'})
     pt_c = pt_c[pt_c['id_point'] != NO_PT_ID]
 
+    # Clip catchment boundaries to study area
+    muni_c = gpd.clip(muni_c, boundary)
+    pt_c = gpd.clip(pt_c, boundary)
+
     # Combined station catchment boundaries
     muni_c.boundary.plot(ax=ax, color='#d6604d', linewidth=0.5, linestyle='--',
                          alpha=0.7, zorder=3)
@@ -1680,8 +2105,12 @@ def _build_diff_plot(muni_catchment, pt_catchment, pt_allocation,
                label='PT-Feeder catchment boundary'),
     ]
 
-    # Rail stations
-    rail_stations.plot(ax=ax, color='black', markersize=20, marker='^', zorder=5)
+    # Rail stations — only within boundary
+    from shapely.prepared import prep as _prep_diff
+    prep_bnd_diff = _prep_diff(boundary)
+    stations_in_bnd = rail_stations[
+        rail_stations.geometry.apply(lambda p: prep_bnd_diff.contains(p))]
+    stations_in_bnd.plot(ax=ax, color='black', markersize=20, marker='^', zorder=5)
     legend_handles.append(
         Line2D([0], [0], marker='^', color='w', markerfacecolor='black',
                markersize=8, label='Rail station'))
@@ -1691,6 +2120,12 @@ def _build_diff_plot(muni_catchment, pt_catchment, pt_allocation,
     legend_handles.append(
         Line2D([0], [0], color='black', linewidth=1.8, linestyle='--',
                label='Study area boundary'))
+
+    # Clip view to study area bounds
+    bx_min, by_min, bx_max, by_max = boundary.bounds
+    pad = 200
+    ax.set_xlim(bx_min - pad, bx_max + pad)
+    ax.set_ylim(by_min - pad, by_max + pad)
 
     ax.legend(handles=legend_handles, loc='upper right', fontsize=8, framealpha=0.9)
     ax.set_title('Catchment Comparison: Municipal vs PT-Feeder (populated cells)',
@@ -1784,6 +2219,12 @@ def _plot_access_times(walk_df, cycle_df, feeder_df, alloc_pop, pop_grid,
         boundary_gdf.boundary.plot(ax=ax, color='black', linewidth=1.8,
                                    linestyle='--', zorder=5)
 
+        # Clip view to study area bounds
+        bx_min, by_min, bx_max, by_max = boundary.bounds
+        pad = 200
+        ax.set_xlim(bx_min - pad, bx_max + pad)
+        ax.set_ylim(by_min - pad, by_max + pad)
+
         # Legend — only include colours that actually appear in the plot
         used_classes = set(gdf.loc[in_buffer, 'class_idx'].astype(int).unique())
         legend_handles = [
@@ -1804,7 +2245,7 @@ def _plot_access_times(walk_df, cycle_df, feeder_df, alloc_pop, pop_grid,
         ax.set_ylabel('N [m]')
         ax.set_aspect('equal')
 
-        out_path = os.path.join(CATCHMENT_PLOT_DIR, fname)
+        out_path = os.path.join(PT_FEEDER_PLOT_DIR, fname)
         fig.savefig(out_path, bbox_inches='tight', dpi=150)
         plt.close(fig)
         print(f"    Saved -> {out_path}")
@@ -2065,8 +2506,6 @@ def get_catchment(use_cache: bool, method: str = 'both',
     # Cache check (only meaningful when running both methods)
     if use_cache and method == 'both':
         expected_files = [
-            os.path.join(CATCHMENT_DATA_DIR, 'population_2023.tif'),
-            os.path.join(CATCHMENT_DATA_DIR, 'employment_2023.tif'),
             os.path.join(CATCHMENT_DATA_DIR, 'municipal_pop_empl_summary.csv'),
             os.path.join(PT_FEEDER_DATA_DIR, 'catchement.gpkg'),
             os.path.join(PT_FEEDER_DATA_DIR, 'catchement.tif'),
@@ -2097,13 +2536,18 @@ def get_catchment(use_cache: bool, method: str = 'both',
     pt_allocation  = None
 
     if method in ('municipal', 'both'):
-        muni_catchment = _run_municipal_method(boundary, pop_grid, empl_grid)
+        rail_stations = _load_rail_stations(boundary, temporal, buffer=0)
+        result = _run_municipal_method(boundary, rail_stations)
+        if result is not None:
+            muni_catchment, assignment_df, muni_gdf, bfs_col = result
+        else:
+            muni_catchment = None
 
         # Municipal catchment visualisation plots
         if muni_catchment is not None:
-            rail_stations = _load_rail_stations(boundary, temporal)
             _plot_municipal_catchments(muni_catchment, pop_grid, empl_grid,
-                                       rail_stations, boundary)
+                                       rail_stations, boundary,
+                                       assignment_df, muni_gdf, bfs_col)
             _plot_municipal_catchments_network(muni_catchment, rail_stations,
                                                boundary, temporal)
 
