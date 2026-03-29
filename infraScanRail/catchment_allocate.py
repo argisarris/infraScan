@@ -24,12 +24,13 @@ import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pandas as pd
-import rasterio
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
-from rasterio.transform import from_origin
 from scipy.spatial import cKDTree
-from shapely.geometry import LineString, Point, Polygon
+import fiona
+import re
+import pyogrio
+from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import unary_union
 from shapely.prepared import prep
 
@@ -64,7 +65,7 @@ CELL_SIZE_M    = 100     # m
 # noPT sentinel
 NO_PT_ID       = -1
 
-# Access mode codes (written to access_mode.tif)
+# Access mode codes (used in allocation logic and visualisation)
 MODE_NO_PT  = 0
 MODE_WALK   = 1
 MODE_BUS    = 2
@@ -84,6 +85,36 @@ MUNICIPAL_DATA_DIR  = os.path.join(CATCHMENT_DATA_DIR, 'Municipal')
 PT_FEEDER_DATA_DIR  = os.path.join(CATCHMENT_DATA_DIR, 'PT_Feeder')
 MUNICIPAL_PLOT_DIR  = os.path.join(CATCHMENT_PLOT_DIR, 'Municipal')
 PT_FEEDER_PLOT_DIR  = os.path.join(CATCHMENT_PLOT_DIR, 'PT_Feeder')
+GUETEKLASSEN_PLOT_DIR = os.path.join(CATCHMENT_PLOT_DIR, 'Gueteklassen')
+
+# ÖV-Güteklassen classification constants (ARE 2022)
+# Operational window for headway calculation.
+# NOTE: ARE standard uses 840 min (06:00–20:00). Our timetable ends at 19:00 (780 min).
+#       Update GK_WINDOW_MIN to 840 when the operational window is extended.
+GK_WINDOW_MIN  = 780
+
+# Maximum walk-access buffer radius (m) per Haltestellenkategorie (1=I … 5=V)
+GK_MAX_RADIUS  = {1: 1000, 2: 1000, 3: 750, 4: 500, 5: 300}
+
+# Distance bands for Güteklasse ring assignment
+GK_DIST_BANDS  = [(0, 300), (300, 500), (500, 750), (750, 1000)]
+GK_DIST_LABELS = ['0-300', '300-500', '500-750', '750-1000']
+
+# Güteklasse lookup: (Kat_int, dist_band_0based) → 'A'/'B'/'C'/'D'
+# Kat: 1=I, 2=II, 3=III, 4=IV, 5=V  |  band: 0=(0-300m), 1=(300-500m), …
+_GK_LOOKUP = {
+    (1, 0): 'A', (1, 1): 'A', (1, 2): 'B', (1, 3): 'C',
+    (2, 0): 'A', (2, 1): 'B', (2, 2): 'C', (2, 3): 'D',
+    (3, 0): 'B', (3, 1): 'C', (3, 2): 'D',
+    (4, 0): 'C', (4, 1): 'D',
+    (5, 0): 'D',
+}
+
+GK_PLOT_COLOURS = {'A': '#2D6A2D', 'B': '#1565C0', 'C': '#E65100', 'D': '#B71C1C'}
+
+_GUETEKLASSEN_ARE_GPKG = os.path.join(
+    'data', 'Spatial_Data', 'Transit_Network',
+    'Gueteklassen_oev_2026_2056.gpkg', 'OeV_Gueteklassen_ARE.gpkg')
 
 
 def _ensure_dirs():
@@ -156,8 +187,6 @@ def _load_grid(df, boundary, label):
     gdf = gpd.GeoDataFrame(df, geometry=geometry, crs=CODEBASE_CRS)
 
     # Step 1: fast pre-filter — drop cells more than one cell-width outside
-    from shapely.prepared import prep
-    from shapely.geometry import box as _cell_box
     prep_expanded = prep(boundary.buffer(CELL_SIZE_M))
     gdf = gdf[gdf.geometry.apply(prep_expanded.contains)].copy()
 
@@ -172,10 +201,10 @@ def _load_grid(df, boundary, label):
     if len(edge_gdf) > 0:
         keep_idx = [
             idx for idx, row in edge_gdf.iterrows()
-            if _cell_box(row['E_KOORD'], row['N_KOORD'],
-                         row['E_KOORD'] + CELL_SIZE_M,
-                         row['N_KOORD'] + CELL_SIZE_M
-                         ).intersection(boundary).area / cell_area >= 0.5
+            if box(row['E_KOORD'], row['N_KOORD'],
+                   row['E_KOORD'] + CELL_SIZE_M,
+                   row['N_KOORD'] + CELL_SIZE_M
+                   ).intersection(boundary).area / cell_area >= 0.5
         ]
         gdf = pd.concat([inside, edge_gdf.loc[keep_idx]]).copy()
     else:
@@ -279,7 +308,7 @@ def _cumulate_per_municipality(pop_grid, empl_grid, boundary):
     # Enforce column order: BFS_NR, NAME, total_population, total_employment
     csv_cols = ['BFS_NR', 'NAME', 'total_population', 'total_employment']
     csv_path = os.path.join(CATCHMENT_DATA_DIR, 'municipal_pop_empl_summary.csv')
-    summary[csv_cols].to_csv(csv_path, index=False)
+    summary[csv_cols].to_csv(csv_path, index=False, encoding='utf-8-sig')
     print(f"    Saved -> {csv_path}")
     print(f"    Total pop = {summary['total_population'].sum():,.0f}, "
           f"empl = {summary['total_employment'].sum():,.0f}")
@@ -438,12 +467,10 @@ def _plot_raster_map(gdf, label, boundary):
     class_idx = np.digitize(vals, bins[1:], right=False)
     class_idx = np.clip(class_idx, 0, n_classes - 1)
 
-    from shapely.geometry import box as _box
-    squares = [
-        _box(row['E_KOORD'], row['N_KOORD'],
-             row['E_KOORD'] + CELL_SIZE_M, row['N_KOORD'] + CELL_SIZE_M)
-        for _, row in gdf.iterrows()
-    ]
+    e_arr = gdf['E_KOORD'].values
+    n_arr = gdf['N_KOORD'].values
+    squares = [box(e, n, e + CELL_SIZE_M, n + CELL_SIZE_M)
+               for e, n in zip(e_arr, n_arr)]
     plot_gdf = gpd.GeoDataFrame(
         {'class_idx': class_idx},
         geometry=squares,
@@ -704,6 +731,9 @@ def _run_municipal_method(boundary, rail_stations):
                 assignment_df = pd.read_csv(assignment_csv)
                 assignment_df['BFS_NR'] = pd.to_numeric(
                     assignment_df['BFS_NR'], errors='coerce')
+                # station_id must stay as str to match rail_stations['id_point']
+                assignment_df['station_id'] = (
+                    assignment_df['station_id'].astype(str))
                 print(f"    Loaded {len(assignment_df)} assignments from cache")
                 break
             elif choice == '2':
@@ -714,19 +744,33 @@ def _run_municipal_method(boundary, rail_stations):
         print("  Assigning stations to municipalities ...")
         assignment_df = _assign_stations_to_municipalities(
             muni, rail_stations, bfs_col, name_col)
-        assignment_df.to_csv(assignment_csv, index=False)
+        assignment_df.to_csv(assignment_csv, index=False, encoding='utf-8-sig')
         print(f"    Assignment saved -> {assignment_csv}")
     n_stations = assignment_df['station_id'].nunique()
     print(f"    {len(assignment_df)} municipalities assigned to "
           f"{n_stations} stations")
 
-    # Build catchment geometry
+    # Build catchment geometry (geometry only)
     print("  Building municipal catchment polygons ...")
     muni_catchment = _build_municipal_catchment_geometry(
         assignment_df, muni, bfs_col)
 
-    # Export station catchment summary CSV
-    _export_station_catchment_csv(assignment_df, rail_stations)
+    # Export station catchment summary CSV; get per-station stats for GPKG enrichment
+    station_agg = _export_station_catchment_csv(assignment_df, rail_stations)
+
+    # Write enriched catchment GPKG: geometry + station stats
+    out_path = os.path.join(MUNICIPAL_DATA_DIR, 'catchment.gpkg')
+    save_df = muni_catchment.rename(columns={'id_point': 'id'}).copy()
+    save_df['train_station'] = save_df['id']
+    stats_idx = station_agg.set_index('Station_Code')
+    id_str = save_df['id'].astype(str)
+    save_df['station_name']   = id_str.map(stats_idx['Station_Name']).fillna('—')
+    save_df['pop']            = id_str.map(stats_idx['Pop']).fillna(0).astype(int)
+    save_df['empl']           = id_str.map(stats_idx['Empl']).fillna(0).astype(int)
+    save_df['municipalities'] = id_str.map(stats_idx['Municipalities']).fillna('—')
+    save_df[['train_station', 'id', 'station_name', 'pop', 'empl',
+             'municipalities', 'geometry']].to_file(out_path, driver='GPKG')
+    print(f"    Municipal catchment GPKG saved -> {out_path}  ({len(save_df)} stations)")
 
     return muni_catchment, assignment_df, muni, bfs_col
 
@@ -755,16 +799,6 @@ def _build_municipal_catchment_geometry(assignment_df, muni_gdf, bfs_col):
     dissolved = merged.dissolve(by='station_id', as_index=False)
     dissolved = dissolved[['station_id', 'geometry']].copy()
     dissolved = dissolved.rename(columns={'station_id': 'id_point'})
-
-    # Save GeoPackage (downstream-compatible format)
-    out_path = os.path.join(MUNICIPAL_DATA_DIR, 'catchement.gpkg')
-    save_df = dissolved.copy()
-    save_df['train_station'] = save_df['id_point']
-    save_df = save_df.rename(columns={'id_point': 'id'})
-    save_df[['train_station', 'id', 'geometry']].to_file(
-        out_path, driver='GPKG')
-    print(f"    Municipal catchment saved -> {out_path}  "
-          f"({len(dissolved)} stations)")
 
     return dissolved
 
@@ -821,10 +855,10 @@ def _export_station_catchment_csv(assignment_df, rail_stations):
     station_agg['Pop'] = station_agg['Pop'].astype(int)
     station_agg['Empl'] = station_agg['Empl'].astype(int)
 
-    # Add unassigned stations
-    assigned_ids = set(assignment_df['station_id'].values)
+    # Add unassigned stations (cast both sides to str to avoid int/str mismatches)
+    assigned_ids = set(str(x) for x in assignment_df['station_id'].values)
     unassigned = rail_stations[
-        ~rail_stations['id_point'].isin(assigned_ids)]
+        ~rail_stations['id_point'].astype(str).isin(assigned_ids)]
     if len(unassigned) > 0:
         names = unassigned['stop_name'].apply(
             lambda x: str(x) if pd.notna(x) else '—')
@@ -847,6 +881,7 @@ def _export_station_catchment_csv(assignment_df, rail_stations):
     n_with = (station_agg['Municipalities'] != '—').sum()
     print(f"    Saved -> {out_path}  ({len(station_agg)} stations, "
           f"{n_with} with catchment)")
+    return station_agg
 
 
 def _assign_cells_to_municipal_catchment(pop_grid, empl_grid, muni_catchment):
@@ -878,6 +913,16 @@ def _assign_cells_to_municipal_catchment(pop_grid, empl_grid, muni_catchment):
     # Spatial join: which municipal catchment polygon contains each cell centroid
     catchment = muni_catchment[['id_point', 'geometry']].copy()
     joined = gpd.sjoin(combined, catchment, how='left', predicate='within')
+
+    # Nearest-catchment fallback for edge cells not strictly within any polygon
+    unassigned_mask = joined['id_point'].isna()
+    if unassigned_mask.any():
+        unassigned = combined.loc[joined.index[unassigned_mask]]
+        catchment_reset = catchment.reset_index(drop=True)
+        for idx, row in unassigned.iterrows():
+            dists = catchment_reset.geometry.boundary.distance(row.geometry)
+            nearest = catchment_reset.loc[dists.idxmin(), 'id_point']
+            joined.loc[idx, 'id_point'] = nearest
 
     return joined[['RELI', 'id_point']].copy()
 
@@ -1005,7 +1050,7 @@ def _plot_municipal_catchments(muni_catchment, pop_grid, empl_grid,
                       if diss_geom.geom_type == 'MultiPolygon'
                       else [diss_geom])
         station_primary[sid] = next(
-            (c for c in components if c.contains(st_pt)), None)
+            (c for c in components if c.covers(st_pt)), None)
 
     has_connect_lines = False
     if assignment_df is not None and muni_gdf is not None and bfs_col is not None:
@@ -1029,9 +1074,11 @@ def _plot_municipal_catchments(muni_catchment, pop_grid, empl_grid,
                     (muni_geom.centroid.x, muni_geom.centroid.y),
                 ]))
 
+        print(f"    Connecting lines: {len(line_geoms)} detached municipality "
+              f"assignments found")
         if line_geoms:
             gpd.GeoDataFrame(geometry=line_geoms, crs=CODEBASE_CRS).plot(
-                ax=ax, color='black', linewidth=0.8, linestyle='-', zorder=5)
+                ax=ax, color='black', linewidth=0.4, linestyle='-', zorder=8)
             has_connect_lines = True
 
     # Study area boundary
@@ -1090,7 +1137,7 @@ def _plot_municipal_catchments(muni_catchment, pop_grid, empl_grid,
     ]
     if has_connect_lines:
         legend_handles.insert(-1, Line2D(
-            [0], [0], color='black', linewidth=0.8,
+            [0], [0], color='black', linewidth=0.4,
             label='External station assignment'))
     ax.legend(handles=legend_handles, loc='upper right', fontsize=8,
               framealpha=0.9)
@@ -1126,7 +1173,6 @@ def _load_feeder_lines(boundary, temporal='all'):
         print(f"    WARNING: {lines_path} not found — skipping feeder lines")
         return gpd.GeoDataFrame(columns=['geometry', 'mode'], crs=CODEBASE_CRS)
 
-    import fiona
     layers = fiona.listlayers(lines_path)
     frames = []
     for layer in layers:
@@ -1278,7 +1324,6 @@ def _load_feeder_stops(boundary, temporal='all'):
     stops_path = os.path.join(base, subfolder, f'pt_feeder_stops{suffix}.gpkg') \
                  if subfolder else os.path.join(base, f'pt_feeder_stops{suffix}.gpkg')
 
-    import fiona
     layers = fiona.listlayers(stops_path)
     frames = []
     for layer in layers:
@@ -1288,15 +1333,12 @@ def _load_feeder_stops(boundary, temporal='all'):
     all_stops = pd.concat(frames, ignore_index=True)
     all_stops = gpd.GeoDataFrame(all_stops, geometry='geometry', crs=CODEBASE_CRS)
 
-    all_stops['buffer_radius_m'] = all_stops['mode'].apply(
-        lambda m: BUFFER_TRAM_M if 'tram' in m.lower() else BUFFER_BUS_M
-    )
-
-    max_buffer = max(BUFFER_BUS_M, BUFFER_TRAM_M)
+    # buffer_radius_m is assigned later by _compute_stop_gueteklassen
+    max_buffer = max(GK_MAX_RADIUS.values())  # 1000 m — max possible Güteklassen radius
     expanded = boundary.buffer(max_buffer)
     all_stops = all_stops[all_stops.geometry.within(expanded)].copy()
 
-    keep_cols = ['stop_id', 'stop_name', 'mode', 'buffer_radius_m', 'geometry']
+    keep_cols = ['stop_id', 'stop_name', 'mode', 'geometry']
     for c in keep_cols:
         if c not in all_stops.columns and c != 'geometry':
             all_stops[c] = None
@@ -1325,7 +1367,6 @@ def _load_rail_stations(boundary, temporal='all', buffer=BUFFER_RAIL_M):
     rail_path = os.path.join(base, subfolder, f'rail_stops{suffix}.gpkg') \
                 if subfolder else os.path.join(base, f'rail_stops{suffix}.gpkg')
 
-    import fiona
     layers = fiona.listlayers(rail_path)
     frames = []
     for layer in layers:
@@ -1376,7 +1417,6 @@ def _load_feeder_segments(temporal='all'):
     seg_path = os.path.join(base, subfolder, f'pt_feeder_segments{suffix}.gpkg') \
                if subfolder else os.path.join(base, f'pt_feeder_segments{suffix}.gpkg')
 
-    import fiona
     layers = fiona.listlayers(seg_path)
     frames = []
     for layer in layers:
@@ -1398,46 +1438,109 @@ def _load_feeder_segments(temporal='all'):
     return segments
 
 
-def _build_pt_buffers(feeder_stops, rail_stations):
-    """Generate buffer geometries for visualisation and validation."""
+def _build_pt_buffers(feeder_stops, rail_stations, boundary, pop_grid, empl_grid):
+    """Generate buffer geometries for visualisation and validation.
+
+    Produces three dissolved, boundary-clipped buffer polygons:
+      - walk_to_rail  : Güteklassen walk radius around each rail station
+      - pt_feeder     : walk-to-stop buffer for all bus + tram feeder stops
+      - cycle_to_rail : fixed CYCLE_RADIUS_M cycling buffer around rail stations
+
+    Attributes per feature: buffer_type, area_m2, population, employment.
+    Saved as three separate named layers in buffers_visualisation.gpkg so that
+    QGIS loads them with walk_to_rail on top (last written = top of panel).
+    """
     print("  Building PT buffers for visualisation ...")
     records = []
 
-    bus_stops = feeder_stops[~feeder_stops['mode'].str.lower().str.contains('tram')]
-    for _, row in bus_stops.iterrows():
-        records.append({
-            'stop_id': row['stop_id'],
-            'buffer_type': 'walk_to_feeder_bus',
-            'geometry': row.geometry.buffer(BUFFER_BUS_M)
-        })
+    bus_mask  = ~feeder_stops['mode'].str.lower().str.contains('tram')
+    tram_mask =  feeder_stops['mode'].str.lower().str.contains('tram')
 
-    tram_stops = feeder_stops[feeder_stops['mode'].str.lower().str.contains('tram')]
-    for _, row in tram_stops.iterrows():
-        records.append({
-            'stop_id': row['stop_id'],
-            'buffer_type': 'walk_to_feeder_tram',
-            'geometry': row.geometry.buffer(BUFFER_TRAM_M)
-        })
+    for _, mask, buf_type in [
+        ('bus',  bus_mask,  'walk_to_feeder_bus'),
+        ('tram', tram_mask, 'walk_to_feeder_tram'),
+    ]:
+        subset = feeder_stops[mask]
+        if subset.empty:
+            continue
+        buf_geoms = [geom.buffer(float(r))
+                     for geom, r in zip(subset.geometry, subset['buffer_radius_m'])]
+        records.extend([
+            {'stop_id': sid, 'buffer_type': buf_type, 'geometry': g}
+            for sid, g in zip(subset['stop_id'], buf_geoms)
+        ])
 
-    for _, row in rail_stations.iterrows():
-        records.append({
-            'stop_id': row['stop_id'],
-            'buffer_type': 'walk_to_rail',
-            'geometry': row.geometry.buffer(BUFFER_RAIL_M)
-        })
+    # Rail: walk buffer (Güteklassen radius) + cycling buffer (fixed)
+    rail_walk_geoms  = [g.buffer(float(r))
+                        for g, r in zip(rail_stations.geometry,
+                                        rail_stations['buffer_radius_m'])]
+    rail_cycle_geoms = [g.buffer(CYCLE_RADIUS_M) for g in rail_stations.geometry]
 
-    for _, row in rail_stations.iterrows():
-        records.append({
-            'stop_id': row['stop_id'],
-            'buffer_type': 'cycle_to_rail',
-            'geometry': row.geometry.buffer(CYCLE_RADIUS_M)
-        })
+    records.extend([
+        {'stop_id': sid, 'buffer_type': 'walk_to_rail',  'geometry': g}
+        for sid, g in zip(rail_stations['stop_id'], rail_walk_geoms)
+    ])
+    records.extend([
+        {'stop_id': sid, 'buffer_type': 'cycle_to_rail', 'geometry': g}
+        for sid, g in zip(rail_stations['stop_id'], rail_cycle_geoms)
+    ])
 
     buffers_gdf = gpd.GeoDataFrame(records, geometry='geometry', crs=CODEBASE_CRS)
 
+    # Dissolve into 3 categories, clip to boundary, compute stats
+    pop_pts  = pop_grid[['geometry', 'NUMMER']].copy()
+    empl_pts = empl_grid[['geometry', 'NUMMER']].copy()
+
+    def _buffer_stats(geom):
+        """Return (area_m2, population, employment) for a dissolved buffer geom."""
+        clipped = geom.intersection(boundary)
+        if clipped.is_empty:
+            return 0.0, 0, 0
+        buf_gdf = gpd.GeoDataFrame([{'geometry': clipped}],
+                                   geometry='geometry', crs=CODEBASE_CRS)
+        pop_in  = int(gpd.sjoin(pop_pts,  buf_gdf, how='inner',
+                                predicate='within')['NUMMER'].sum())
+        empl_in = int(gpd.sjoin(empl_pts, buf_gdf, how='inner',
+                                predicate='within')['NUMMER'].sum())
+        return round(clipped.area, 0), pop_in, empl_in
+
+    # Layer order: cycle_to_rail first (bottom in QGIS), pt_feeder second,
+    # walk_to_rail last (top in QGIS panel when loaded from file)
+    layer_order = [
+        (['walk_to_feeder_bus', 'walk_to_feeder_tram'], 'pt_feeder'),
+        (['walk_to_rail'],                              'walk_to_rail'),
+        (['cycle_to_rail'],                             'cycle_to_rail'),
+    ]
+
+    dissolved_by_label = {}
+    for buf_types, label in layer_order:
+        sub = buffers_gdf[buffers_gdf['buffer_type'].isin(buf_types)]
+        if not sub.empty:
+            merged_geom = unary_union(sub.geometry.values)
+            area_m2, pop_in, empl_in = _buffer_stats(merged_geom)
+            clipped_geom = merged_geom.intersection(boundary)
+            dissolved_by_label[label] = {
+                'buffer_type': label,
+                'area_m2':     area_m2,
+                'population':  pop_in,
+                'employment':  empl_in,
+                'geometry':    clipped_geom,
+            }
+
     out_path = os.path.join(PT_FEEDER_DATA_DIR, 'buffers_visualisation.gpkg')
-    buffers_gdf.to_file(out_path, driver='GPKG')
-    print(f"    Saved -> {out_path}  ({len(buffers_gdf)} features)")
+    if os.path.exists(out_path):
+        os.remove(out_path)
+
+    # Write in render order: cycle_to_rail → pt_feeder → walk_to_rail
+    for label in ['cycle_to_rail', 'pt_feeder', 'walk_to_rail']:
+        if label in dissolved_by_label:
+            row = dissolved_by_label[label]
+            layer_gdf = gpd.GeoDataFrame([row], geometry='geometry', crs=CODEBASE_CRS)
+            layer_gdf.to_file(out_path, layer=label, driver='GPKG')
+            print(f"    Layer '{label}': area={row['area_m2']:,.0f} m2, "
+                  f"pop={row['population']:,}, empl={row['employment']:,}")
+
+    print(f"    Saved -> {out_path}  ({len(dissolved_by_label)} layers)")
 
     return buffers_gdf
 
@@ -1474,8 +1577,6 @@ def _build_feeder_graph(feeder_stops, feeder_segments, rail_stations):
     dict
         feeder_stop_to_rail_times[feeder_stop_id] = {rail_stop_id: time_sec, ...}
     """
-    import re
-
     print("  Building feeder network graph (node-split) ...")
     G = nx.Graph()
 
@@ -1618,28 +1719,33 @@ def _build_feeder_graph(feeder_stops, feeder_segments, rail_stations):
 # ===============================================================================
 
 def _compute_walk_to_rail_times(grid, rail_stations):
-    """For each cell centroid, find rail stations within BUFFER_RAIL_M and
-    compute walk time."""
+    """For each cell centroid, find rail stations within their Güteklassen walk
+    buffer radius and compute walk time."""
     coords_grid = np.column_stack([grid.geometry.x, grid.geometry.y])
     coords_rail = np.column_stack([rail_stations.geometry.x, rail_stations.geometry.y])
+    rail_radii  = rail_stations['buffer_radius_m'].values.astype(float)
+
+    # Query with the largest radius present; filter per-station below
+    max_radius = rail_radii.max() if len(rail_radii) > 0 else float(BUFFER_RAIL_M)
 
     tree = cKDTree(coords_rail)
     results = []
-    neighbors = tree.query_ball_point(coords_grid, r=BUFFER_RAIL_M)
+    neighbors = tree.query_ball_point(coords_grid, r=max_radius)
 
-    reli_values = grid['RELI'].values
+    reli_values   = grid['RELI'].values
     rail_stop_ids = rail_stations['stop_id'].values
 
     for i, near_idxs in enumerate(neighbors):
         for j in near_idxs:
             dist = np.sqrt((coords_grid[i, 0] - coords_rail[j, 0])**2 +
                            (coords_grid[i, 1] - coords_rail[j, 1])**2)
-            time_sec = dist / WALK_SPEED_MS
+            if dist > rail_radii[j]:
+                continue
             results.append({
                 'RELI': reli_values[i],
                 'rail_stop_id': str(rail_stop_ids[j]),
-                'total_time_sec': time_sec,
-                'access_mode': MODE_WALK
+                'total_time_sec': dist / WALK_SPEED_MS,
+                'access_mode': 'Walk'
             })
 
     return pd.DataFrame(results)
@@ -1667,15 +1773,16 @@ def _compute_cycle_to_rail_times(grid, rail_stations):
                 'RELI': reli_values[i],
                 'rail_stop_id': str(rail_stop_ids[j]),
                 'total_time_sec': time_sec,
-                'access_mode': MODE_CYCLE
+                'access_mode': 'Cycle'
             })
 
     return pd.DataFrame(results)
 
 
 def _compute_feeder_to_rail_times(grid, feeder_stops, feeder_stop_to_rail_times):
-    """For each cell centroid, find reachable feeder stops within their buffer
-    radii, then compute walk-to-stop + graph-derived time to each rail station.
+    """For each cell centroid, find reachable feeder stops within their
+    Güteklassen walk buffer radii, then compute walk-to-stop + graph-derived
+    time to each rail station.
 
     Transfer penalties are already embedded in feeder_stop_to_rail_times by
     _build_feeder_graph: a penalty of TRANSFER_PENALTY_SEC is added only when
@@ -1686,53 +1793,54 @@ def _compute_feeder_to_rail_times(grid, feeder_stops, feeder_stop_to_rail_times)
     results = []
     reli_values = grid['RELI'].values
 
-    for radius, mode_code in [(BUFFER_BUS_M, MODE_BUS), (BUFFER_TRAM_M, MODE_TRAM)]:
-        if mode_code == MODE_TRAM:
-            subset = feeder_stops[feeder_stops['mode'].str.lower().str.contains('tram')]
-        else:
-            subset = feeder_stops[~feeder_stops['mode'].str.lower().str.contains('tram')]
+    if feeder_stops.empty:
+        return pd.DataFrame(results)
 
-        if len(subset) == 0:
-            continue
+    def _feeder_mode_label(mode_str):
+        m = mode_str.lower()
+        if 'funicular' in m: return 'Funicular'
+        if 'tram'      in m: return 'Tram'
+        if 'ship'      in m: return 'Ship'
+        return 'Bus'
 
-        coords_fs = np.column_stack([subset.geometry.x, subset.geometry.y])
-        tree = cKDTree(coords_fs)
-        neighbors = tree.query_ball_point(coords_grid, r=radius)
+    coords_fs   = np.column_stack([feeder_stops.geometry.x, feeder_stops.geometry.y])
+    fs_radii    = feeder_stops['buffer_radius_m'].values.astype(float)
+    fs_stop_ids = feeder_stops['stop_id'].astype(str).values
+    fs_modes    = np.array([_feeder_mode_label(m)
+                            for m in feeder_stops['mode'].astype(str)])
 
-        fs_stop_ids = subset['stop_id'].astype(str).values
+    # Query with the largest per-stop radius present; filter individually below
+    max_radius = fs_radii.max() if len(fs_radii) > 0 else 1000.0
+    tree = cKDTree(coords_fs)
+    neighbors = tree.query_ball_point(coords_grid, r=max_radius)
 
-        for i, near_idxs in enumerate(neighbors):
-            for j in near_idxs:
-                feeder_sid = fs_stop_ids[j]
-                rail_times = feeder_stop_to_rail_times.get(feeder_sid, {})
-                if not rail_times:
-                    continue
+    for i, near_idxs in enumerate(neighbors):
+        for j in near_idxs:
+            dist = np.sqrt((coords_grid[i, 0] - coords_fs[j, 0])**2 +
+                           (coords_grid[i, 1] - coords_fs[j, 1])**2)
+            if dist > fs_radii[j]:
+                continue
 
-                dist = np.sqrt((coords_grid[i, 0] - coords_fs[j, 0])**2 +
-                               (coords_grid[i, 1] - coords_fs[j, 1])**2)
-                walk_sec = dist / WALK_SPEED_MS
+            feeder_sid = fs_stop_ids[j]
+            rail_times = feeder_stop_to_rail_times.get(feeder_sid, {})
+            if not rail_times:
+                continue
 
-                for rail_id, graph_time_sec in rail_times.items():
-                    # walk to first feeder stop + graph time (in-vehicle + any transfer penalties)
-                    total = walk_sec + graph_time_sec
-                    results.append({
-                        'RELI': reli_values[i],
-                        'rail_stop_id': rail_id,
-                        'total_time_sec': total,
-                        'access_mode': mode_code
-                    })
+            walk_sec = dist / WALK_SPEED_MS
+            for rail_id, graph_time_sec in rail_times.items():
+                results.append({
+                    'RELI': reli_values[i],
+                    'rail_stop_id': rail_id,
+                    'total_time_sec': walk_sec + graph_time_sec,
+                    'access_mode': fs_modes[j]
+                })
 
     return pd.DataFrame(results)
 
 
-def _allocate_cells(walk_df, cycle_df, feeder_df, grid, rail_stations, output_dir):
-    """Winner-takes-all allocation: for each cell, pick the station with
-    minimum total access time. Also save top-N candidates.
-
-    Parameters
-    ----------
-    output_dir : str
-        Method-specific data directory for saving candidates CSV.
+def _allocate_cells(walk_df, cycle_df, feeder_df, grid, rail_stations):
+    """Hierarchical allocation: walk and PT-feeder compete on minimum time;
+    cycling only fills cells that neither walk nor feeder can reach.
 
     Returns
     -------
@@ -1740,33 +1848,30 @@ def _allocate_cells(walk_df, cycle_df, feeder_df, grid, rail_stations, output_di
         Allocation with columns: RELI, E_KOORD, N_KOORD, station_id, id_point,
         access_time_sec, access_mode.
     """
-    print("    Running winner-takes-all allocation ...")
+    print("    Running hierarchical allocation (walk+PT primary, cycle fallback) ...")
 
     rail_id_map = dict(zip(rail_stations['stop_id'].astype(str),
                            rail_stations['id_point']))
 
-    frames = [df for df in [walk_df, cycle_df, feeder_df] if len(df) > 0]
-    if len(frames) == 0:
-        print("    WARNING: No access routes found - all cells get NO_PT")
-        combined = pd.DataFrame(columns=['RELI', 'rail_stop_id', 'total_time_sec', 'access_mode'])
-    else:
-        combined = pd.concat(frames, ignore_index=True)
-
-    if len(combined) > 0:
-        allocation = combined.loc[combined.groupby('RELI')['total_time_sec'].idxmin()].copy()
-
-        top_n = (combined.sort_values('total_time_sec')
-                 .groupby('RELI').head(MAX_CANDIDATE_STATIONS).copy())
-        top_n['rank'] = top_n.groupby('RELI').cumcount() + 1
-        top_n['id_point'] = top_n['rail_stop_id'].map(rail_id_map)
-        top_n = top_n.rename(columns={'rail_stop_id': 'station_id',
-                                       'total_time_sec': 'access_time_sec'})
-        candidates_path = os.path.join(output_dir, 'cell_station_candidates.csv')
-        top_n[['RELI', 'rank', 'station_id', 'id_point', 'access_time_sec', 'access_mode']].to_csv(
-            candidates_path, index=False)
-        print(f"    Top-{MAX_CANDIDATE_STATIONS} candidates saved -> {candidates_path}")
+    # --- Primary competition: walk vs PT-feeder ---
+    primary_frames = [df for df in [walk_df, feeder_df] if len(df) > 0]
+    if primary_frames:
+        primary = pd.concat(primary_frames, ignore_index=True)
+        allocation = primary.loc[primary.groupby('RELI')['total_time_sec'].idxmin()].copy()
     else:
         allocation = pd.DataFrame(columns=['RELI', 'rail_stop_id', 'total_time_sec', 'access_mode'])
+
+    # --- Cycling fallback: only for cells unreached by walk or PT ---
+    if len(cycle_df) > 0:
+        covered = set(allocation['RELI'])
+        cycle_uncovered = cycle_df[~cycle_df['RELI'].isin(covered)]
+        if len(cycle_uncovered) > 0:
+            cycle_best = cycle_uncovered.loc[
+                cycle_uncovered.groupby('RELI')['total_time_sec'].idxmin()].copy()
+            allocation = pd.concat([allocation, cycle_best], ignore_index=True)
+
+    if len(allocation) == 0:
+        print("    WARNING: No access routes found - all cells get NO_PT")
 
     allocation = allocation.rename(columns={'rail_stop_id': 'station_id',
                                              'total_time_sec': 'access_time_sec'})
@@ -1778,10 +1883,9 @@ def _allocate_cells(walk_df, cycle_df, feeder_df, grid, rail_stations, output_di
     allocation['station_id'] = allocation['station_id'].fillna(str(NO_PT_ID))
     allocation['id_point'] = allocation['id_point'].fillna(NO_PT_ID)
     allocation['access_time_sec'] = allocation['access_time_sec'].fillna(99999)
-    allocation['access_mode'] = allocation['access_mode'].fillna(MODE_NO_PT)
+    allocation['access_mode'] = allocation['access_mode'].fillna('No PT')
 
     allocation['id_point'] = allocation['id_point'].astype(int)
-    allocation['access_mode'] = allocation['access_mode'].astype(int)
 
     n_assigned = (allocation['id_point'] != NO_PT_ID).sum()
     print(f"    {n_assigned}/{len(allocation)} cells assigned to a rail station")
@@ -1789,151 +1893,323 @@ def _allocate_cells(walk_df, cycle_df, feeder_df, grid, rail_stations, output_di
     return allocation
 
 
+def _build_candidates_csv(walk_df, cycle_df, feeder_df,
+                           pop_grid, empl_grid, rail_stations, output_dir):
+    """Build wide-format cell-station candidates CSV combining population and
+    employment for each cell.
+
+    Columns: RELI, Pop, Emp,
+             Station_1_ID, Access_Time_1_min, Access_Mode_1, … (up to 5 slots).
+
+    Slot ordering: nearest station first (by best access time across modes),
+    then all available modes to that station in priority order
+    (Walk → PT-Feeder → Cycle), then next nearest station, and so on.
+    Cells with no access to any station are excluded.
+
+    In the CSV output all PT feeder modes (Bus, Tram, Ship, Funicular) are
+    collapsed to 'PT-Feeder'.  The plots use the original mode names.
+    """
+    _PT_FEEDER_MODES = {'Bus', 'Tram', 'Ship', 'Funicular'}
+    _MODE_ORDER = {'Walk': 0, 'PT-Feeder': 1, 'Cycle': 2}
+
+    rail_id_map = dict(zip(rail_stations['stop_id'].astype(str),
+                           rail_stations['id_point']))
+
+    pop_dict  = pop_grid.groupby('RELI')['NUMMER'].sum().to_dict()
+    empl_dict = empl_grid.groupby('RELI')['NUMMER'].sum().to_dict()
+
+    all_frames = [df for df in [walk_df, feeder_df, cycle_df] if len(df) > 0]
+    if not all_frames:
+        print("    WARNING: No access data — candidates CSV not written")
+        return
+
+    combined = pd.concat(all_frames, ignore_index=True)
+    combined['id_point'] = combined['rail_stop_id'].astype(str).map(rail_id_map)
+
+    # One entry per (cell, station, mode): keep the fastest path
+    combined = (combined
+                .groupby(['RELI', 'rail_stop_id', 'access_mode'], as_index=False)
+                .agg(total_time_sec=('total_time_sec', 'min'),
+                     id_point       =('id_point',       'first')))
+
+    # Collapse all PT feeder mode names to 'PT-Feeder' for CSV output, then
+    # re-deduplicate so Bus+Tram to the same station don't consume two slots.
+    combined['access_mode'] = combined['access_mode'].apply(
+        lambda m: 'PT-Feeder' if m in _PT_FEEDER_MODES else m)
+    combined = (combined
+                .groupby(['RELI', 'rail_stop_id', 'access_mode'], as_index=False)
+                .agg(total_time_sec=('total_time_sec', 'min'),
+                     id_point       =('id_point',       'first')))
+
+    # Station rank within cell: minimum access time to that station across all modes
+    station_min = (combined.groupby(['RELI', 'rail_stop_id'])['total_time_sec']
+                   .min().rename('station_min_sec').reset_index())
+    combined = combined.merge(station_min, on=['RELI', 'rail_stop_id'])
+
+    # Sort: nearest station first, then Walk → Bus → Tram → Cycle within station
+    combined['mode_ord'] = combined['access_mode'].map(_MODE_ORDER).fillna(9).astype(int)
+    combined = combined.sort_values(['RELI', 'station_min_sec', 'mode_ord'],
+                                    kind='mergesort')
+
+    # Assign slot numbers (1-based) and keep top-N per cell
+    combined['slot'] = combined.groupby('RELI').cumcount() + 1
+    top_n = combined[combined['slot'] <= MAX_CANDIDATE_STATIONS].copy()
+
+    top_n['time_min']   = (top_n['total_time_sec'] / 60).round(1)
+    top_n['station_id'] = top_n['id_point'].fillna(NO_PT_ID).astype(int)
+
+    # Pivot to wide format (fully vectorised)
+    piv_id   = top_n.pivot(index='RELI', columns='slot', values='station_id')
+    piv_time = top_n.pivot(index='RELI', columns='slot', values='time_min')
+    piv_mode = top_n.pivot(index='RELI', columns='slot', values='access_mode')
+
+    piv_id.columns   = [f'Station_{c}_ID'      for c in piv_id.columns]
+    piv_time.columns = [f'Access_Time_{c}_min' for c in piv_time.columns]
+    piv_mode.columns = [f'Access_Mode_{c}'     for c in piv_mode.columns]
+
+    wide = pd.concat([piv_id, piv_time, piv_mode], axis=1)
+
+    # Interleave into Station_1_ID, Access_Time_1_min, Access_Mode_1, Station_2_ID, …
+    slot_cols = []
+    for i in range(1, MAX_CANDIDATE_STATIONS + 1):
+        for col in (f'Station_{i}_ID', f'Access_Time_{i}_min', f'Access_Mode_{i}'):
+            if col in wide.columns:
+                slot_cols.append(col)
+
+    wide = wide[slot_cols].reset_index()
+    wide['Pop'] = wide['RELI'].map(pop_dict).fillna(0).round().astype(int)
+    wide['Emp'] = wide['RELI'].map(empl_dict).fillna(0).round().astype(int)
+    wide = wide[['RELI', 'Pop', 'Emp'] + slot_cols]
+
+    out_path = os.path.join(output_dir, 'cell_station_candidates.csv')
+    wide.to_csv(out_path, index=False, encoding='utf-8-sig')
+    print(f"    Cell candidates ({len(wide):,} cells, ≤{MAX_CANDIDATE_STATIONS} slots each)"
+          f" saved -> {out_path}")
+
+
 # ===============================================================================
 # OUTPUTS
 # ===============================================================================
 
-def _build_catchment_gpkg(allocation, grid, output_dir):
+def _build_catchment_gpkg(allocation, pop_grid, empl_grid, rail_stations, output_dir):
     """Dissolve cells per station into catchment polygons.
-    Schema: [train_station, id, geometry] for downstream compatibility."""
+    Schema: [train_station, id, station_name, pop, empl, geometry]."""
     print("  Building catchment GeoPackage ...")
 
-    merged = allocation.merge(grid[['RELI', 'geometry']], on='RELI', how='left')
+    merged = allocation.merge(pop_grid[['RELI', 'geometry']], on='RELI', how='left')
     merged = gpd.GeoDataFrame(merged, geometry='geometry', crs=CODEBASE_CRS)
     merged['geometry'] = merged.geometry.buffer(CELL_SIZE_M / 2, cap_style=3)
 
     dissolved = merged.dissolve(by='id_point', as_index=False)
     dissolved = dissolved.rename(columns={'id_point': 'id'})
     dissolved['train_station'] = dissolved['id'].copy()
-    dissolved = dissolved[['train_station', 'id', 'geometry']].copy()
     dissolved['id'] = dissolved['id'].astype(int)
     dissolved['train_station'] = dissolved['train_station'].astype(int)
 
-    out_path = os.path.join(output_dir, 'catchement.gpkg')
+    # Per-station pop and empl from allocated cells
+    pop_map  = pop_grid.set_index('RELI')['NUMMER']
+    empl_map = empl_grid.set_index('RELI')['NUMMER']
+    alloc = allocation.copy()
+    alloc['_pop']  = alloc['RELI'].map(pop_map).fillna(0)
+    alloc['_empl'] = alloc['RELI'].map(empl_map).fillna(0)
+    stats = alloc.groupby('id_point').agg(
+        pop=('_pop', 'sum'), empl=('_empl', 'sum')).astype(int).reset_index()
+    stats['id'] = stats['id_point'].astype(int)
+
+    # Station names
+    name_map = rail_stations.set_index('id_point')['stop_name'].to_dict()
+    dissolved['station_name'] = dissolved['id'].map(name_map).fillna('—')
+
+    dissolved = dissolved.merge(stats[['id', 'pop', 'empl']], on='id', how='left')
+    dissolved['pop']  = dissolved['pop'].fillna(0).astype(int)
+    dissolved['empl'] = dissolved['empl'].fillna(0).astype(int)
+
+    dissolved = dissolved[['train_station', 'id', 'station_name',
+                            'pop', 'empl', 'geometry']].copy()
+
+    out_path = os.path.join(output_dir, 'catchment.gpkg')
     dissolved.to_file(out_path, driver='GPKG')
     print(f"    Saved -> {out_path}  ({len(dissolved)} features)")
 
     return dissolved
 
 
-def _build_catchment_tif(allocation, output_dir):
-    """Write a 2-band GeoTIFF: Band 1 = access time (sec), Band 2 = station ID (ID_point)."""
-    print("  Building catchment raster ...")
-
-    e_min = int(allocation['E_KOORD'].min())
-    e_max = int(allocation['E_KOORD'].max()) + CELL_SIZE_M
-    n_min = int(allocation['N_KOORD'].min())
-    n_max = int(allocation['N_KOORD'].max()) + CELL_SIZE_M
-
-    width  = (e_max - e_min) // CELL_SIZE_M
-    height = (n_max - n_min) // CELL_SIZE_M
-
-    time_raster    = np.full((height, width), 99999, dtype=np.float32)
-    station_raster = np.full((height, width), NO_PT_ID, dtype=np.float32)
-
-    for _, row in allocation.iterrows():
-        col = int((row['E_KOORD'] - e_min) // CELL_SIZE_M)
-        r   = int((n_max - row['N_KOORD'] - CELL_SIZE_M) // CELL_SIZE_M)
-        if 0 <= r < height and 0 <= col < width:
-            time_raster[r, col]    = row['access_time_sec']
-            station_raster[r, col] = row['id_point']
-
-    transform = from_origin(e_min, n_max, CELL_SIZE_M, CELL_SIZE_M)
-    out_path = os.path.join(output_dir, 'catchement.tif')
-
-    with rasterio.open(out_path, 'w', driver='GTiff',
-                       height=height, width=width, count=2,
-                       dtype='float32', crs=CODEBASE_CRS,
-                       transform=transform) as dst:
-        dst.write(time_raster, 1)
-        dst.write(station_raster, 2)
-
-    print(f"    Saved -> {out_path}  ({width}x{height}, 2 bands)")
 
 
-def _build_access_mode_tif(allocation, output_dir):
-    """Write a single-band int8 GeoTIFF with access mode codes (0-4)."""
-    print("  Building access mode raster ...")
-
-    e_min = int(allocation['E_KOORD'].min())
-    e_max = int(allocation['E_KOORD'].max()) + CELL_SIZE_M
-    n_min = int(allocation['N_KOORD'].min())
-    n_max = int(allocation['N_KOORD'].max()) + CELL_SIZE_M
-
-    width  = (e_max - e_min) // CELL_SIZE_M
-    height = (n_max - n_min) // CELL_SIZE_M
-
-    mode_raster = np.full((height, width), MODE_NO_PT, dtype=np.int8)
-
-    for _, row in allocation.iterrows():
-        col = int((row['E_KOORD'] - e_min) // CELL_SIZE_M)
-        r   = int((n_max - row['N_KOORD'] - CELL_SIZE_M) // CELL_SIZE_M)
-        if 0 <= r < height and 0 <= col < width:
-            mode_raster[r, col] = int(row['access_mode'])
-
-    transform = from_origin(e_min, n_max, CELL_SIZE_M, CELL_SIZE_M)
-    out_path = os.path.join(output_dir, 'access_mode.tif')
-
-    with rasterio.open(out_path, 'w', driver='GTiff',
-                       height=height, width=width, count=1,
-                       dtype='int8', crs=CODEBASE_CRS,
-                       transform=transform, nodata=MODE_NO_PT) as dst:
-        dst.write(mode_raster, 1)
-
-    print(f"    Saved -> {out_path}  ({width}x{height})")
-
-
-def _build_visualisation(allocation, grid, rail_stations, boundary, method_label):
+def _build_visualisation(allocation, grid, rail_stations, boundary, method_label,
+                         empl_grid=None,
+                         walk_df=None, cycle_df=None, feeder_df=None):
     """Produce a thesis-quality catchment visualisation map.
-    Saved to plots/Catchment_Area/."""
+
+    Cells are drawn as 100×100 m squares clipped to the catchment boundary.
+    Lakes and the study area boundary are included.
+    Rail stations are shown as circles with white fill and black outline.
+    A summary table below the map reports pop and FTE by overarching access mode:
+    Walk, PT (bus/tram/ship/funicular), Cycling, and No access.
+
+    Saved to plots/Catchment_Area/PT_Feeder/.
+    """
     print(f"  Building {method_label} catchment visualisation ...")
 
-    merged = allocation.merge(grid[['RELI', 'geometry']], on='RELI', how='left')
-    merged = gpd.GeoDataFrame(merged, geometry='geometry', crs=CODEBASE_CRS)
+    # Build 100×100 m square cells from allocation coordinates
+    alloc = allocation.copy()
+    alloc['geometry'] = [
+        box(e, n, e + CELL_SIZE_M, n + CELL_SIZE_M)
+        for e, n in zip(alloc['E_KOORD'], alloc['N_KOORD'])
+    ]
+    alloc = gpd.GeoDataFrame(alloc, geometry='geometry', crs=CODEBASE_CRS)
+
+    # Clip cells to catchment boundary
+    alloc = gpd.clip(alloc, boundary)
+
+    mode_colors = {
+        'No PT':     '#d9d9d9',
+        'Walk':      '#2ca02c',
+        'Bus':       '#1f77b4',
+        'Tram':      '#ff7f0e',
+        'Ship':      '#004B8D',
+        'Funicular': '#7B3F00',
+        'Cycle':     '#9467bd',
+    }
+    mode_labels = {
+        'No PT':     'No access',
+        'Walk':      'Walk to rail',
+        'Bus':       'Bus feeder',
+        'Tram':      'Tram feeder',
+        'Ship':      'Ship feeder',
+        'Funicular': 'Funicular feeder',
+        'Cycle':     'Cycle to rail',
+    }
 
     fig, ax = plt.subplots(1, 1, figsize=(14, 12))
 
-    mode_colors = {
-        MODE_NO_PT: '#d9d9d9',
-        MODE_WALK:  '#2ca02c',
-        MODE_BUS:   '#1f77b4',
-        MODE_TRAM:  '#ff7f0e',
-        MODE_CYCLE: '#9467bd'
-    }
-    mode_labels = {
-        MODE_NO_PT: 'No PT access',
-        MODE_WALK:  'Walk to rail',
-        MODE_BUS:   'Bus feeder',
-        MODE_TRAM:  'Tram feeder',
-        MODE_CYCLE: 'Cycle to rail'
-    }
-
-    for mode, color in mode_colors.items():
-        subset = merged[merged['access_mode'] == mode]
-        if len(subset) > 0:
-            subset.plot(ax=ax, color=color, markersize=1, alpha=0.6)
-
-    rail_stations.plot(ax=ax, color='red', markersize=30, marker='^',
-                       zorder=5, label='Rail stations')
-
+    # Grey background, white interior
+    ax.set_facecolor('#E8E8E8')
     boundary_gdf = gpd.GeoDataFrame(geometry=[boundary], crs=CODEBASE_CRS)
-    boundary_gdf.boundary.plot(ax=ax, color='black', linewidth=1.5, linestyle='--')
+    boundary_gdf.plot(ax=ax, color='white', edgecolor='none', zorder=0)
 
-    legend_elements = [
-        Line2D([0], [0], marker='o', color='w', markerfacecolor=color,
-               markersize=8, label=mode_labels[mode])
-        for mode, color in mode_colors.items()
-    ]
+    # Plot cells per mode
+    legend_elements = []
+    for mode, color in mode_colors.items():
+        subset = alloc[alloc['access_mode'] == mode]
+        if len(subset) > 0:
+            subset.plot(ax=ax, color=color, edgecolor='none', alpha=0.85, zorder=2)
+            legend_elements.append(
+                Patch(facecolor=color, edgecolor='none', label=mode_labels[mode]))
+
+    # Lakes
+    if os.path.exists(paths.LAKES_SHP):
+        lakes = gpd.read_file(paths.LAKES_SHP).to_crs(CODEBASE_CRS)
+        lakes = lakes[lakes.geometry.intersects(boundary)]
+        if not lakes.empty:
+            gpd.clip(lakes, boundary).plot(
+                ax=ax, color='#A8D8EA', edgecolor='none', zorder=3)
+
+    # Catchment boundary
+    boundary_gdf.boundary.plot(ax=ax, color='black', linewidth=1.8,
+                               linestyle='--', zorder=5)
     legend_elements.append(
-        Line2D([0], [0], marker='^', color='w', markerfacecolor='red',
-               markersize=10, label='Rail station')
-    )
-    ax.legend(handles=legend_elements, loc='upper left', fontsize=9)
+        Line2D([0], [0], color='black', linewidth=1.8, linestyle='--',
+               label='Study area boundary'))
+
+    # Rail stations: white fill, black outline
+    prep_bnd_vis = prep(boundary)
+    stations_in_bnd = rail_stations[
+        rail_stations.geometry.apply(lambda p: prep_bnd_vis.contains(p))]
+    if not stations_in_bnd.empty:
+        ax.scatter(stations_in_bnd.geometry.x, stations_in_bnd.geometry.y,
+                   s=25, c='white', edgecolors='black', linewidths=0.8,
+                   marker='o', zorder=6)
+    legend_elements.append(
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='white',
+               markeredgecolor='black', markersize=8, label='Rail station'))
+
+    bx_min, by_min, bx_max, by_max = boundary.bounds
+    pad = 200
+    ax.set_xlim(bx_min - pad, bx_max + pad)
+    ax.set_ylim(by_min - pad, by_max + pad)
+    ax.set_aspect('equal')
 
     ax.set_title(f'Catchment Area Allocation - {method_label}', fontsize=14)
     ax.set_xlabel('E [m]')
     ax.set_ylabel('N [m]')
-    ax.set_aspect('equal')
+
+    # --- Summary table: pop and FTE by mode group ---
+    # When mode DataFrames are provided, count every cell reachable by that mode
+    # regardless of which mode won (cells may appear in multiple rows).
+    # Fallback: use the winner-takes-all access_mode column.
+    pop_map  = grid.set_index('RELI')['NUMMER'].to_dict()
+    empl_map = empl_grid.set_index('RELI')['NUMMER'].to_dict() if empl_grid is not None else {}
+
+    alloc['_pop']  = alloc['RELI'].map(pop_map).fillna(0)
+    alloc['_empl'] = alloc['RELI'].map(empl_map).fillna(0)
+    total_pop  = alloc['_pop'].sum()
+    total_empl = alloc['_empl'].sum()
+
+    use_multi = (walk_df is not None or cycle_df is not None or feeder_df is not None)
+
+    if use_multi:
+        # Build RELI sets reachable per mode group from raw access DataFrames
+        walk_relis   = set(walk_df['RELI'].values)   if walk_df   is not None else set()
+        feeder_relis = set(feeder_df['RELI'].values) if feeder_df is not None else set()
+        cycle_relis  = set(cycle_df['RELI'].values)  if cycle_df  is not None else set()
+        no_acc_relis = set(alloc.loc[alloc['id_point'] == NO_PT_ID, 'RELI'].values)
+
+        reli_pop  = alloc.set_index('RELI')['_pop'].to_dict()
+        reli_empl = alloc.set_index('RELI')['_empl'].to_dict()
+
+        def _mode_stats(relis):
+            p = sum(reli_pop.get(r, 0)  for r in relis)
+            e = sum(reli_empl.get(r, 0) for r in relis)
+            pp = p / total_pop  * 100 if total_pop  > 0 else 0.0
+            ep = e / total_empl * 100 if total_empl > 0 else 0.0
+            return int(p), pp, int(e), ep
+
+        tbl_rows = [
+            ('Walk',       _mode_stats(walk_relis)),
+            ('PT Feeder',  _mode_stats(feeder_relis)),
+            ('Cycling',    _mode_stats(cycle_relis)),
+            ('No access',  _mode_stats(no_acc_relis)),
+        ]
+        note = "(cells may count in multiple modes)"
+    else:
+        pt_modes = {'Bus', 'Tram', 'Ship', 'Funicular'}
+
+        def _group_mode(mode):
+            if mode == 'Walk':    return 'Walk'
+            if mode in pt_modes:  return 'PT Feeder'
+            if mode == 'Cycle':   return 'Cycling'
+            return 'No access'
+
+        alloc['_group'] = alloc['access_mode'].apply(_group_mode)
+        tbl_rows = []
+        for grp in ('Walk', 'PT Feeder', 'Cycling', 'No access'):
+            sub = alloc[alloc['_group'] == grp]
+            p  = int(sub['_pop'].sum())
+            e  = int(sub['_empl'].sum())
+            pp = p / total_pop  * 100 if total_pop  > 0 else 0.0
+            ep = e / total_empl * 100 if total_empl > 0 else 0.0
+            tbl_rows.append((grp, (p, pp, e, ep)))
+        note = ""
+
+    col_w = 10
+    tbl  = f"{'Mode group':<14}{'Pop':>{col_w}}{'Pop%':>{col_w}}{'FTE':>{col_w}}{'FTE%':>{col_w}}\n"
+    tbl += "─" * (14 + 4 * col_w) + "\n"
+    for grp, (p, pp, e, ep) in tbl_rows:
+        tbl += f"{grp:<14}{p:>{col_w},}{pp:>{col_w-1}.1f}%{e:>{col_w},}{ep:>{col_w-1}.1f}%\n"
+    if note:
+        tbl += note
+
+    # Legend and summary stacked vertically, centered below the plot
+    fig.subplots_adjust(bottom=0.28)
+    ax.legend(handles=legend_elements, loc='upper center',
+              bbox_to_anchor=(0.5, -0.08),
+              bbox_transform=ax.transAxes,
+              ncol=3, fontsize=8, framealpha=0.9,
+              borderaxespad=0)
+    fig.text(0.5, 0.18, tbl, ha='center', va='top',
+             fontsize=8.5, fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.85))
 
     out_path = os.path.join(PT_FEEDER_PLOT_DIR,
                             f'catchment_visualisation_{method_label.lower().replace(" ", "_")}.pdf')
@@ -2036,15 +2312,10 @@ def _build_diff_plot(muni_catchment, pt_catchment, pt_allocation,
     merged = merged[merged['category'] != ''].copy()
 
     # Build cell square geometries
-    merged['geometry'] = [
-        Polygon([
-            (r['E_KOORD'], r['N_KOORD']),
-            (r['E_KOORD'] + CELL_SIZE_M, r['N_KOORD']),
-            (r['E_KOORD'] + CELL_SIZE_M, r['N_KOORD'] + CELL_SIZE_M),
-            (r['E_KOORD'], r['N_KOORD'] + CELL_SIZE_M),
-        ])
-        for _, r in merged.iterrows()
-    ]
+    e_arr = merged['E_KOORD'].values
+    n_arr = merged['N_KOORD'].values
+    merged['geometry'] = [box(e, n, e + CELL_SIZE_M, n + CELL_SIZE_M)
+                          for e, n in zip(e_arr, n_arr)]
     merged = gpd.GeoDataFrame(merged, geometry='geometry', crs=CODEBASE_CRS)
 
     # Summary stats
@@ -2054,6 +2325,26 @@ def _build_diff_plot(muni_catchment, pt_catchment, pt_allocation,
     n_pt   = pt_only.sum()
     print(f"    Cells — same station: {n_same:,}, different: {n_diff:,}, "
           f"municipal only: {n_muni:,}, PT-feeder only: {n_pt:,}")
+
+    # --- Pop and empl per category (for summary table) ---
+    pop_map  = pop_grid.set_index('RELI')['NUMMER'].to_dict()
+    empl_map = empl_grid.set_index('RELI')['NUMMER'].to_dict()
+    merged['_pop']  = merged['RELI'].map(pop_map).fillna(0)
+    merged['_empl'] = merged['RELI'].map(empl_map).fillna(0)
+    total_pop  = merged['_pop'].sum()
+    total_empl = merged['_empl'].sum()
+
+    def _cat_stats(cat):
+        sub = merged[merged['category'] == cat]
+        p = sub['_pop'].sum()
+        e = sub['_empl'].sum()
+        return (p / total_pop  * 100 if total_pop  > 0 else 0.0,
+                e / total_empl * 100 if total_empl > 0 else 0.0)
+
+    pct_same  = _cat_stats('same')
+    pct_diff  = _cat_stats('different')
+    pct_muni  = _cat_stats('muni_only')
+    pct_pt    = _cat_stats('pt_only')
 
     # --- Plot ---
     fig, ax = plt.subplots(1, 1, figsize=(14, 12))
@@ -2105,15 +2396,52 @@ def _build_diff_plot(muni_catchment, pt_catchment, pt_allocation,
                label='PT-Feeder catchment boundary'),
     ]
 
-    # Rail stations — only within boundary
-    from shapely.prepared import prep as _prep_diff
-    prep_bnd_diff = _prep_diff(boundary)
+    # --- Station markers: white fill + black outline for all; green fill for
+    #     stations that have a PT-feeder catchment but no municipalities assigned
+    #     in the municipal method (Municipalities == '—' in station_catchment_summary.csv) ---
+    prep_bnd_diff = prep(boundary)
     stations_in_bnd = rail_stations[
-        rail_stations.geometry.apply(lambda p: prep_bnd_diff.contains(p))]
-    stations_in_bnd.plot(ax=ax, color='black', markersize=20, marker='^', zorder=5)
-    legend_handles.append(
-        Line2D([0], [0], marker='^', color='w', markerfacecolor='black',
-               markersize=8, label='Rail station'))
+        rail_stations.geometry.apply(lambda p: prep_bnd_diff.contains(p))].copy()
+
+    # Load no-municipality stations from the municipal summary CSV.
+    # All ID sets use strings to match rail_stations['id_point'] (str from stop_id).
+    summary_csv = os.path.join(MUNICIPAL_DATA_DIR, 'station_catchment_summary.csv')
+    no_muni_ids: set = set()
+    if os.path.exists(summary_csv):
+        _sum = pd.read_csv(summary_csv)
+        no_muni_mask = _sum['Municipalities'].astype(str).str.strip() == '—'
+        no_muni_ids = set(
+            _sum.loc[no_muni_mask, 'Station_Code'].astype(str).values
+        )
+
+    # A station is "PT-feeder new" if it has no municipal assignment AND exists
+    # in the PT-feeder catchment
+    pt_ids = {str(x) for x in pt_c['id_point'].values
+              if str(x) != str(NO_PT_ID)}
+    pt_new_ids = no_muni_ids & pt_ids
+
+    sta_all    = stations_in_bnd
+    sta_pt_new = stations_in_bnd[
+        stations_in_bnd['id_point'].astype(str).isin(pt_new_ids)]
+
+    # Draw all stations white+black first, then overlay green for new PT stations
+    if not sta_all.empty:
+        ax.scatter(sta_all.geometry.x, sta_all.geometry.y,
+                   s=25, c='white', edgecolors='black', linewidths=0.8,
+                   marker='o', zorder=6)
+    if not sta_pt_new.empty:
+        ax.scatter(sta_pt_new.geometry.x, sta_pt_new.geometry.y,
+                   s=25, c='#2ca02c', edgecolors='black', linewidths=0.8,
+                   marker='o', zorder=7)
+
+    legend_handles += [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='white',
+               markeredgecolor='black', markersize=8,
+               label='Rail station (both methods)'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#2ca02c',
+               markeredgecolor='black', markersize=8,
+               label='Rail station (PT-Feeder only)'),
+    ]
 
     # Study area boundary
     boundary_gdf.boundary.plot(ax=ax, color='black', linewidth=1.8, linestyle='--', zorder=4)
@@ -2127,12 +2455,34 @@ def _build_diff_plot(muni_catchment, pt_catchment, pt_allocation,
     ax.set_xlim(bx_min - pad, bx_max + pad)
     ax.set_ylim(by_min - pad, by_max + pad)
 
-    ax.legend(handles=legend_handles, loc='upper right', fontsize=8, framealpha=0.9)
-    ax.set_title('Catchment Comparison: Municipal vs PT-Feeder (populated cells)',
-                 fontsize=14)
+    ax.set_title('Catchment Comparison: Municipal vs PT-Feeder', fontsize=14)
     ax.set_xlabel('E [m]')
     ax.set_ylabel('N [m]')
     ax.set_aspect('equal')
+
+    # --- Summary table ---
+    col_w = 9
+    tbl  = "Population & employment shift: Municipal → PT-Feeder\n"
+    tbl += f"{'Category':<28}{'Pop (%)':>{col_w}}{'FTE (%)':>{col_w}}\n"
+    tbl += "─" * (28 + 2 * col_w) + "\n"
+    rows = [
+        ('Same station',              pct_same),
+        ('Changed station',           pct_diff),
+        ('Lost access (Mun. only)',   pct_muni),
+        ('Gained access (PT only)',   pct_pt),
+    ]
+    for label, (pp, ep) in rows:
+        tbl += f"{label:<28}{pp:>{col_w-1}.1f}%{ep:>{col_w-1}.1f}%\n"
+
+    # Legend and summary stacked vertically, centered below the plot
+    fig.subplots_adjust(bottom=0.30)
+    ax.legend(handles=legend_handles, loc='upper center',
+              bbox_to_anchor=(0.5, -0.08),
+              bbox_transform=ax.transAxes,
+              ncol=2, fontsize=8, framealpha=0.9, borderaxespad=0)
+    fig.text(0.5, 0.18, tbl, ha='center', va='top',
+             fontsize=9, fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.85))
 
     out_path = os.path.join(CATCHMENT_PLOT_DIR, 'catchment_diff_municipal_vs_pt_feeder.pdf')
     fig.savefig(out_path, bbox_inches='tight', dpi=150)
@@ -2151,7 +2501,7 @@ _ACCESS_GREY   = '#BDBDBD'
 
 
 def _plot_access_times(walk_df, cycle_df, feeder_df, alloc_pop, pop_grid,
-                       rail_stations, feeder_stops, boundary):
+                       rail_stations, feeder_stops, boundary, empl_grid=None):
     """Produce four access-time maps (plasma_r palette, discrete 3/5-min bins).
 
     Plots
@@ -2173,12 +2523,10 @@ def _plot_access_times(walk_df, cycle_df, feeder_df, alloc_pop, pop_grid,
     colours = [cmap(k / (n_bins - 1)) for k in range(n_bins)]
 
     # Pre-build square polygon geometry for the grid (100 m × 100 m)
-    from shapely.geometry import box as _box
-    squares = [
-        _box(row['E_KOORD'], row['N_KOORD'],
-             row['E_KOORD'] + CELL_SIZE_M, row['N_KOORD'] + CELL_SIZE_M)
-        for _, row in pop_grid.iterrows()
-    ]
+    _e = pop_grid['E_KOORD'].values
+    _n = pop_grid['N_KOORD'].values
+    squares = [box(e, n, e + CELL_SIZE_M, n + CELL_SIZE_M)
+               for e, n in zip(_e, _n)]
     grid_plot = gpd.GeoDataFrame(
         pop_grid[['RELI', 'E_KOORD', 'N_KOORD']].copy(),
         geometry=squares, crs=CODEBASE_CRS
@@ -2189,6 +2537,9 @@ def _plot_access_times(walk_df, cycle_df, feeder_df, alloc_pop, pop_grid,
         mins = np.array(time_sec, dtype=float) / 60.0
         idx  = np.digitize(mins, _ACCESS_BINS[1:], right=False)
         return np.clip(idx, 0, n_bins - 1)
+
+    pop_map  = pop_grid.set_index('RELI')['NUMMER'].to_dict()
+    empl_map = empl_grid.set_index('RELI')['NUMMER'].to_dict() if empl_grid is not None else {}
 
     def _render(title, fname, reli_series, time_series):
         """Plot one access-time map given aligned RELI and time_sec arrays."""
@@ -2201,6 +2552,14 @@ def _plot_access_times(walk_df, cycle_df, feeder_df, alloc_pop, pop_grid,
         in_buffer = gdf['time_sec'].notna()
         gdf['class_idx'] = -1  # -1 = outside buffer (grey)
         gdf.loc[in_buffer, 'class_idx'] = _class(gdf.loc[in_buffer, 'time_sec'].values)
+
+        # Attach pop/empl values for the summary
+        gdf['_pop']  = gdf['RELI'].map(pop_map).fillna(0)
+        gdf['_empl'] = gdf['RELI'].map(empl_map).fillna(0)
+        total_pop_grid  = gdf['_pop'].sum()
+        total_empl_grid = gdf['_empl'].sum()
+        total_pop  = gdf.loc[in_buffer, '_pop'].sum()
+        total_empl = gdf.loc[in_buffer, '_empl'].sum()
 
         fig, ax = plt.subplots(1, 1, figsize=(12, 10))
 
@@ -2236,14 +2595,48 @@ def _plot_access_times(walk_df, cycle_df, feeder_df, alloc_pop, pop_grid,
         legend_handles.append(Line2D([0], [0], color='black', linewidth=1.8,
                                      linestyle='--', label='Catchment area boundary'))
 
-        ax.legend(handles=legend_handles, title='Access time (min)',
-                  title_fontsize=8, fontsize=7,
-                  loc='upper right', framealpha=0.9)
-
         ax.set_title(title, fontsize=13)
         ax.set_xlabel('E [m]')
         ax.set_ylabel('N [m]')
         ax.set_aspect('equal')
+
+        # --- Summary table: pop and FTE by access-time bin ---
+        # Percentages are relative to total grid (in-buffer + outside buffer)
+        col_w = 9
+        tbl  = f"{'Bin (min)':<10}{'Pop':>{col_w}}{'Pop%':>{col_w}}{'FTE':>{col_w}}{'FTE%':>{col_w}}\n"
+        tbl += "─" * (10 + 4 * col_w) + "\n"
+        for ci in sorted(used_classes):
+            mask_ci = gdf['class_idx'] == ci
+            p  = int(gdf.loc[mask_ci, '_pop'].sum())
+            e  = int(gdf.loc[mask_ci, '_empl'].sum())
+            pp = p / total_pop_grid  * 100 if total_pop_grid  > 0 else 0.0
+            ep = e / total_empl_grid * 100 if total_empl_grid > 0 else 0.0
+            tbl += (f"{_ACCESS_LABELS[ci]:<10}"
+                    f"{p:>{col_w},}{pp:>{col_w-1}.1f}%"
+                    f"{e:>{col_w},}{ep:>{col_w-1}.1f}%\n")
+        p_out = int(total_pop_grid  - total_pop)
+        e_out = int(total_empl_grid - total_empl)
+        pp_out = p_out / total_pop_grid  * 100 if total_pop_grid  > 0 else 0.0
+        ep_out = e_out / total_empl_grid * 100 if total_empl_grid > 0 else 0.0
+        tbl += (f"{'Outside':<10}"
+                f"{p_out:>{col_w},}{pp_out:>{col_w-1}.1f}%"
+                f"{e_out:>{col_w},}{ep_out:>{col_w-1}.1f}%\n")
+        p_tot  = int(total_pop_grid)
+        e_tot  = int(total_empl_grid)
+        tbl += "─" * (10 + 4 * col_w) + "\n"
+        tbl += f"{'Total':<10}{p_tot:>{col_w},}{'100.0':>{col_w}}%{e_tot:>{col_w},}{'100.0':>{col_w-1}}%\n"
+
+        # Legend and summary stacked vertically, centered below the plot
+        fig.subplots_adjust(bottom=0.30)
+        ax.legend(handles=legend_handles, title='Access time (min)',
+                  title_fontsize=8, fontsize=7,
+                  loc='upper center',
+                  bbox_to_anchor=(0.5, -0.08),
+                  bbox_transform=ax.transAxes,
+                  ncol=3, framealpha=0.9, borderaxespad=0)
+        fig.text(0.5, 0.16, tbl, ha='center', va='top',
+                 fontsize=8, fontfamily='monospace',
+                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.85))
 
         out_path = os.path.join(PT_FEEDER_PLOT_DIR, fname)
         fig.savefig(out_path, bbox_inches='tight', dpi=150)
@@ -2282,6 +2675,595 @@ def _plot_access_times(walk_df, cycle_df, feeder_df, alloc_pop, pop_grid,
 
 
 # ===============================================================================
+# STEP 2-PT: ÖV-GÜTEKLASSEN CLASSIFICATION (ARE 2022)
+# ===============================================================================
+
+def _headway_to_kat(headway_min, mode_group, is_bahnknoten=False):
+    """Convert headway (min) to Haltestellenkategorie integer (1=I … 5=V).
+
+    Returns 0 if headway > 60 min (no category) or mode_group is unknown.
+    """
+    if not np.isfinite(headway_min) or headway_min <= 0 or headway_min > 60:
+        return 0
+
+    if mode_group == 'C':       # Funicular: always Kat. V
+        return 5
+
+    # Headway bucket: 0 = <5, 1 = 5–9, 2 = 10–19, 3 = 20–39, 4 = 40–60
+    if   headway_min <  5: bucket = 0
+    elif headway_min < 10: bucket = 1
+    elif headway_min < 20: bucket = 2
+    elif headway_min < 40: bucket = 3
+    else:                  bucket = 4
+
+    if mode_group == 'A':
+        return [1, 1, 2, 3, 4][bucket] if is_bahnknoten else [1, 2, 3, 4, 5][bucket]
+    else:                               # mode_group == 'B'
+        return [2, 3, 4, 5, 5][bucket]
+
+
+def _kat_to_ring_records(stop_row, boundary_geom=None):
+    """Return a list of ring-polygon records for one stop.
+
+    Each record is a dict with keys:
+        stop_id, stop_name, hst_kat, gk_class, dist_band,
+        headway_min, n_lines, is_bahnknoten, geometry
+    """
+    kat = int(stop_row['hst_kat'])
+    if kat == 0:
+        return []
+
+    max_radius = GK_MAX_RADIUS[kat]
+    records = []
+
+    for band_idx, (r_inner, r_outer) in enumerate(GK_DIST_BANDS):
+        if r_inner >= max_radius:
+            break
+        r_outer_clamp = min(r_outer, max_radius)
+        gk = _GK_LOOKUP.get((kat, band_idx))
+        if gk is None:
+            continue
+
+        outer = stop_row.geometry.buffer(r_outer_clamp)
+        geom  = outer.difference(stop_row.geometry.buffer(r_inner)) if r_inner > 0 else outer
+        if boundary_geom is not None:
+            geom = geom.intersection(boundary_geom)
+        if geom.is_empty:
+            continue
+
+        records.append({
+            'stop_id':       str(stop_row['stop_id']),
+            'stop_name':     stop_row.get('stop_name', ''),
+            'hst_kat':       kat,
+            'gk_class':      gk,
+            'dist_band':     GK_DIST_LABELS[band_idx],
+            'headway_min':   round(float(stop_row.get('headway_min', np.inf)), 1),
+            'n_lines':       int(stop_row.get('n_lines', 0)),
+            'is_bahnknoten': bool(stop_row.get('is_bahnknoten', False)),
+            'geometry':      geom,
+        })
+
+    return records
+
+
+def _compute_stop_gueteklassen(feeder_stops, rail_stops, temporal='all'):
+    """Classify every feeder and rail stop according to the ARE ÖV-Güteklassen
+    methodology (ARE 2022) and add the following columns to both GDFs:
+
+        hst_kat         int   0 (none) or 1–5  (I–V)
+        buffer_radius_m int   maximum walk-access radius derived from hst_kat
+        headway_min     float effective combined headway across all lines at stop
+        n_lines         int   number of distinct routes serving the stop
+        is_bahnknoten   bool  True if ≥ 2 distinct rail routes serve the stop
+
+    Headway method: for each route compute a bidirectional average dep_value,
+    then sum across all routes in the same mode group at the stop:
+        temporal='all'     → dep_value = mean(total_dep, dir0, dir1)
+                             headway   = GK_WINDOW_MIN / sum_per_stop
+        temporal='peak'    → dep_value = mean((freq_am_peak + freq_pm_peak)/2, dir0, dir1)
+                             headway   = 60 / sum_per_stop
+        temporal='offpeak' → dep_value = mean(freq_offpeak, dir0, dir1)
+                             headway   = 60 / sum_per_stop
+
+    For stops served by multiple mode groups the best (lowest) Kat wins.
+    Bahnknoten threshold: ≥ 2 distinct rail route_ids.
+    """
+    print("  Computing ÖV-Güteklassen stop categories ...")
+
+    subfolder_map = {'all': '',       'peak': 'Peak',     'offpeak': 'Off_Peak'}
+    suffix_map    = {'all': '',       'peak': '_peak',    'offpeak': '_offpeak'}
+    subfolder = subfolder_map[temporal]
+    suffix    = suffix_map[temporal]
+
+    feeder_base = os.path.join(paths.FEEDER_LINES_DIR, GTFS_NETWORK_FOLDER)
+    rail_base   = os.path.join(paths.RAIL_PROCESSED_DIR, GTFS_NETWORK_FOLDER)
+
+    def _versioned(base, name):
+        if subfolder:
+            return os.path.join(base, subfolder, f'{name}{suffix}.gpkg')
+        return os.path.join(base, f'{name}.gpkg')
+
+    # --- Load lines (frequency data) ---
+    feeder_mode_grp = {'tram': 'B', 'bus': 'B', 'ship': 'B', 'funicular': 'C'}
+    rail_mode_grp   = {k: 'A' for k in
+                       ['sbahn', 'long_distance_rail',
+                        'inter_regional_rail', 'regional_rail']}
+
+    def _load_lines(path, mode_grp_map):
+        frames = []
+        for layer_name, _ in pyogrio.list_layers(path):
+            gdf = gpd.read_file(path, layer=layer_name)
+            gdf['mode_group'] = mode_grp_map.get(layer_name, 'B')
+            frames.append(gdf)
+        return pd.concat(frames, ignore_index=True)
+
+    feeder_lines = _load_lines(_versioned(feeder_base, 'pt_feeder_lines'), feeder_mode_grp)
+    rail_lines   = _load_lines(_versioned(rail_base,   'rail_lines'),      rail_mode_grp)
+    all_lines = pd.concat([feeder_lines, rail_lines], ignore_index=True)
+
+    # Compute per-row dep_value, keeping both direction_ids.
+    # The bidirectional average is produced by mean() in the route_dep aggregation.
+    if temporal == 'peak':
+        # Average AM-peak and PM-peak frequencies per row
+        all_lines['dep_value'] = (
+            pd.to_numeric(all_lines['freq_am_peak_dep_hr'], errors='coerce').fillna(0) +
+            pd.to_numeric(all_lines['freq_pm_peak_dep_hr'], errors='coerce').fillna(0)
+        ) / 2
+        use_rate = True    # headway = 60 / sum_per_stop
+    elif temporal == 'offpeak':
+        all_lines['dep_value'] = pd.to_numeric(
+            all_lines['freq_offpeak_dep_hr'], errors='coerce').fillna(0)
+        use_rate = True    # headway = 60 / sum_per_stop
+    else:  # 'all'
+        all_lines['dep_value'] = pd.to_numeric(
+            all_lines['total_dep'], errors='coerce').fillna(0)
+        use_rate = False   # headway = GK_WINDOW_MIN / sum_per_stop
+
+    # One dep_value per (route_id, variant_rank): mean across direction_ids
+    # gives the bidirectional average naturally (both dirs present → (dir0+dir1)/2).
+    route_dep = (all_lines.groupby(['route_id', 'variant_rank'], as_index=False)
+                 .agg(dep_value=('dep_value', 'mean'),
+                      mode_group=('mode_group', 'first')))
+
+    # --- Load segments to map stops → routes ---
+    def _load_segs(path):
+        frames = []
+        for layer_name, _ in pyogrio.list_layers(path):
+            gdf = gpd.read_file(path, layer=layer_name)
+            frames.append(
+                gdf[['from_stop_id', 'to_stop_id',
+                     'route_id', 'direction_id', 'variant_rank']].copy())
+        return pd.concat(frames, ignore_index=True)
+
+    feeder_segs = _load_segs(_versioned(feeder_base, 'pt_feeder_segments'))
+    rail_segs   = _load_segs(_versioned(rail_base,   'rail_segments'))
+    all_segs = pd.concat([feeder_segs, rail_segs], ignore_index=True)
+    # Keep both directions so terminal stops that only appear in direction_id=1 are included.
+
+    # Build unique (stop_id, route_id, variant_rank) pairs
+    from_p = all_segs[['from_stop_id', 'route_id', 'variant_rank']].rename(
+        columns={'from_stop_id': 'stop_id'})
+    to_p   = all_segs[['to_stop_id',   'route_id', 'variant_rank']].rename(
+        columns={'to_stop_id':   'stop_id'})
+    pairs = (pd.concat([from_p, to_p])
+               .drop_duplicates()
+               .astype({'stop_id': str}))
+
+    # Join departure counts
+    pairs = pairs.merge(route_dep, on=['route_id', 'variant_rank'], how='left')
+    pairs = pairs.dropna(subset=['dep_value'])
+    pairs = pairs[pairs['dep_value'] > 0]
+
+    # --- Aggregate per stop per mode group ---
+    stop_grp = (pairs.groupby(['stop_id', 'mode_group'], as_index=False)
+                .agg(dep_sum  =('dep_value', 'sum'),
+                     n_routes =('route_id',  'nunique')))
+
+    if use_rate:
+        stop_grp['headway_min'] = 60.0 / stop_grp['dep_sum'].clip(lower=1e-6)
+    else:
+        stop_grp['headway_min'] = GK_WINDOW_MIN / stop_grp['dep_sum'].clip(lower=1e-6)
+
+    # Bahnknoten: rail stops with ≥ 2 distinct route_ids
+    rail_route_cnt = (pairs[pairs['mode_group'] == 'A']
+                      .groupby('stop_id')['route_id']
+                      .nunique()
+                      .rename('rail_n_routes')
+                      .reset_index())
+
+    # Pivot headways to wide format: one row per stop
+    pivot = stop_grp.pivot(index='stop_id', columns='mode_group',
+                           values='headway_min').reset_index()
+    pivot.columns.name = None
+    for col in ('A', 'B', 'C'):
+        if col not in pivot.columns:
+            pivot[col] = np.nan
+    pivot = pivot.rename(columns={'A': 'hw_A', 'B': 'hw_B', 'C': 'hw_C'})
+    pivot = pivot.merge(rail_route_cnt, on='stop_id', how='left')
+    pivot['is_bahnknoten'] = pivot['rail_n_routes'].fillna(0) >= 2
+
+    # Per-stop n_lines (all groups combined)
+    n_lines = (pairs.groupby('stop_id')['route_id']
+               .nunique().rename('n_lines').reset_index())
+    pivot = pivot.merge(n_lines, on='stop_id', how='left')
+    pivot['n_lines'] = pivot['n_lines'].fillna(0).astype(int)
+
+    # Best headway across groups (for display)
+    pivot['headway_min'] = pivot[['hw_A', 'hw_B', 'hw_C']].min(axis=1)
+
+    # Classify: best (lowest) Kat across all mode groups at the stop
+    def _best_kat(row):
+        kats = [
+            _headway_to_kat(row['hw_A'], 'A', row['is_bahnknoten']),
+            _headway_to_kat(row['hw_B'], 'B'),
+            _headway_to_kat(row['hw_C'], 'C'),
+        ]
+        valid = [k for k in kats if k > 0]
+        return min(valid) if valid else 0
+
+    pivot['hst_kat'] = pivot.apply(_best_kat, axis=1)
+    pivot['buffer_radius_m'] = pivot['hst_kat'].map(GK_MAX_RADIUS).fillna(0).astype(int)
+
+    gk_cols = ['stop_id', 'hst_kat', 'buffer_radius_m',
+               'headway_min', 'n_lines', 'is_bahnknoten']
+    gk = pivot[gk_cols].copy()
+
+    def _apply_gk(stops_gdf):
+        out = stops_gdf.copy()
+        out['_sid'] = out['stop_id'].astype(str)
+        out = out.merge(gk, left_on='_sid', right_on='stop_id',
+                        how='left', suffixes=('', '_gk'))
+        out = out.drop(columns=['_sid', 'stop_id_gk'], errors='ignore')
+        out['hst_kat']       = out['hst_kat'].fillna(0).astype(int)
+        out['buffer_radius_m'] = out['buffer_radius_m'].fillna(0).astype(int)
+        out['headway_min']   = out['headway_min'].fillna(np.inf)
+        out['n_lines']       = out['n_lines'].fillna(0).astype(int)
+        out['is_bahnknoten'] = out['is_bahnknoten'].fillna(False)
+        return gpd.GeoDataFrame(out, geometry='geometry', crs=CODEBASE_CRS)
+
+    feeder_stops = _apply_gk(feeder_stops)
+    rail_stops   = _apply_gk(rail_stops)
+
+    n_cls = ((feeder_stops['hst_kat'] > 0).sum()
+             + (rail_stops['hst_kat'] > 0).sum())
+    n_tot = len(feeder_stops) + len(rail_stops)
+    print(f"    Classified {n_cls}/{n_tot} stops  "
+          f"(window={GK_WINDOW_MIN} min, method={'rate' if use_rate else 'total_dep'})")
+
+    kat_names = {0: 'none', 1: 'I', 2: 'II', 3: 'III', 4: 'IV', 5: 'V'}
+    for k in range(6):
+        n = ((feeder_stops['hst_kat'] == k).sum()
+             + (rail_stops['hst_kat'] == k).sum())
+        if n > 0:
+            print(f"      Kat {kat_names[k]}: {n:,} stops")
+
+    return feeder_stops, rail_stops
+
+
+def _dissolve_hierarchical(rings_gdf):
+    """Return a GeoDataFrame with one row per Güteklasse (A–D), where each
+    class geometry has been clipped to remove overlap with better classes.
+
+    A is best: unchanged.  B = B_raw − A_raw.  C = C_raw − (A∪B)_raw.  Etc.
+    """
+    class_order = ['A', 'B', 'C', 'D']
+    raw_union = {}
+    for cls in class_order:
+        sub = rings_gdf[rings_gdf['gk_class'] == cls]
+        raw_union[cls] = unary_union(sub.geometry.values) if not sub.empty else None
+
+    rows = []
+    cumulative_mask = None
+    for cls in class_order:
+        geom = raw_union[cls]
+        if geom is not None and not geom.is_empty:
+            if cumulative_mask is not None:
+                geom = geom.difference(cumulative_mask)
+            if not geom.is_empty:
+                rows.append({'gk_class': cls, 'geometry': geom})
+        if raw_union[cls] is not None:
+            cumulative_mask = (raw_union[cls] if cumulative_mask is None
+                               else cumulative_mask.union(raw_union[cls]))
+    return gpd.GeoDataFrame(rows, geometry='geometry', crs=CODEBASE_CRS)
+
+
+def _build_gueteklassen_gpkgs(feeder_stops, rail_stops, boundary, pop_grid, empl_grid):
+    """Save two GeoPackages to PT_FEEDER_DATA_DIR:
+
+    gueteklassen_by_stop.gpkg   — ring polygons per stop (one layer per mode)
+                                  with cross-stop hierarchy applied: lower-class
+                                  rings are clipped where higher-class rings overlap.
+    gueteklassen_by_class.gpkg  — single layer, 4 rows (one per Güteklasse A–D)
+                                  after hierarchical masking; columns:
+                                  fid, Class, Class_Area_m2, Pop, Empl.
+    """
+    print("  Building Güteklassen GeoPackages ...")
+
+    # Tag each stop with its transport-mode layer name
+    feeder_s = feeder_stops.copy()
+    feeder_s['_layer'] = feeder_s['mode'].str.lower().apply(
+        lambda m: ('funicular' if 'funicular' in m else
+                   'tram'      if 'tram'      in m else
+                   'ship'      if 'ship'      in m else 'bus'))
+    rail_s = rail_stops.copy()
+    rail_s['_layer'] = 'rail'
+
+    all_stops = gpd.GeoDataFrame(
+        pd.concat([feeder_s, rail_s], ignore_index=True),
+        geometry='geometry', crs=CODEBASE_CRS)
+
+    all_records = []
+    for _, row in all_stops.iterrows():
+        rings = _kat_to_ring_records(row, boundary_geom=boundary)
+        for r in rings:
+            r['transport_mode'] = row['_layer']
+        all_records.extend(rings)
+
+    if not all_records:
+        print("    WARNING: no classified stops — skipping GPKG output")
+        return
+
+    rings_gdf = gpd.GeoDataFrame(all_records, geometry='geometry', crs=CODEBASE_CRS)
+
+    # Pre-compute raw class unions for hierarchy masking
+    class_order = ['A', 'B', 'C', 'D']
+    raw_union = {}
+    for cls in class_order:
+        sub = rings_gdf[rings_gdf['gk_class'] == cls]
+        raw_union[cls] = unary_union(sub.geometry.values) if not sub.empty else None
+
+    # --- GPKG 1: by stop — cross-stop hierarchy applied to individual rings ---
+    gpkg1 = os.path.join(PT_FEEDER_DATA_DIR, 'gueteklassen_by_stop.gpkg')
+    if os.path.exists(gpkg1):
+        os.remove(gpkg1)
+
+    clipped_frames = []
+    cumulative_mask = None
+    for cls in class_order:
+        cls_rings = rings_gdf[rings_gdf['gk_class'] == cls].copy()
+        if not cls_rings.empty and cumulative_mask is not None:
+            cls_rings['geometry'] = cls_rings.geometry.apply(
+                lambda g: g.difference(cumulative_mask))
+            cls_rings = cls_rings[~cls_rings.geometry.is_empty].copy()
+        clipped_frames.append(cls_rings)
+        if raw_union[cls] is not None:
+            cumulative_mask = (raw_union[cls] if cumulative_mask is None
+                               else cumulative_mask.union(raw_union[cls]))
+
+    clipped_rings = gpd.GeoDataFrame(
+        pd.concat(clipped_frames, ignore_index=True),
+        geometry='geometry', crs=CODEBASE_CRS)
+
+    for layer in ['rail', 'bus', 'tram', 'ship', 'funicular']:
+        subset = clipped_rings[clipped_rings['transport_mode'] == layer].drop(
+            columns=['transport_mode'], errors='ignore')
+        if not subset.empty:
+            subset.to_file(gpkg1, layer=layer, driver='GPKG')
+    print(f"    Saved -> {gpkg1}  ({len(clipped_rings):,} features)")
+
+    # --- GPKG 2: by class — single layer, 4 rows, hierarchical, with stats ---
+    gpkg2 = os.path.join(PT_FEEDER_DATA_DIR, 'gueteklassen_by_class.gpkg')
+    if os.path.exists(gpkg2):
+        os.remove(gpkg2)
+
+    # Build exclusive geometries (A intact, each lower class minus better classes)
+    exclusive_union = {}
+    cumulative_mask = None
+    for cls in class_order:
+        geom = raw_union[cls]
+        if geom is not None and not geom.is_empty:
+            if cumulative_mask is not None:
+                geom = geom.difference(cumulative_mask)
+            exclusive_union[cls] = geom if not geom.is_empty else None
+        else:
+            exclusive_union[cls] = None
+        if raw_union[cls] is not None:
+            cumulative_mask = (raw_union[cls] if cumulative_mask is None
+                               else cumulative_mask.union(raw_union[cls]))
+
+    pop_pts  = pop_grid[['geometry', 'NUMMER']].copy()
+    empl_pts = empl_grid[['geometry', 'NUMMER']].copy()
+
+    class_rows = []
+    for i, cls in enumerate(class_order, 1):
+        geom = exclusive_union.get(cls)
+        if geom is None or geom.is_empty:
+            continue
+        cls_poly = gpd.GeoDataFrame([{'geometry': geom}],
+                                    geometry='geometry', crs=CODEBASE_CRS)
+        pop_in  = int(gpd.sjoin(pop_pts,  cls_poly, how='inner',
+                                predicate='within')['NUMMER'].sum())
+        empl_in = int(gpd.sjoin(empl_pts, cls_poly, how='inner',
+                                predicate='within')['NUMMER'].sum())
+        class_rows.append({
+            'fid':           i,
+            'Class':         cls,
+            'Class_Area_m2': round(geom.area, 0),
+            'Pop':           pop_in,
+            'Empl':          empl_in,
+            'geometry':      geom,
+        })
+
+    if class_rows:
+        by_class = gpd.GeoDataFrame(class_rows, geometry='geometry', crs=CODEBASE_CRS)
+        by_class.to_file(gpkg2, layer='gueteklassen', driver='GPKG')
+        print(f"    Saved -> {gpkg2}  ({len(by_class)} classes)")
+    else:
+        print(f"    WARNING: no classified zones — skipping {gpkg2}")
+
+
+def _plot_gueteklassen_comparison(feeder_stops, rail_stops, boundary, pop_grid, empl_grid):
+    """Side-by-side map: our computed Güteklassen vs. official ARE 2026 data.
+    Includes a summary table in the figure with coverage of inhabited area,
+    pop%, and FTE% per class.
+    """
+    print("  Plotting Güteklassen comparison ...")
+
+    are_path = os.path.join(paths.MAIN, _GUETEKLASSEN_ARE_GPKG)
+    if not os.path.exists(are_path):
+        print(f"    WARNING: official ARE data not found at {are_path} — skipping")
+        return
+
+    official = gpd.read_file(are_path, layer='OeV_Gueteklassen_ARE').to_crs(CODEBASE_CRS)
+    official = gpd.clip(official, boundary)
+
+    # Build computed rings from classified stops
+    all_stops = gpd.GeoDataFrame(
+        pd.concat([feeder_stops, rail_stops], ignore_index=True),
+        geometry='geometry', crs=CODEBASE_CRS)
+
+    all_records = []
+    for _, row in all_stops.iterrows():
+        all_records.extend(_kat_to_ring_records(row, boundary_geom=boundary))
+
+    if not all_records:
+        print("    WARNING: no classified stops — skipping comparison plot")
+        return
+
+    rings = gpd.GeoDataFrame(all_records, geometry='geometry', crs=CODEBASE_CRS)
+    # Apply hierarchical dissolving so lower classes don't overlap higher ones
+    computed = _dissolve_hierarchical(rings)
+
+    # --- Inhabited area: union of 100 m cell squares that contain pop or empl ---
+    inhab_cells = pd.concat([
+        pop_grid[pop_grid['NUMMER'] > 0][['E_KOORD', 'N_KOORD']],
+        empl_grid[empl_grid['NUMMER'] > 0][['E_KOORD', 'N_KOORD']],
+    ]).drop_duplicates()
+    inhabited_geom = unary_union([
+        box(e, n, e + CELL_SIZE_M, n + CELL_SIZE_M)
+        for e, n in zip(inhab_cells['E_KOORD'], inhab_cells['N_KOORD'])
+    ])
+    inhabited_area = inhabited_geom.area
+
+    # --- Coverage statistics: % of inhabited area ---
+    def _area_pct(gdf, col):
+        """% of inhabited area covered by each class."""
+        result = {}
+        for gk in ('A', 'B', 'C', 'D'):
+            if (gdf[col] == gk).any():
+                class_geom = unary_union(gdf.loc[gdf[col] == gk, 'geometry'])
+                result[gk] = class_geom.intersection(inhabited_geom).area / inhabited_area * 100
+            else:
+                result[gk] = 0.0
+        # No-class: inhabited area not covered by any class
+        all_covered = unary_union(gdf['geometry'])
+        result['No class'] = (
+            inhabited_geom.difference(all_covered).area / inhabited_area * 100
+        )
+        return result
+
+    comp_pct = _area_pct(computed, 'gk_class')
+    off_pct  = _area_pct(official, 'KLASSE')
+
+    # --- Pop % and FTE % per class ---
+    total_pop  = pop_grid['NUMMER'].sum()
+    total_empl = empl_grid['NUMMER'].sum()
+    pop_pts  = pop_grid[['geometry', 'NUMMER', 'RELI']].copy()
+    empl_pts = empl_grid[['geometry', 'NUMMER', 'RELI']].copy()
+
+    def _pop_empl_pct(gdf, col):
+        """% of total pop and empl in each class (no-class = remainder)."""
+        pop_j  = gpd.sjoin(pop_pts,  gdf[['geometry', col]],
+                           how='left', predicate='within')
+        pop_j  = pop_j[~pop_j.index.duplicated(keep='first')]
+        empl_j = gpd.sjoin(empl_pts, gdf[['geometry', col]],
+                           how='left', predicate='within')
+        empl_j = empl_j[~empl_j.index.duplicated(keep='first')]
+
+        pop_res  = {}
+        empl_res = {}
+        for gk in ('A', 'B', 'C', 'D'):
+            p  = pop_j.loc[pop_j[col]  == gk, 'NUMMER'].sum()
+            e  = empl_j.loc[empl_j[col] == gk, 'NUMMER'].sum()
+            pop_res[gk]  = p  / total_pop  * 100 if total_pop  > 0 else 0.0
+            empl_res[gk] = e  / total_empl * 100 if total_empl > 0 else 0.0
+        # No class = not matched by any class
+        pop_res['No class']  = pop_j[pop_j[col].isna()]['NUMMER'].sum() / total_pop  * 100 \
+            if total_pop  > 0 else 0.0
+        empl_res['No class'] = empl_j[empl_j[col].isna()]['NUMMER'].sum() / total_empl * 100 \
+            if total_empl > 0 else 0.0
+        return pop_res, empl_res
+
+    comp_pop_pct, comp_empl_pct = _pop_empl_pct(computed, 'gk_class')
+    off_pop_pct,  off_empl_pct  = _pop_empl_pct(official, 'KLASSE')
+
+    fig, axes = plt.subplots(1, 2, figsize=(20, 12), sharey=True)
+    fig.subplots_adjust(top=0.93, bottom=0.22)
+    bx0, by0, bx1, by1 = boundary.bounds
+    pad = 500
+    boundary_gdf = gpd.GeoDataFrame(geometry=[boundary], crs=CODEBASE_CRS)
+
+    panel_data = [
+        (axes[0], computed, 'gk_class', 'Computed (infraScanRail)'),
+        (axes[1], official, 'KLASSE',   'Official ARE (2026)'),
+    ]
+    for ax, gdf, col, title in panel_data:
+        boundary_gdf.plot(ax=ax, color='#F5F5F5', edgecolor='none', zorder=0)
+        for gk in ('D', 'C', 'B', 'A'):   # D first → A on top
+            sub = gdf[gdf[col] == gk]
+            if not sub.empty:
+                sub.plot(ax=ax, color=GK_PLOT_COLOURS[gk],
+                         edgecolor='none', alpha=0.80, zorder=1)
+        if os.path.exists(paths.LAKES_SHP):
+            lakes = gpd.read_file(paths.LAKES_SHP).to_crs(CODEBASE_CRS)
+            lakes = lakes[lakes.geometry.intersects(boundary)]
+            if not lakes.empty:
+                gpd.clip(lakes, boundary).plot(
+                    ax=ax, color='#A8D4F0', edgecolor='none', zorder=2)
+        boundary_gdf.boundary.plot(
+            ax=ax, color='black', linewidth=1.8, linestyle='--', zorder=3)
+        ax.set_xlim(bx0 - pad, bx1 + pad)
+        ax.set_ylim(by0 - pad, by1 + pad)
+        ax.set_aspect('equal')
+        ax.set_title(title, fontsize=13)
+        ax.set_xlabel('E [m]')
+        ax.set_ylabel('N [m]')
+
+    legend_handles = [
+        Patch(facecolor=GK_PLOT_COLOURS[gk], edgecolor='none',
+              label=f'Class {gk}')
+        for gk in ('A', 'B', 'C', 'D')
+    ]
+    legend_handles.append(
+        Line2D([0], [0], color='black', linewidth=1.8,
+               linestyle='--', label='Study area boundary'))
+    axes[1].legend(handles=legend_handles, loc='upper right',
+                   fontsize=9, framealpha=0.9)
+
+    # --- Summary table (% of inhabited area + pop% + FTE%) ---
+    col_w = 9
+    hdr = (f"{'':9}"
+           f"{'—— Computed ——':>{3*col_w}}"
+           f"  {'—— Official ——':>{3*col_w}}\n")
+    hdr += (f"{'Class':<9}"
+            f"{'Area%':>{col_w}}{'Pop%':>{col_w}}{'FTE%':>{col_w}}"
+            f"  {'Area%':>{col_w}}{'Pop%':>{col_w}}{'FTE%':>{col_w}}\n")
+    hdr += "─" * (9 + 3*col_w + 2 + 3*col_w) + "\n"
+
+    tbl = f"Coverage (% of inhabited area)\n{hdr}"
+    for gk in ('A', 'B', 'C', 'D', 'No class'):
+        label = f'Class {gk}' if gk != 'No class' else 'No class'
+        tbl += (f"{label:<9}"
+                f"{comp_pct[gk]:>{col_w-1}.1f}%"
+                f"{comp_pop_pct[gk]:>{col_w-1}.1f}%"
+                f"{comp_empl_pct[gk]:>{col_w-1}.1f}%"
+                f"  "
+                f"{off_pct[gk]:>{col_w-1}.1f}%"
+                f"{off_pop_pct[gk]:>{col_w-1}.1f}%"
+                f"{off_empl_pct[gk]:>{col_w-1}.1f}%\n")
+
+    fig.text(0.5, 0.02, tbl, ha='center', fontsize=8.5, fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.85))
+    fig.suptitle('ÖV-Güteklassen: Computed vs. Official ARE (2026)',
+                 fontsize=15, y=0.97)
+
+    out_path = os.path.join(CATCHMENT_PLOT_DIR, 'gueteklassen_comparison.pdf')
+    fig.savefig(out_path, bbox_inches='tight', dpi=150)
+    plt.close(fig)
+    print(f"    Saved -> {out_path}")
+
+
+# ===============================================================================
 # ORCHESTRATORS
 # ===============================================================================
 
@@ -2302,10 +3284,17 @@ def _run_pt_feeder_method(boundary, pop_grid, empl_grid, temporal='all'):
     st = time.time()
 
     # Step 2-PT: Load network data
-    feeder_stops = _load_feeder_stops(boundary, temporal)
-    rail_stations = _load_rail_stations(boundary, temporal)
+    feeder_stops    = _load_feeder_stops(boundary, temporal)
+    rail_stations   = _load_rail_stations(boundary, temporal)
     feeder_segments = _load_feeder_segments(temporal)
-    _build_pt_buffers(feeder_stops, rail_stations)
+
+    # Güteklassen classification → assigns buffer_radius_m per stop
+    feeder_stops, rail_stations = _compute_stop_gueteklassen(
+        feeder_stops, rail_stations, temporal)
+    _build_gueteklassen_gpkgs(feeder_stops, rail_stations, boundary, pop_grid, empl_grid)
+    _plot_gueteklassen_comparison(feeder_stops, rail_stations, boundary, pop_grid, empl_grid)
+
+    _build_pt_buffers(feeder_stops, rail_stations, boundary, pop_grid, empl_grid)
 
     print(f"  [Step 2-PT complete: {time.time() - st:.1f}s]")
     st = time.time()
@@ -2324,38 +3313,45 @@ def _run_pt_feeder_method(boundary, pop_grid, empl_grid, temporal='all'):
     feeder_pop = _compute_feeder_to_rail_times(pop_grid, feeder_stops,
                                                 feeder_stop_to_rail_times)
     alloc_pop = _allocate_cells(walk_pop, cycle_pop, feeder_pop,
-                                pop_grid, rail_stations, PT_FEEDER_DATA_DIR)
+                                pop_grid, rail_stations)
+    _build_candidates_csv(walk_pop, cycle_pop, feeder_pop,
+                          pop_grid, empl_grid, rail_stations, PT_FEEDER_DATA_DIR)
 
-    print(f"  [Pop allocation complete: {time.time() - st:.1f}s]")
+    print(f"  [Pop allocation + candidates complete: {time.time() - st:.1f}s]")
     st = time.time()
 
-    # Step 4: Allocate cells - employment grid
-    print("\n  Allocating employment cells ...")
-    walk_empl  = _compute_walk_to_rail_times(empl_grid, rail_stations)
-    cycle_empl = _compute_cycle_to_rail_times(empl_grid, rail_stations)
-    feeder_empl = _compute_feeder_to_rail_times(empl_grid, feeder_stops,
-                                                 feeder_stop_to_rail_times)
-    alloc_empl = _allocate_cells(walk_empl, cycle_empl, feeder_empl,
-                                  empl_grid, rail_stations, PT_FEEDER_DATA_DIR)
-
-    empl_alloc_path = os.path.join(PT_FEEDER_DATA_DIR, 'employment_allocation.csv')
-    alloc_empl.to_csv(empl_alloc_path, index=False)
-    print(f"  Employment allocation saved -> {empl_alloc_path}")
-
-    print(f"  [Empl allocation complete: {time.time() - st:.1f}s]")
+    # Step 4b: Allocate employment-only cells (RELIs in empl_grid but not in pop_grid).
+    # These cells are absent from alloc_pop; running the same allocation for them
+    # ensures the diff plot can compare all inhabited cells, not just pop cells.
+    pop_relis_set = set(pop_grid['RELI'].values)
+    empl_only_grid = empl_grid[~empl_grid['RELI'].isin(pop_relis_set)].copy()
+    if not empl_only_grid.empty:
+        print(f"\n  Allocating {len(empl_only_grid):,} employment-only cells ...")
+        walk_empl   = _compute_walk_to_rail_times(empl_only_grid, rail_stations)
+        cycle_empl  = _compute_cycle_to_rail_times(empl_only_grid, rail_stations)
+        feeder_empl = _compute_feeder_to_rail_times(empl_only_grid, feeder_stops,
+                                                     feeder_stop_to_rail_times)
+        alloc_empl = _allocate_cells(walk_empl, cycle_empl, feeder_empl,
+                                     empl_only_grid, rail_stations)
+        alloc_combined = pd.concat([alloc_pop, alloc_empl], ignore_index=True)
+        print(f"  [Empl-only allocation complete: {time.time() - st:.1f}s]")
+    else:
+        alloc_combined = alloc_pop.copy()
+        print("  No employment-only cells found — combined allocation equals pop allocation")
     st = time.time()
 
     # Outputs - produced from population allocation (primary)
-    pt_catchment = _build_catchment_gpkg(alloc_pop, pop_grid, PT_FEEDER_DATA_DIR)
-    _build_catchment_tif(alloc_pop, PT_FEEDER_DATA_DIR)
-    _build_access_mode_tif(alloc_pop, PT_FEEDER_DATA_DIR)
-    _build_visualisation(alloc_pop, pop_grid, rail_stations, boundary, 'PT-Feeder')
+    pt_catchment = _build_catchment_gpkg(
+        alloc_pop, pop_grid, empl_grid, rail_stations, PT_FEEDER_DATA_DIR)
+    _build_visualisation(alloc_pop, pop_grid, rail_stations, boundary, 'PT-Feeder',
+                         empl_grid,
+                         walk_df=walk_pop, cycle_df=cycle_pop, feeder_df=feeder_pop)
     _plot_access_times(walk_pop, cycle_pop, feeder_pop, alloc_pop, pop_grid,
-                       rail_stations, feeder_stops, boundary)
+                       rail_stations, feeder_stops, boundary, empl_grid=empl_grid)
 
     print(f"  [Outputs complete: {time.time() - st:.1f}s]")
 
-    return pt_catchment, alloc_pop
+    return pt_catchment, alloc_combined
 
 
 # ===============================================================================
@@ -2507,10 +3503,8 @@ def get_catchment(use_cache: bool, method: str = 'both',
     if use_cache and method == 'both':
         expected_files = [
             os.path.join(CATCHMENT_DATA_DIR, 'municipal_pop_empl_summary.csv'),
-            os.path.join(PT_FEEDER_DATA_DIR, 'catchement.gpkg'),
-            os.path.join(PT_FEEDER_DATA_DIR, 'catchement.tif'),
-            os.path.join(PT_FEEDER_DATA_DIR, 'access_mode.tif'),
-            os.path.join(MUNICIPAL_DATA_DIR, 'catchement.gpkg'),
+            os.path.join(PT_FEEDER_DATA_DIR, 'catchment.gpkg'),
+            os.path.join(MUNICIPAL_DATA_DIR, 'catchment.gpkg'),
             os.path.join(CATCHMENT_PLOT_DIR, 'catchment_diff_municipal_vs_pt_feeder.pdf'),
         ]
         all_exist = all(os.path.exists(f) for f in expected_files)
