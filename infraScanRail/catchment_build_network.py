@@ -109,8 +109,20 @@ AM_PEAK_START  = '06:00:00'
 AM_PEAK_END    = '09:00:00'
 PM_PEAK_START  = '16:00:00'
 PM_PEAK_END    = '19:00:00'
+
+# Off-peak windows — midday and evening (Güteklasse alignment: operational day 06:00–20:00)
+# Used as a list so frequency computation can iterate over multiple windows
+OFFPEAK_WINDOWS = [
+    ('09:00:00', '16:00:00'),  # midday off-peak
+    ('19:00:00', '20:00:00'),  # evening off-peak
+]
+# Legacy single-window constants (kept for backward compatibility with adaptive peak detection)
 OFFPEAK_START  = '09:00:00'
 OFFPEAK_END    = '16:00:00'
+
+# Operational day boundaries (for trip filtering)
+OPERATIONAL_DAY_START = '06:00:00'  # = AM_PEAK_START
+OPERATIONAL_DAY_END   = '20:00:00'  # extended for Güteklasse alignment
 
 # Adaptive peak detection — per (route_id, direction_id) window detection
 HALFDAY_MIDPOINT              = '12:00:00'  # splits operating day into AM / PM halves
@@ -1493,20 +1505,33 @@ def _compute_frequencies(trip_ids, windows=None, min_departures=None):
     if windows is not None:
         am_s, am_e = windows['am_start'], windows['am_end']
         pm_s, pm_e = windows['pm_start'], windows['pm_end']
-        op_s, op_e = windows['op_start'], windows['op_end']
+        # When adaptive windows are provided, use only the midday off-peak from windows
+        # (evening off-peak is always added from OFFPEAK_WINDOWS)
+        op_windows_to_use = [(windows['op_start'], windows['op_end'])]
+        # Add evening off-peak window if it exists and differs from the adaptive window
+        for op_s, op_e in OFFPEAK_WINDOWS:
+            if (op_s, op_e) != (windows['op_start'], windows['op_end']):
+                op_windows_to_use.append((op_s, op_e))
     else:
         am_s, am_e = AM_PEAK_START, AM_PEAK_END
         pm_s, pm_e = PM_PEAK_START, PM_PEAK_END
-        op_s, op_e = OFFPEAK_START, OFFPEAK_END
+        op_windows_to_use = OFFPEAK_WINDOWS
 
-    am_deps    = _get_window_departures(trip_ids, time_col, am_s, am_e)
-    pm_deps    = _get_window_departures(trip_ids, time_col, pm_s, pm_e)
-    op_deps    = _get_window_departures(trip_ids, time_col, op_s, op_e)
+    am_deps = _get_window_departures(trip_ids, time_col, am_s, am_e)
+    pm_deps = _get_window_departures(trip_ids, time_col, pm_s, pm_e)
+
+    # Collect off-peak departures from all off-peak windows
+    op_parts = []
+    for op_s, op_e in op_windows_to_use:
+        op_deps = _get_window_departures(trip_ids, time_col, op_s, op_e)
+        if not op_deps.empty:
+            op_parts.append(op_deps)
+    combined_op_deps = pd.concat(op_parts, ignore_index=True) if op_parts else pd.DataFrame()
 
     return {
         'freq_am_peak_dep_hr':  _median_freq(am_deps,  time_col, min_departures=min_departures),
         'freq_pm_peak_dep_hr':  _median_freq(pm_deps,  time_col, min_departures=min_departures),
-        'freq_offpeak_dep_hr':  _median_freq(op_deps,  time_col, min_departures=min_departures),
+        'freq_offpeak_dep_hr':  _median_freq(combined_op_deps,  time_col, min_departures=min_departures),
     }
 
 
@@ -2231,7 +2256,7 @@ print("\n[4] Preparing stop_times ...")
 
 stop_times['stop_sequence_int'] = pd.to_numeric(stop_times['stop_sequence'], errors='coerce')
 
-# Filter trips to operational window (AM_PEAK_START–PM_PEAK_END, i.e. 06:00–19:00).
+# Filter trips to operational window (OPERATIONAL_DAY_START–OPERATIONAL_DAY_END, i.e. 06:00–20:00).
 # Only trips whose first-stop departure falls within this window are retained.
 # This affects variant classification, frequency computation, and trip-share calculations.
 _time_col = 'departure_time' if 'departure_time' in stop_times.columns else 'arrival_time'
@@ -2242,10 +2267,10 @@ _first_dep = (
     .set_index('trip_id')[_time_col]
 )
 _in_window = _first_dep[
-    (_first_dep >= AM_PEAK_START) & (_first_dep < PM_PEAK_END)
+    (_first_dep >= OPERATIONAL_DAY_START) & (_first_dep < OPERATIONAL_DAY_END)
 ].index
 stop_times = stop_times[stop_times['trip_id'].isin(_in_window)].copy()
-print(f"  Trips in operational window ({AM_PEAK_START}–{PM_PEAK_END}): {len(_in_window):,}")
+print(f"  Trips in operational window ({OPERATIONAL_DAY_START}–{OPERATIONAL_DAY_END}): {len(_in_window):,}")
 
 trips_slim = trips_all[['trip_id', 'route_id', 'direction_id', 'service_id']].copy()
 stop_times_enriched = stop_times.merge(trips_slim, on='trip_id', how='left')
@@ -2710,7 +2735,9 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
 
             for variant_rank, (seq, variant_trip_ids) in enumerate(variants, start=1):
                 # stop_ids are parent-station level — direct lookup in stop_coord
-                if _zvv_geometry_available:
+                # Ships (route_type 1000) always use straight lines — they don't follow
+                # road/rail geometry and ZVV line data doesn't represent actual routes.
+                if _zvv_geometry_available and route_type_int != 1000:
                     geom = _build_linestring_zvv(seq, stop_coord, short_name)
                 else:
                     geom = None
@@ -2736,15 +2763,17 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
 
                 service_period  = _service_period_tag(variant_trip_ids, windows=_variant_windows)
 
-                # Total weekday departures across the full operational window
+                # Total weekday departures across the full operational window (including all off-peak windows)
                 _time_col_td = 'departure_time' if 'departure_time' in stop_times.columns else 'arrival_time'
                 total_dep = (
                     len(_get_window_departures(variant_trip_ids, _time_col_td, AM_PEAK_START, AM_PEAK_END))
-                    + len(_get_window_departures(variant_trip_ids, _time_col_td, OFFPEAK_START, OFFPEAK_END))
                     + len(_get_window_departures(variant_trip_ids, _time_col_td, PM_PEAK_START, PM_PEAK_END))
                 )
+                # Add departures from all off-peak windows
+                for op_s, op_e in OFFPEAK_WINDOWS:
+                    total_dep += len(_get_window_departures(variant_trip_ids, _time_col_td, op_s, op_e))
 
-                # Trip share: weekday trips only (stop_times already filtered to 06:00–19:00)
+                # Trip share: weekday trips only (stop_times already filtered to operational window)
                 all_dir_trip_ids = set(dir_group['trip_id'].unique())
                 weekday_dir_trips = set(
                     trips_all.loc[

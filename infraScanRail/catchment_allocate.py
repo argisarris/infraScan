@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+from matplotlib_scalebar.scalebar import ScaleBar
 from scipy.spatial import cKDTree
 import fiona
 import re
@@ -88,10 +89,8 @@ PT_FEEDER_PLOT_DIR  = os.path.join(CATCHMENT_PLOT_DIR, 'PT_Feeder')
 GUETEKLASSEN_PLOT_DIR = os.path.join(CATCHMENT_PLOT_DIR, 'Gueteklassen')
 
 # ÖV-Güteklassen classification constants (ARE 2022)
-# Operational window for headway calculation.
-# NOTE: ARE standard uses 840 min (06:00–20:00). Our timetable ends at 19:00 (780 min).
-#       Update GK_WINDOW_MIN to 840 when the operational window is extended.
-GK_WINDOW_MIN  = 780
+# Operational window for headway calculation (ARE standard: 06:00–20:00 = 840 min)
+GK_WINDOW_MIN  = 840
 
 # Maximum walk-access buffer radius (m) per Haltestellenkategorie (1=I … 5=V)
 GK_MAX_RADIUS  = {1: 1000, 2: 1000, 3: 750, 4: 500, 5: 300}
@@ -123,6 +122,118 @@ def _ensure_dirs():
               MUNICIPAL_DATA_DIR, PT_FEEDER_DATA_DIR,
               MUNICIPAL_PLOT_DIR, PT_FEEDER_PLOT_DIR]:
         os.makedirs(d, exist_ok=True)
+
+
+# ===============================================================================
+# MAP CARTOGRAPHIC ELEMENTS (North arrow & scale bar)
+# ===============================================================================
+
+def _add_north_arrow(ax, x=0.03, y=0.97, arrow_length=0.047, fontsize=10):
+    """Add a compass-style north arrow to a matplotlib axes.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The axes to add the arrow to.
+    x, y : float
+        Position in axes coordinates (0-1). Default is top-left.
+    arrow_length : float
+        Length of the arrow in axes fraction (reduced by 1/3 from 0.07).
+    fontsize : int
+        Font size for the 'N' label.
+    """
+    from matplotlib.patches import Polygon as MplPolygon
+    from matplotlib.transforms import Bbox, TransformedBbox, BboxTransform
+
+    # Arrow dimensions in axes fraction
+    half_width = arrow_length * 0.35
+    tip_y = y
+    base_y = y - arrow_length
+    label_y = base_y - 0.015
+
+    # Define the two triangular halves of the compass needle
+    # Left half (dark/filled)
+    left_triangle = [(x, tip_y), (x - half_width, base_y), (x, base_y)]
+    # Right half (light/white)
+    right_triangle = [(x, tip_y), (x + half_width, base_y), (x, base_y)]
+
+    # Draw left half (dark grey fill)
+    left_patch = MplPolygon(
+        left_triangle, closed=True,
+        facecolor='#4a4a4a', edgecolor='black', linewidth=0.8,
+        transform=ax.transAxes, zorder=1000
+    )
+    ax.add_patch(left_patch)
+
+    # Draw right half (white fill)
+    right_patch = MplPolygon(
+        right_triangle, closed=True,
+        facecolor='white', edgecolor='black', linewidth=0.8,
+        transform=ax.transAxes, zorder=1000
+    )
+    ax.add_patch(right_patch)
+
+    # Add 'N' label below the arrow
+    ax.text(
+        x, label_y, 'N',
+        transform=ax.transAxes,
+        ha='center', va='top', fontsize=fontsize, fontweight='bold',
+        zorder=1000
+    )
+
+
+def _add_scale_bar(ax):
+    """Add a custom scale bar with two boxes (0–5 km and 5–10 km), always lower right."""
+    from matplotlib.patches import Rectangle
+
+    xlim = ax.get_xlim()
+
+    # Scale bar dimensions in metres — two bins only
+    bins_km = [5, 10]  # cumulative distances
+    bins_m = [b * 1000 for b in bins_km]
+
+    # Always lower right
+    y_offset = 0.04
+    x_offset = 0.75
+
+    # Convert metres to axes fraction
+    data_width = xlim[1] - xlim[0]
+    total_width_frac = bins_m[-1] / data_width
+
+    # Draw boxes
+    box_height_frac = 0.012
+    prev_frac = 0
+    colours = ['black', 'white']  # alternating
+
+    for i, dist_m in enumerate(bins_m):
+        width_frac = (dist_m / data_width) - prev_frac
+        rect = Rectangle(
+            (x_offset + prev_frac, y_offset),
+            width_frac, box_height_frac,
+            facecolor=colours[i], edgecolor='black', linewidth=0.8,
+            transform=ax.transAxes, zorder=999
+        )
+        ax.add_patch(rect)
+        prev_frac = dist_m / data_width
+
+    # Add tick labels below boxes
+    label_y = y_offset - 0.018
+    ax.text(x_offset, label_y, '0', transform=ax.transAxes,
+            ha='center', va='top', fontsize=7, zorder=1000)
+    for dist_m, dist_km in zip(bins_m, bins_km):
+        x_pos = x_offset + dist_m / data_width
+        ax.text(x_pos, label_y, f'{dist_km}', transform=ax.transAxes,
+                ha='center', va='top', fontsize=7, zorder=1000)
+
+    # Add 'km' unit label
+    ax.text(x_offset + total_width_frac / 2, y_offset + box_height_frac + 0.008, 'km',
+            transform=ax.transAxes, ha='center', va='bottom', fontsize=7, zorder=1000)
+
+
+def _add_map_elements(ax):
+    """Add scale bar (lower right, 0–5–10 km) and north arrow (upper left) to an axes."""
+    _add_scale_bar(ax)
+    _add_north_arrow(ax)
 
 
 # ===============================================================================
@@ -403,6 +514,9 @@ def _plot_municipal_distributions(summary_df, boundary):
             ax.set_xlim(bx_min - pad, bx_max + pad)
             ax.set_ylim(by_min - pad, by_max + pad)
 
+            # Add cartographic elements
+            _add_map_elements(ax)
+
             legend_handles = []
             for color, lbl in zip(colors, labels):
                 legend_handles.append(
@@ -553,6 +667,9 @@ def _plot_raster_map(gdf, label, boundary):
         pad = 200
         ax.set_xlim(bx_min - pad, bx_max + pad)
         ax.set_ylim(by_min - pad, by_max + pad)
+
+        # Add cartographic elements
+        _add_map_elements(ax)
 
         ax.set_title(title, fontsize=13)
         ax.set_xlabel('E [m]')
@@ -1141,6 +1258,10 @@ def _plot_municipal_catchments(muni_catchment, pop_grid, empl_grid,
             label='External station assignment'))
     ax.legend(handles=legend_handles, loc='upper right', fontsize=8,
               framealpha=0.9)
+
+    # Add cartographic elements
+    _add_map_elements(ax)
+
     ax.set_title('Municipal Catchment Areas', fontsize=14)
     ax.set_xlabel('E [m]')
     ax.set_ylabel('N [m]')
@@ -1292,6 +1413,10 @@ def _plot_municipal_catchments_network(muni_catchment, rail_stations,
                label='Study area boundary'),
     ]
     ax.legend(handles=legend_handles, loc='upper right', fontsize=8, framealpha=0.9)
+
+    # Add cartographic elements
+    _add_map_elements(ax)
+
     ax.set_title('Municipal Catchment Areas with PT-Feeder Network', fontsize=14)
     ax.set_xlabel('E [m]')
     ax.set_ylabel('N [m]')
@@ -2038,28 +2163,27 @@ def _build_catchment_gpkg(allocation, pop_grid, empl_grid, rail_stations, output
 
 def _build_visualisation(allocation, grid, rail_stations, boundary, method_label,
                          empl_grid=None,
-                         walk_df=None, cycle_df=None, feeder_df=None):
-    """Produce a thesis-quality catchment visualisation map.
+                         walk_df=None, cycle_df=None, feeder_df=None,
+                         catchment_gdf=None):
+    """Produce a thesis-quality catchment visualisation as two side-by-side panels.
 
-    Cells are drawn as 100×100 m squares clipped to the catchment boundary.
-    Lakes and the study area boundary are included.
-    Rail stations are shown as circles with white fill and black outline.
-    A summary table below the map reports pop and FTE by overarching access mode:
-    Walk, PT (bus/tram/ship/funicular), Cycling, and No access.
+    Left panel:  cells coloured by access mode (Walk / Bus / Tram / Cycle / No PT).
+    Right panel: cells coloured by station allocation (graph-coloured catchment fills).
+
+    A 3-column summary table (Modal Access | Hierarchical | Non-Hierarchical) is
+    rendered below the figure.
 
     Saved to plots/Catchment_Area/PT_Feeder/.
     """
     print(f"  Building {method_label} catchment visualisation ...")
 
-    # Build 100×100 m square cells from allocation coordinates
+    # --- Build 100×100 m square cells from allocation coordinates ---
     alloc = allocation.copy()
     alloc['geometry'] = [
         box(e, n, e + CELL_SIZE_M, n + CELL_SIZE_M)
         for e, n in zip(alloc['E_KOORD'], alloc['N_KOORD'])
     ]
     alloc = gpd.GeoDataFrame(alloc, geometry='geometry', crs=CODEBASE_CRS)
-
-    # Clip cells to catchment boundary
     alloc = gpd.clip(alloc, boundary)
 
     mode_colors = {
@@ -2081,134 +2205,221 @@ def _build_visualisation(allocation, grid, rail_stations, boundary, method_label
         'Cycle':     'Cycle to rail',
     }
 
-    fig, ax = plt.subplots(1, 1, figsize=(14, 12))
+    # Graph-colouring palette (shared between both panels)
+    boundary_palette = [
+        '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+        '#8c564b', '#e377c2', '#bcbd22', '#17becf', '#393b79',
+        '#637939', '#8c6d31', '#843c39', '#7b4173', '#5254a3',
+    ]
 
-    # Grey background, white interior
-    ax.set_facecolor('#E8E8E8')
+    # --- Build graph colouring for station catchments (right panel) ---
+    color_map = {}   # id_point (int) -> hex colour
+    clipped_catchment = None
+    if catchment_gdf is not None and not catchment_gdf.empty:
+        clipped_catchment = gpd.clip(catchment_gdf, boundary).reset_index(drop=True)
+        id_col = 'id' if 'id' in clipped_catchment.columns else 'train_station'
+
+        G = nx.Graph()
+        for i in range(len(clipped_catchment)):
+            G.add_node(clipped_catchment.loc[i, id_col])
+        for i in range(len(clipped_catchment)):
+            for j in range(i + 1, len(clipped_catchment)):
+                geom_i = clipped_catchment.loc[i, 'geometry']
+                geom_j = clipped_catchment.loc[j, 'geometry']
+                if geom_i.intersects(geom_j):
+                    inter = geom_i.intersection(geom_j)
+                    if hasattr(inter, 'length') and inter.length > 0:
+                        G.add_edge(clipped_catchment.loc[i, id_col],
+                                   clipped_catchment.loc[j, id_col])
+
+        coloring = nx.coloring.greedy_color(G, strategy='largest_first')
+        n_colors = max(coloring.values()) + 1 if coloring else 1
+        color_map = {sid: boundary_palette[cidx % len(boundary_palette)]
+                     for sid, cidx in coloring.items()}
+        max_deg = max(dict(G.degree()).values()) if G.degree() else 0
+        print(f"    Graph colouring: {n_colors} colours for "
+              f"{len(clipped_catchment)} station catchments (max adjacency {max_deg})")
+
+    # --- Common base layers (loaded once) ---
     boundary_gdf = gpd.GeoDataFrame(geometry=[boundary], crs=CODEBASE_CRS)
-    boundary_gdf.plot(ax=ax, color='white', edgecolor='none', zorder=0)
-
-    # Plot cells per mode
-    legend_elements = []
-    for mode, color in mode_colors.items():
-        subset = alloc[alloc['access_mode'] == mode]
-        if len(subset) > 0:
-            subset.plot(ax=ax, color=color, edgecolor='none', alpha=0.85, zorder=2)
-            legend_elements.append(
-                Patch(facecolor=color, edgecolor='none', label=mode_labels[mode]))
-
-    # Lakes
-    if os.path.exists(paths.LAKES_SHP):
-        lakes = gpd.read_file(paths.LAKES_SHP).to_crs(CODEBASE_CRS)
-        lakes = lakes[lakes.geometry.intersects(boundary)]
-        if not lakes.empty:
-            gpd.clip(lakes, boundary).plot(
-                ax=ax, color='#A8D8EA', edgecolor='none', zorder=3)
-
-    # Catchment boundary
-    boundary_gdf.boundary.plot(ax=ax, color='black', linewidth=1.8,
-                               linestyle='--', zorder=5)
-    legend_elements.append(
-        Line2D([0], [0], color='black', linewidth=1.8, linestyle='--',
-               label='Study area boundary'))
-
-    # Rail stations: white fill, black outline
     prep_bnd_vis = prep(boundary)
     stations_in_bnd = rail_stations[
         rail_stations.geometry.apply(lambda p: prep_bnd_vis.contains(p))]
-    if not stations_in_bnd.empty:
-        ax.scatter(stations_in_bnd.geometry.x, stations_in_bnd.geometry.y,
-                   s=25, c='white', edgecolors='black', linewidths=0.8,
-                   marker='o', zorder=6)
-    legend_elements.append(
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='white',
-               markeredgecolor='black', markersize=8, label='Rail station'))
+
+    lakes_gdf = None
+    if os.path.exists(paths.LAKES_SHP):
+        lakes_raw = gpd.read_file(paths.LAKES_SHP).to_crs(CODEBASE_CRS)
+        lakes_raw = lakes_raw[lakes_raw.geometry.intersects(boundary)]
+        if not lakes_raw.empty:
+            lakes_gdf = gpd.clip(lakes_raw, boundary)
 
     bx_min, by_min, bx_max, by_max = boundary.bounds
     pad = 200
-    ax.set_xlim(bx_min - pad, bx_max + pad)
-    ax.set_ylim(by_min - pad, by_max + pad)
-    ax.set_aspect('equal')
 
-    ax.set_title(f'Catchment Area Allocation - {method_label}', fontsize=14)
-    ax.set_xlabel('E [m]')
-    ax.set_ylabel('N [m]')
+    def _base_setup(ax, ylabel='N [m]'):
+        """Apply grey background, boundary, lakes, stations, limits, map elements."""
+        ax.set_facecolor('#E8E8E8')
+        boundary_gdf.plot(ax=ax, color='white', edgecolor='none', zorder=0)
+        if lakes_gdf is not None and not lakes_gdf.empty:
+            lakes_gdf.plot(ax=ax, color='#A8D8EA', edgecolor='none', zorder=3)
+        boundary_gdf.boundary.plot(ax=ax, color='black', linewidth=1.8,
+                                   linestyle='--', zorder=5)
+        if not stations_in_bnd.empty:
+            ax.scatter(stations_in_bnd.geometry.x, stations_in_bnd.geometry.y,
+                       s=25, c='white', edgecolors='black', linewidths=0.8,
+                       marker='o', zorder=6)
+        ax.set_xlim(bx_min - pad, bx_max + pad)
+        ax.set_ylim(by_min - pad, by_max + pad)
+        ax.set_aspect('equal')
+        ax.set_xlabel('E [m]')
+        ax.set_ylabel(ylabel)
+        _add_map_elements(ax)
 
-    # --- Summary table: pop and FTE by mode group ---
-    # When mode DataFrames are provided, count every cell reachable by that mode
-    # regardless of which mode won (cells may appear in multiple rows).
-    # Fallback: use the winner-takes-all access_mode column.
-    pop_map  = grid.set_index('RELI')['NUMMER'].to_dict()
-    empl_map = empl_grid.set_index('RELI')['NUMMER'].to_dict() if empl_grid is not None else {}
+    # --- Figure: 1×2 panels ---
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(26, 11), sharey=True)
+    fig.suptitle(f'Catchment Area Allocation — {method_label}', fontsize=14)
 
-    alloc['_pop']  = alloc['RELI'].map(pop_map).fillna(0)
-    alloc['_empl'] = alloc['RELI'].map(empl_map).fillna(0)
+    # ---- Left panel: Access mode ----
+    legend_left = []
+    for mode, color in mode_colors.items():
+        subset = alloc[alloc['access_mode'] == mode]
+        if len(subset) > 0:
+            subset.plot(ax=ax1, color=color, edgecolor='none', alpha=0.85, zorder=2)
+            legend_left.append(
+                Patch(facecolor=color, edgecolor='none', label=mode_labels[mode]))
+    _base_setup(ax1, ylabel='N [m]')
+    legend_left.append(
+        Line2D([0], [0], color='black', linewidth=1.8, linestyle='--',
+               label='Study area boundary'))
+    legend_left.append(
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='white',
+               markeredgecolor='black', markersize=8, label='Rail station'))
+    ax1.set_title('Access Mode', fontsize=13)
+    ax1.legend(handles=legend_left, loc='upper center',
+               bbox_to_anchor=(0.5, -0.06), bbox_transform=ax1.transAxes,
+               ncol=3, fontsize=8, framealpha=0.9, borderaxespad=0)
+
+    # ---- Right panel: Station allocation ----
+    legend_right = []
+    if color_map:
+        for sid, color in color_map.items():
+            subset = alloc[alloc['id_point'] == sid]
+            if len(subset) > 0:
+                subset.plot(ax=ax2, color=color, edgecolor='none', alpha=0.85, zorder=2)
+        legend_right.append(
+            Patch(facecolor=boundary_palette[0], edgecolor='none',
+                  label='Station catchment'))
+    no_pt_cells = alloc[alloc['id_point'] == NO_PT_ID]
+    if len(no_pt_cells) > 0:
+        no_pt_cells.plot(ax=ax2, color='#d9d9d9', edgecolor='none', alpha=0.85, zorder=2)
+    legend_right.append(
+        Patch(facecolor='#d9d9d9', edgecolor='none', label='No access'))
+    legend_right.append(
+        Line2D([0], [0], color='black', linewidth=1.8, linestyle='--',
+               label='Study area boundary'))
+    legend_right.append(
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='white',
+               markeredgecolor='black', markersize=8, label='Rail station'))
+    _base_setup(ax2, ylabel='')
+    ax2.set_title('Station Allocation', fontsize=13)
+    ax2.legend(handles=legend_right, loc='upper center',
+               bbox_to_anchor=(0.5, -0.06), bbox_transform=ax2.transAxes,
+               ncol=3, fontsize=8, framealpha=0.9, borderaxespad=0)
+
+    # --- Summary table: Modal Access | Hierarchical | Non-Hierarchical ---
+    pop_map_d  = grid.set_index('RELI')['NUMMER'].to_dict()
+    empl_map_d = empl_grid.set_index('RELI')['NUMMER'].to_dict() if empl_grid is not None else {}
+
+    alloc['_pop']  = alloc['RELI'].map(pop_map_d).fillna(0)
+    alloc['_empl'] = alloc['RELI'].map(empl_map_d).fillna(0)
     total_pop  = alloc['_pop'].sum()
     total_empl = alloc['_empl'].sum()
 
-    use_multi = (walk_df is not None or cycle_df is not None or feeder_df is not None)
+    # No access: same across all three columns (cells no mode can reach at all)
+    no_acc_relis = set(alloc.loc[alloc['id_point'] == NO_PT_ID, 'RELI'].values)
 
-    if use_multi:
-        # Build RELI sets reachable per mode group from raw access DataFrames
-        walk_relis   = set(walk_df['RELI'].values)   if walk_df   is not None else set()
-        feeder_relis = set(feeder_df['RELI'].values) if feeder_df is not None else set()
-        cycle_relis  = set(cycle_df['RELI'].values)  if cycle_df  is not None else set()
-        no_acc_relis = set(alloc.loc[alloc['id_point'] == NO_PT_ID, 'RELI'].values)
+    reli_pop_d  = alloc.set_index('RELI')['_pop'].to_dict()
+    reli_empl_d = alloc.set_index('RELI')['_empl'].to_dict()
 
-        reli_pop  = alloc.set_index('RELI')['_pop'].to_dict()
-        reli_empl = alloc.set_index('RELI')['_empl'].to_dict()
+    def _reli_stats(relis):
+        p  = sum(reli_pop_d.get(r,  0) for r in relis)
+        e  = sum(reli_empl_d.get(r, 0) for r in relis)
+        pp = p / total_pop  * 100 if total_pop  > 0 else 0.0
+        ep = e / total_empl * 100 if total_empl > 0 else 0.0
+        return int(p), pp, int(e), ep
 
-        def _mode_stats(relis):
-            p = sum(reli_pop.get(r, 0)  for r in relis)
-            e = sum(reli_empl.get(r, 0) for r in relis)
-            pp = p / total_pop  * 100 if total_pop  > 0 else 0.0
-            ep = e / total_empl * 100 if total_empl > 0 else 0.0
-            return int(p), pp, int(e), ep
+    # Modal Access: cells counted in ALL reachable modes simultaneously
+    walk_relis   = set(walk_df['RELI'].values)   if walk_df   is not None and len(walk_df)   > 0 else set()
+    feeder_relis = set(feeder_df['RELI'].values) if feeder_df is not None and len(feeder_df) > 0 else set()
+    cycle_relis  = set(cycle_df['RELI'].values)  if cycle_df  is not None and len(cycle_df)  > 0 else set()
+    modal_access_stats = {
+        'Walk':      _reli_stats(walk_relis),
+        'PT Feeder': _reli_stats(feeder_relis),
+        'Cycling':   _reli_stats(cycle_relis),
+        'No access': _reli_stats(no_acc_relis),
+    }
 
-        tbl_rows = [
-            ('Walk',       _mode_stats(walk_relis)),
-            ('PT Feeder',  _mode_stats(feeder_relis)),
-            ('Cycling',    _mode_stats(cycle_relis)),
-            ('No access',  _mode_stats(no_acc_relis)),
-        ]
-        note = "(cells may count in multiple modes)"
+    # Hierarchical: winner-takes-all (Walk/PT primary; Cycle only fills uncovered cells)
+    pt_modes = {'Bus', 'Tram', 'Ship', 'Funicular'}
+
+    def _group_mode(mode):
+        if mode == 'Walk':    return 'Walk'
+        if mode in pt_modes:  return 'PT Feeder'
+        if mode == 'Cycle':   return 'Cycling'
+        return 'No access'
+
+    alloc['_group'] = alloc['access_mode'].apply(_group_mode)
+    hier_stats = {}
+    for grp in ('Walk', 'PT Feeder', 'Cycling', 'No access'):
+        sub = alloc[alloc['_group'] == grp]
+        p  = int(sub['_pop'].sum())
+        e  = int(sub['_empl'].sum())
+        pp = p / total_pop  * 100 if total_pop  > 0 else 0.0
+        ep = e / total_empl * 100 if total_empl > 0 else 0.0
+        hier_stats[grp] = (p, pp, e, ep)
+
+    # Non-Hierarchical: all three modes compete equally on raw travel time
+    nh_frames = [df for df in [walk_df, feeder_df, cycle_df]
+                 if df is not None and len(df) > 0]
+    if nh_frames:
+        nh_combined = pd.concat(nh_frames, ignore_index=True)
+        nh_best = nh_combined.loc[
+            nh_combined.groupby('RELI')['total_time_sec'].idxmin()].copy()
+        nh_best['_group'] = nh_best['access_mode'].apply(_group_mode)
     else:
-        pt_modes = {'Bus', 'Tram', 'Ship', 'Funicular'}
+        nh_best = pd.DataFrame(columns=['RELI', '_group'])
+    nh_reli_sets = {grp: set(nh_best.loc[nh_best['_group'] == grp, 'RELI'].values)
+                    for grp in ('Walk', 'PT Feeder', 'Cycling')}
+    nonhier_stats = {
+        'Walk':      _reli_stats(nh_reli_sets['Walk']),
+        'PT Feeder': _reli_stats(nh_reli_sets['PT Feeder']),
+        'Cycling':   _reli_stats(nh_reli_sets['Cycling']),
+        'No access': _reli_stats(no_acc_relis),
+    }
 
-        def _group_mode(mode):
-            if mode == 'Walk':    return 'Walk'
-            if mode in pt_modes:  return 'PT Feeder'
-            if mode == 'Cycle':   return 'Cycling'
-            return 'No access'
+    # Build 3-column table
+    col_w = 9
+    hdr = f"{'Pop':>{col_w}}{'Pop%':>{col_w}}{'FTE':>{col_w}}{'FTE%':>{col_w}}"
+    tbl  = (f"{'':14}"
+            f"{'── Modal Access ──':>{4*col_w}}  "
+            f"{'── Hierarchical ──':>{4*col_w}}  "
+            f"{'── Non-Hierarchical ──':>{4*col_w}}\n")
+    tbl += f"{'Mode':<14}{hdr}  {hdr}  {hdr}\n"
+    tbl += "─" * (14 + 3 * (4*col_w) + 4) + "\n"
 
-        alloc['_group'] = alloc['access_mode'].apply(_group_mode)
-        tbl_rows = []
-        for grp in ('Walk', 'PT Feeder', 'Cycling', 'No access'):
-            sub = alloc[alloc['_group'] == grp]
-            p  = int(sub['_pop'].sum())
-            e  = int(sub['_empl'].sum())
-            pp = p / total_pop  * 100 if total_pop  > 0 else 0.0
-            ep = e / total_empl * 100 if total_empl > 0 else 0.0
-            tbl_rows.append((grp, (p, pp, e, ep)))
-        note = ""
+    def _fmt(p, pp, e, ep):
+        return f"{p:>{col_w},}{pp:>{col_w-1}.1f}%{e:>{col_w},}{ep:>{col_w-1}.1f}%"
 
-    col_w = 10
-    tbl  = f"{'Mode group':<14}{'Pop':>{col_w}}{'Pop%':>{col_w}}{'FTE':>{col_w}}{'FTE%':>{col_w}}\n"
-    tbl += "─" * (14 + 4 * col_w) + "\n"
-    for grp, (p, pp, e, ep) in tbl_rows:
-        tbl += f"{grp:<14}{p:>{col_w},}{pp:>{col_w-1}.1f}%{e:>{col_w},}{ep:>{col_w-1}.1f}%\n"
-    if note:
-        tbl += note
+    for grp in ('Walk', 'PT Feeder', 'Cycling', 'No access'):
+        tbl += f"{grp:<14}{_fmt(*modal_access_stats[grp])}  {_fmt(*hier_stats[grp])}  {_fmt(*nonhier_stats[grp])}\n"
+    tbl += "─" * (14 + 3 * (4*col_w) + 4) + "\n"
+    tbl += ("Modal Access: all reachable modes counted per cell  |  "
+            "Hierarchical: walk/PT primary + cycle fallback  |  "
+            "Non-Hierarchical: fastest mode wins (cycle competes equally)")
 
-    # Legend and summary stacked vertically, centered below the plot
-    fig.subplots_adjust(bottom=0.28)
-    ax.legend(handles=legend_elements, loc='upper center',
-              bbox_to_anchor=(0.5, -0.08),
-              bbox_transform=ax.transAxes,
-              ncol=3, fontsize=8, framealpha=0.9,
-              borderaxespad=0)
-    fig.text(0.5, 0.18, tbl, ha='center', va='top',
-             fontsize=8.5, fontfamily='monospace',
+    fig.subplots_adjust(top=0.93, bottom=0.24, wspace=0.08)
+    fig.text(0.5, 0.02, tbl, ha='center', va='bottom',
+             fontsize=7.5, fontfamily='monospace',
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.85))
 
     out_path = os.path.join(PT_FEEDER_PLOT_DIR,
@@ -2460,6 +2671,9 @@ def _build_diff_plot(muni_catchment, pt_catchment, pt_allocation,
     ax.set_ylabel('N [m]')
     ax.set_aspect('equal')
 
+    # Add cartographic elements
+    _add_map_elements(ax)
+
     # --- Summary table ---
     col_w = 9
     tbl  = "Population & employment shift: Municipal → PT-Feeder\n"
@@ -2522,6 +2736,12 @@ def _plot_access_times(walk_df, cycle_df, feeder_df, alloc_pop, pop_grid,
     cmap    = plt.get_cmap('plasma_r', n_bins)
     colours = [cmap(k / (n_bins - 1)) for k in range(n_bins)]
 
+    # Load lakes once for all access-time plots
+    lakes = None
+    if os.path.exists(paths.LAKES_SHP):
+        lakes = gpd.read_file(paths.LAKES_SHP).to_crs(CODEBASE_CRS)
+        lakes = lakes[lakes.geometry.intersects(boundary)].copy()
+
     # Pre-build square polygon geometry for the grid (100 m × 100 m)
     _e = pop_grid['E_KOORD'].values
     _n = pop_grid['N_KOORD'].values
@@ -2573,6 +2793,10 @@ def _plot_access_times(walk_df, cycle_df, feeder_df, alloc_pop, pop_grid,
             if mask.any():
                 gdf[mask].plot(ax=ax, color=colour, edgecolor='none', linewidth=0)
 
+        # Lakes — above coloured cells, below boundary
+        if lakes is not None and not lakes.empty:
+            gpd.clip(lakes, boundary).plot(ax=ax, color='#A8D8EA', edgecolor='none', zorder=3)
+
         # Boundary
         boundary_gdf = gpd.GeoDataFrame(geometry=[boundary], crs=CODEBASE_CRS)
         boundary_gdf.boundary.plot(ax=ax, color='black', linewidth=1.8,
@@ -2592,6 +2816,8 @@ def _plot_access_times(walk_df, cycle_df, feeder_df, alloc_pop, pop_grid,
         ]
         legend_handles.append(Patch(facecolor=_ACCESS_GREY, edgecolor='none',
                                     label='Outside buffer'))
+        if lakes is not None and not lakes.empty:
+            legend_handles.append(Patch(facecolor='#A8D8EA', edgecolor='none', label='Lake'))
         legend_handles.append(Line2D([0], [0], color='black', linewidth=1.8,
                                      linestyle='--', label='Catchment area boundary'))
 
@@ -2599,6 +2825,9 @@ def _plot_access_times(walk_df, cycle_df, feeder_df, alloc_pop, pop_grid,
         ax.set_xlabel('E [m]')
         ax.set_ylabel('N [m]')
         ax.set_aspect('equal')
+
+        # Add cartographic elements
+        _add_map_elements(ax)
 
         # --- Summary table: pop and FTE by access-time bin ---
         # Percentages are relative to total grid (in-buffer + outside buffer)
@@ -3093,9 +3322,10 @@ def _build_gueteklassen_gpkgs(feeder_stops, rail_stops, boundary, pop_grid, empl
 
 
 def _plot_gueteklassen_comparison(feeder_stops, rail_stops, boundary, pop_grid, empl_grid):
-    """Side-by-side map: our computed Güteklassen vs. official ARE 2026 data.
+    """Side-by-side map: our computed Güteklassen vs. official ARE 2026 data,
+    plus a diff panel showing improvement/worsening per cell.
     Includes a summary table in the figure with coverage of inhabited area,
-    pop%, and FTE% per class.
+    pop%, and FTE% per class, plus diff statistics.
     """
     print("  Plotting Güteklassen comparison ...")
 
@@ -3126,9 +3356,9 @@ def _plot_gueteklassen_comparison(feeder_stops, rail_stops, boundary, pop_grid, 
 
     # --- Inhabited area: union of 100 m cell squares that contain pop or empl ---
     inhab_cells = pd.concat([
-        pop_grid[pop_grid['NUMMER'] > 0][['E_KOORD', 'N_KOORD']],
-        empl_grid[empl_grid['NUMMER'] > 0][['E_KOORD', 'N_KOORD']],
-    ]).drop_duplicates()
+        pop_grid[pop_grid['NUMMER'] > 0][['E_KOORD', 'N_KOORD', 'RELI']],
+        empl_grid[empl_grid['NUMMER'] > 0][['E_KOORD', 'N_KOORD', 'RELI']],
+    ]).drop_duplicates(subset='RELI')
     inhabited_geom = unary_union([
         box(e, n, e + CELL_SIZE_M, n + CELL_SIZE_M)
         for e, n in zip(inhab_cells['E_KOORD'], inhab_cells['N_KOORD'])
@@ -3187,12 +3417,111 @@ def _plot_gueteklassen_comparison(feeder_stops, rail_stops, boundary, pop_grid, 
     comp_pop_pct, comp_empl_pct = _pop_empl_pct(computed, 'gk_class')
     off_pop_pct,  off_empl_pct  = _pop_empl_pct(official, 'KLASSE')
 
-    fig, axes = plt.subplots(1, 2, figsize=(20, 12), sharey=True)
-    fig.subplots_adjust(top=0.93, bottom=0.22)
+    # --- Build diff cells for third panel ---
+    # Class hierarchy: A > B > C > D > None (A is best = 0, None = 4)
+    class_rank = {'A': 0, 'B': 1, 'C': 2, 'D': 3, None: 4}
+
+    # Build cell geometries for inhabited cells
+    cell_geoms = [
+        box(e, n, e + CELL_SIZE_M, n + CELL_SIZE_M)
+        for e, n in zip(inhab_cells['E_KOORD'], inhab_cells['N_KOORD'])
+    ]
+    cells_gdf = gpd.GeoDataFrame(
+        inhab_cells[['RELI', 'E_KOORD', 'N_KOORD']].copy(),
+        geometry=cell_geoms, crs=CODEBASE_CRS
+    )
+
+    # Area-based majority classification: assign each cell to the class covering
+    # the majority of its area (eliminates false "neither" for boundary cells)
+    def _classify_by_area_majority(cells, class_gdf, class_col):
+        """For each cell, compute intersection area with each class polygon
+        and return the class that covers the majority of the cell's area."""
+        results = [None] * len(cells)
+        class_rank = {'A': 0, 'B': 1, 'C': 2, 'D': 3}  # lower rank = better class
+
+        for idx, cell_row in enumerate(cells.itertuples()):
+            cell_geom = cell_row.geometry
+            cell_area = cell_geom.area
+            best_class = None
+            best_area = 0.0
+
+            # Find all intersecting class polygons
+            candidates = class_gdf[class_gdf.geometry.intersects(cell_geom)]
+            for _, poly_row in candidates.iterrows():
+                try:
+                    inter_area = cell_geom.intersection(poly_row.geometry).area
+                except Exception:
+                    inter_area = 0.0
+                gk = poly_row[class_col]
+                # If this class covers more area, or equal area but better rank, use it
+                if inter_area > best_area or (
+                    inter_area == best_area and
+                    class_rank.get(gk, 99) < class_rank.get(best_class, 99)
+                ):
+                    best_area = inter_area
+                    best_class = gk
+
+            # Only assign if at least some area is covered
+            if best_area > 0:
+                results[idx] = best_class
+        return results
+
+    cells_gdf['comp_class'] = _classify_by_area_majority(
+        cells_gdf, computed[['geometry', 'gk_class']], 'gk_class')
+    cells_gdf['off_class'] = _classify_by_area_majority(
+        cells_gdf, official[['geometry', 'KLASSE']], 'KLASSE')
+
+    # Classify diff: improved (green), worsened (red), same (light grey), neither (dark grey)
+    def _classify_diff(comp, off):
+        comp_rank = class_rank.get(comp, 4)
+        off_rank  = class_rank.get(off, 4)
+        if comp_rank == 4 and off_rank == 4:
+            return 'neither'
+        elif comp_rank < off_rank:
+            return 'improved'
+        elif comp_rank > off_rank:
+            return 'worsened'
+        else:
+            return 'same'
+
+    cells_gdf['diff_class'] = [
+        _classify_diff(c, o)
+        for c, o in zip(cells_gdf['comp_class'], cells_gdf['off_class'])
+    ]
+
+    # Diff colour scheme
+    diff_colours = {
+        'improved':  '#2ca02c',  # green
+        'worsened':  '#d62728',  # red
+        'same':      '#d9d9d9',  # light grey
+        'neither':   '#808080',  # dark grey
+    }
+
+    # Compute diff statistics (pop and FTE)
+    pop_map  = pop_grid.set_index('RELI')['NUMMER'].to_dict()
+    empl_map = empl_grid.set_index('RELI')['NUMMER'].to_dict()
+    cells_gdf['_pop']  = cells_gdf['RELI'].map(pop_map).fillna(0)
+    cells_gdf['_empl'] = cells_gdf['RELI'].map(empl_map).fillna(0)
+    total_diff_pop  = cells_gdf['_pop'].sum()
+    total_diff_empl = cells_gdf['_empl'].sum()
+
+    diff_stats = {}
+    for dc in ('improved', 'worsened', 'same', 'neither'):
+        sub = cells_gdf[cells_gdf['diff_class'] == dc]
+        p  = int(sub['_pop'].sum())
+        e  = int(sub['_empl'].sum())
+        pp = p / total_diff_pop  * 100 if total_diff_pop  > 0 else 0.0
+        ep = e / total_diff_empl * 100 if total_diff_empl > 0 else 0.0
+        diff_stats[dc] = (p, pp, e, ep)
+
+    # --- Create 3-panel figure ---
+    fig, axes = plt.subplots(1, 3, figsize=(28, 12), sharey=True)
+    fig.subplots_adjust(top=0.93, bottom=0.24, wspace=0.08)
     bx0, by0, bx1, by1 = boundary.bounds
     pad = 500
     boundary_gdf = gpd.GeoDataFrame(geometry=[boundary], crs=CODEBASE_CRS)
 
+    # Panel 1 & 2: Computed and Official
     panel_data = [
         (axes[0], computed, 'gk_class', 'Computed (infraScanRail)'),
         (axes[1], official, 'KLASSE',   'Official ARE (2026)'),
@@ -3218,23 +3547,65 @@ def _plot_gueteklassen_comparison(feeder_stops, rail_stops, boundary, pop_grid, 
         ax.set_title(title, fontsize=13)
         ax.set_xlabel('E [m]')
         ax.set_ylabel('N [m]')
+        # Add cartographic elements
+        _add_map_elements(ax)
 
-    legend_handles = [
+    # Panel 3: Diff (improvement / worsening)
+    ax3 = axes[2]
+    boundary_gdf.plot(ax=ax3, color='#F5F5F5', edgecolor='none', zorder=0)
+
+    # Plot diff cells by category
+    for dc, colour in diff_colours.items():
+        sub = cells_gdf[cells_gdf['diff_class'] == dc]
+        if not sub.empty:
+            sub.plot(ax=ax3, color=colour, edgecolor='none', alpha=0.85, zorder=1)
+
+    if os.path.exists(paths.LAKES_SHP):
+        lakes = gpd.read_file(paths.LAKES_SHP).to_crs(CODEBASE_CRS)
+        lakes = lakes[lakes.geometry.intersects(boundary)]
+        if not lakes.empty:
+            gpd.clip(lakes, boundary).plot(
+                ax=ax3, color='#A8D4F0', edgecolor='none', zorder=2)
+    boundary_gdf.boundary.plot(
+        ax=ax3, color='black', linewidth=1.8, linestyle='--', zorder=3)
+    ax3.set_xlim(bx0 - pad, bx1 + pad)
+    ax3.set_ylim(by0 - pad, by1 + pad)
+    ax3.set_aspect('equal')
+    ax3.set_title('Difference (Computed vs. Official)', fontsize=13)
+    ax3.set_xlabel('E [m]')
+
+    # Add cartographic elements to panel 3
+    _add_map_elements(ax3)
+
+    # Legend for panels 1 & 2
+    legend_handles_gk = [
         Patch(facecolor=GK_PLOT_COLOURS[gk], edgecolor='none',
               label=f'Class {gk}')
         for gk in ('A', 'B', 'C', 'D')
     ]
-    legend_handles.append(
+    legend_handles_gk.append(
         Line2D([0], [0], color='black', linewidth=1.8,
                linestyle='--', label='Study area boundary'))
-    axes[1].legend(handles=legend_handles, loc='upper right',
-                   fontsize=9, framealpha=0.9)
+    axes[1].legend(handles=legend_handles_gk, loc='upper right',
+                   fontsize=8, framealpha=0.9)
 
-    # --- Summary table (% of inhabited area + pop% + FTE%) ---
-    col_w = 9
+    # Legend for panel 3 (diff)
+    legend_handles_diff = [
+        Patch(facecolor=diff_colours['improved'], edgecolor='none', label='Improved'),
+        Patch(facecolor=diff_colours['worsened'], edgecolor='none', label='Worsened'),
+        Patch(facecolor=diff_colours['same'], edgecolor='none', label='Same class'),
+        Patch(facecolor=diff_colours['neither'], edgecolor='none', label='Neither classified'),
+        Line2D([0], [0], color='black', linewidth=1.8,
+               linestyle='--', label='Study area boundary'),
+    ]
+    ax3.legend(handles=legend_handles_diff, loc='upper right',
+               fontsize=8, framealpha=0.9)
+
+    # --- Summary table (% of inhabited area + pop% + FTE% + diff stats) ---
+    col_w = 8
     hdr = (f"{'':9}"
-           f"{'—— Computed ——':>{3*col_w}}"
-           f"  {'—— Official ——':>{3*col_w}}\n")
+           f"{'— Computed —':>{3*col_w}}"
+           f"  {'— Official —':>{3*col_w}}\n")
     hdr += (f"{'Class':<9}"
             f"{'Area%':>{col_w}}{'Pop%':>{col_w}}{'FTE%':>{col_w}}"
             f"  {'Area%':>{col_w}}{'Pop%':>{col_w}}{'FTE%':>{col_w}}\n")
@@ -3252,7 +3623,16 @@ def _plot_gueteklassen_comparison(feeder_stops, rail_stops, boundary, pop_grid, 
                 f"{off_pop_pct[gk]:>{col_w-1}.1f}%"
                 f"{off_empl_pct[gk]:>{col_w-1}.1f}%\n")
 
-    fig.text(0.5, 0.02, tbl, ha='center', fontsize=8.5, fontfamily='monospace',
+    # Add diff statistics
+    tbl += "\n"
+    tbl += f"{'Diff':9}{'Pop':>{col_w}}{'Pop%':>{col_w}}{'FTE':>{col_w}}{'FTE%':>{col_w}}\n"
+    tbl += "─" * (9 + 4*col_w) + "\n"
+    for dc, label in [('improved', 'Improved'), ('worsened', 'Worsened'),
+                      ('same', 'Same'), ('neither', 'Neither')]:
+        p, pp, e, ep = diff_stats[dc]
+        tbl += f"{label:<9}{p:>{col_w},}{pp:>{col_w-1}.1f}%{e:>{col_w},}{ep:>{col_w-1}.1f}%\n"
+
+    fig.text(0.5, 0.02, tbl, ha='center', fontsize=7.5, fontfamily='monospace',
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.85))
     fig.suptitle('ÖV-Güteklassen: Computed vs. Official ARE (2026)',
                  fontsize=15, y=0.97)
@@ -3345,7 +3725,8 @@ def _run_pt_feeder_method(boundary, pop_grid, empl_grid, temporal='all'):
         alloc_pop, pop_grid, empl_grid, rail_stations, PT_FEEDER_DATA_DIR)
     _build_visualisation(alloc_pop, pop_grid, rail_stations, boundary, 'PT-Feeder',
                          empl_grid,
-                         walk_df=walk_pop, cycle_df=cycle_pop, feeder_df=feeder_pop)
+                         walk_df=walk_pop, cycle_df=cycle_pop, feeder_df=feeder_pop,
+                         catchment_gdf=pt_catchment)
     _plot_access_times(walk_pop, cycle_pop, feeder_pop, alloc_pop, pop_grid,
                        rail_stations, feeder_stops, boundary, empl_grid=empl_grid)
 

@@ -45,6 +45,15 @@ RAIL_ROUTE_TYPES = {
 }
 
 # ---------------------------------------------------------------------------
+# Route-type overrides — reclassify specific routes for testing
+# Key: route_short_name (str), Value: new route_type (int)
+# Set to empty dict {} to disable all overrides
+# ---------------------------------------------------------------------------
+ROUTE_TYPE_OVERRIDES = {
+    '18': 109,   # Uncomment to treat Tram line 18 as S-Bahn (109)
+}
+
+# ---------------------------------------------------------------------------
 # Retention policies — how each route type's trips are clipped spatially
 #   'full'      : keep all stops of any trip touching the canton (106, 109)
 #   'border+1'  : envelope around canton stops + 1 stop padding each side (102, 103)
@@ -741,6 +750,18 @@ _tier1_stats = {
 
 print("\n[4] Route-type filtering ...")
 routes_raw['route_type_int'] = pd.to_numeric(routes_raw['route_type'], errors='coerce')
+
+# Apply route-type overrides if configured
+if ROUTE_TYPE_OVERRIDES:
+    for idx, row in routes_raw.iterrows():
+        short_name = str(row.get('route_short_name', '')).strip()
+        if short_name in ROUTE_TYPE_OVERRIDES:
+            original_type = int(row['route_type_int']) if pd.notna(row['route_type_int']) else None
+            new_type = ROUTE_TYPE_OVERRIDES[short_name]
+            routes_raw.at[idx, 'route_type_int'] = new_type
+            routes_raw.at[idx, 'route_type'] = str(new_type)
+            print(f"    Override: route '{short_name}' reclassified from {original_type} to {new_type}")
+
 routes = routes_raw[routes_raw['route_type_int'].isin(ALL_RETAINED_ROUTE_TYPES)].copy()
 
 # Tag each route with its mode class — carried through for Task 2, not written to GTFS
