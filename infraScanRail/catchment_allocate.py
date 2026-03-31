@@ -2417,7 +2417,7 @@ def _build_visualisation(allocation, grid, rail_stations, boundary, method_label
             "Hierarchical: walk/PT primary + cycle fallback  |  "
             "Non-Hierarchical: fastest mode wins (cycle competes equally)")
 
-    fig.subplots_adjust(top=0.93, bottom=0.24, wspace=0.08)
+    fig.subplots_adjust(top=0.93, bottom=0.24, wspace=0.02)
     fig.text(0.5, 0.02, tbl, ha='center', va='bottom',
              fontsize=7.5, fontfamily='monospace',
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.85))
@@ -3445,8 +3445,9 @@ def _plot_gueteklassen_comparison(feeder_stops, rail_stops, boundary, pop_grid, 
             best_class = None
             best_area = 0.0
 
-            # Find all intersecting class polygons
-            candidates = class_gdf[class_gdf.geometry.intersects(cell_geom)]
+            # Find all intersecting class polygons via spatial index
+            candidates = class_gdf.iloc[
+                list(class_gdf.sindex.query(cell_geom, predicate='intersects'))]
             for _, poly_row in candidates.iterrows():
                 try:
                     inter_area = cell_geom.intersection(poly_row.geometry).area

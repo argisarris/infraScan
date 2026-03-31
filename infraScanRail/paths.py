@@ -19,6 +19,25 @@ OD_STATIONS_KT_ZH_PATH = r'data/traffic_flow/od/rail/ktzh/od_matrix_stations_ktz
 COMMUNE_TO_STATION_PATH = r"data\Network\processed\Communes_to_railway_stations_ZH.xlsx"
 GRAPH_POS_PATH = r"data\Network\processed\graph_data.pkl"
 
+# --- BAV Geopackages (Official Swiss Railway Infrastructure) ---
+BAV_RAIL_NODES_GPKG = r"data/Spatial_Data/Railway_Infrastructure/Rail_Nodes.gpkg"
+BAV_RAIL_SEGMENTS_GPKG = r"data/Spatial_Data/Railway_Infrastructure/Rail_Edges_Segments.gpkg"
+BAV_RAIL_ROUTES_GPKG = r"data/Spatial_Data/Railway_Infrastructure/Rail_Edges_Routes.gpkg"
+HALTESTELLEN_OEV_GPKG = r"data/Spatial_Data/Railway_Infrastructure/HaltestellenOeV.gpkg"
+
+# --- TLMRegio Railway (Supplementary data for tunnels/bridges) ---
+TLMREGIO_RAILWAY_SHP = r"data/Spatial_Data/Land_Use/Transportation/swissTLMRegio_Railway.shp"
+
+# --- Network Infrastructure ---
+NETWORK_INFRASTRUCTURE_DIR  = r"data/Infrastructure"
+NETWORK_INFRASTRUCTURE_BASE = r"data/Infrastructure/Base"
+NETWORK_INFRASTRUCTURE_CLEANED_NODES               = r"data/Infrastructure/Base/nodes.gpkg"
+NETWORK_INFRASTRUCTURE_CLEANED_SEGMENTS            = r"data/Infrastructure/Base/segments.gpkg"
+NETWORK_INFRASTRUCTURE_CLEANED_SEGMENTS_COMPOSITION = r"data/Infrastructure/Base/segments_composition.gpkg"
+
+# --- Infrastructure Plots ---
+INFRASTRUCTURE_PLOTS_DIR = r"plots/infrastructure"
+
 POPULATION_RASTER = r"data\independent_variable\processed\replacement.pop20_ArcGisExport.tif"
 EMPLOYMENT_RASTER = r"data\independent_variable\processed\replacement.empl20_ArcGisExport.tif"
 POPULATION_SCENARIO_CANTON_ZH_2050 = r"data\Scenario\KTZH_00000705_00001741.csv"
