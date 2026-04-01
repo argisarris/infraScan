@@ -100,118 +100,28 @@ _TIMETABLE_YEAR_TAG = 'FP2026'
 
 
 # ===========================================================================
-# Pipeline Configuration TUI
+# Pipeline Configuration TUI — GTFS folders only
 # ===========================================================================
 
-def _load_boundary_names(gpkg_path, objektart_filter=None):
-    """Load a boundary GeoPackage and return sorted list of unique 'name' values.
+def _configure_gtfs_folders():
+    """Prompt the user for GTFS input and output folder names.
 
-    Parameters
-    ----------
-    gpkg_path : str
-        Path to the GeoPackage file.
-    objektart_filter : str or None
-        If given, only rows where ``objektart == objektart_filter`` are kept.
-        Needed for the municipalities file which also contains 'Kantonsgebiet'
-        and 'Kommunanz' rows.
-
-    Returns
-    -------
-    list[str]
-        Sorted unique names.
-    """
-    layers = gpd.list_layers(gpkg_path)
-    gdf = gpd.read_file(gpkg_path, layer=layers.iloc[0]['name'])
-    if objektart_filter is not None and 'objektart' in gdf.columns:
-        gdf = gdf[gdf['objektart'] == objektart_filter]
-    return sorted(gdf['name'].dropna().unique().tolist())
-
-
-def _select_names_interactive(available_names, entity_label):
-    """Let the user pick one or more names from *available_names* via partial
-    name search.
-
-    The user types comma-separated search terms.  Each term is matched
-    case-insensitively against *available_names*.  Exact matches are accepted
-    directly; partial matches are listed for the user to refine.
-
-    Returns
-    -------
-    list[str]
-        The selected names (may be empty if the user types nothing).
-    """
-    print(f"\n   Available {entity_label} ({len(available_names)} total).")
-    print(f"   Type comma-separated names (or partial names) to search & select.")
-    print(f"   Leave empty to skip.\n")
-
-    selected = []
-    while True:
-        raw = input(f"   Search / select {entity_label}: ").strip()
-        if not raw:
-            break
-
-        terms = [t.strip() for t in raw.split(',') if t.strip()]
-        batch = []
-        for term in terms:
-            # Exact match (case-insensitive)
-            exact = [n for n in available_names if n.lower() == term.lower()]
-            if exact:
-                batch.extend(exact)
-                continue
-
-            # Partial match
-            partial = [n for n in available_names if term.lower() in n.lower()]
-            if len(partial) == 0:
-                print(f"     No match for '{term}'.")
-            elif len(partial) == 1:
-                batch.append(partial[0])
-                print(f"     Matched: {partial[0]}")
-            else:
-                print(f"     Multiple matches for '{term}':")
-                for i, name in enumerate(partial, 1):
-                    print(f"       {i}) {name}")
-                pick = input(f"     Enter numbers (comma-separated) or 'all': ").strip()
-                if pick.lower() == 'all':
-                    batch.extend(partial)
-                else:
-                    for p in pick.split(','):
-                        p = p.strip()
-                        if p.isdigit() and 1 <= int(p) <= len(partial):
-                            batch.append(partial[int(p) - 1])
-
-        # Deduplicate while preserving order
-        for name in batch:
-            if name not in selected:
-                selected.append(name)
-
-        if selected:
-            print(f"     Currently selected: {selected}")
-            more = input(f"   Add more {entity_label}? (y/n) [n]: ").strip().lower()
-            if more != 'y':
-                break
-
-    return selected
-
-
-def _configure_pipeline():
-    """Prompt the user for spatial filtering configuration.
+    The catchment area boundary is read from the GeoPackage exported by
+    initialisation.py. Run initialisation.py first if that file does not exist.
 
     Returns a dict with keys:
-        gtfs_input_folder  : str   – subfolder name under GTFS_TRANSIT_DIR
-        gtfs_output_folder : str   – subfolder name under GTFS_TRANSIT_DIR
-        admin_level        : str   – 'national' | 'cantonal' | 'bezirke' | 'municipal'
-        primary_names      : list  – selected entity names at the primary admin level
-        subdivision_names  : dict  – {'bezirke': [...], 'municipal': [...]}
-        buffer_m           : float – buffer distance in metres around dissolved boundary
+        gtfs_input_folder  : str – subfolder name under GTFS_TRANSIT_DIR
+        gtfs_output_folder : str – subfolder name under GTFS_TRANSIT_DIR
     """
     print("=" * 70)
-    print("catchment_filter_gtfs.py — PIPELINE CONFIGURATION")
+    print("catchment_filter_gtfs.py — Pipeline configuration")
     print("=" * 70)
+    print(f"\n   Catchment boundary : {paths.CATCHMENT_AREA_BUFFER_GPKG}")
+    print("   Run initialisation.py first if that file does not exist.\n")
 
-    # --- A. GTFS Input Folder ------------------------------------------------
-    print("\nA. GTFS INPUT FOLDER")
+    # --- A. GTFS input folder ------------------------------------------------
+    print("A. GTFS input folder")
     print(f"   Base path: {paths.GTFS_TRANSIT_DIR}")
-    # List available subfolders
     gtfs_base = os.path.join(paths.MAIN, paths.GTFS_TRANSIT_DIR)
     if os.path.isdir(gtfs_base):
         subfolders = sorted([
@@ -232,274 +142,41 @@ def _configure_pipeline():
         full_input = os.path.join(gtfs_base, gtfs_input)
         if os.path.isdir(full_input):
             break
-        # Allow numeric selection from the listed subfolders
         if gtfs_input.isdigit() and 1 <= int(gtfs_input) <= len(subfolders):
             gtfs_input = subfolders[int(gtfs_input) - 1]
             break
         print(f"   Folder not found: {full_input}")
         print(f"   Please enter an existing subfolder name.")
 
-    # --- B. Administrative Level ---------------------------------------------
-    print("\nB. ADMINISTRATIVE LEVEL — Primary Spatial Boundary")
-    print("   1) National    — All of Switzerland")
-    print("   2) Cantonal    — Choose one or more cantons")
-    print("   3) Bezirke     — Choose one or more districts (Bezirke)")
-    print("   4) Municipal   — Choose one or more municipalities (Gemeinden)")
-
-    while True:
-        level_choice = input("\n   Select administrative level (1-4) [2]: ").strip() or "2"
-        if level_choice in ['1', '2', '3', '4']:
-            break
-        print("   Invalid selection. Please enter 1, 2, 3, or 4.")
-
-    level_map = {'1': 'national', '2': 'cantonal', '3': 'bezirke', '4': 'municipal'}
-    admin_level = level_map[level_choice]
-
-    # --- B2. Select entities at the chosen level -----------------------------
-    primary_names = []
-    area_label = ''  # for output folder suggestion
-
-    if admin_level == 'national':
-        area_label = 'CH'
-        print("   → National boundary selected (all cantons).")
-
-    elif admin_level == 'cantonal':
-        print("\n   Loading canton names ...")
-        canton_names = _load_boundary_names(
-            os.path.join(paths.MAIN, CANTONS_GPKG)
-        )
-        primary_names = _select_names_interactive(canton_names, 'cantons')
-        if not primary_names:
-            raise ValueError("No cantons selected. Aborting.")
-        area_label = '_'.join(primary_names) if len(primary_names) <= 3 else f"{len(primary_names)}cantons"
-
-    elif admin_level == 'bezirke':
-        print("\n   Loading Bezirke names ...")
-        bezirke_names = _load_boundary_names(
-            os.path.join(paths.MAIN, BEZIRKE_GPKG)
-        )
-        primary_names = _select_names_interactive(bezirke_names, 'Bezirke')
-        if not primary_names:
-            raise ValueError("No Bezirke selected. Aborting.")
-        area_label = '_'.join(primary_names) if len(primary_names) <= 3 else f"{len(primary_names)}bezirke"
-
-    elif admin_level == 'municipal':
-        print("\n   Loading municipality names ...")
-        municipal_names = _load_boundary_names(
-            os.path.join(paths.MAIN, MUNICIPALITIES_GPKG),
-            objektart_filter='Gemeindegebiet',
-        )
-        primary_names = _select_names_interactive(municipal_names, 'municipalities')
-        if not primary_names:
-            raise ValueError("No municipalities selected. Aborting.")
-        area_label = '_'.join(primary_names) if len(primary_names) <= 3 else f"{len(primary_names)}municipalities"
-
-    # Sanitise area_label for folder name (replace spaces, special chars)
-    area_label = area_label.replace(' ', '').replace('/', '-').replace('\\', '-')
-
-    # --- C. Additional Subdivisions ------------------------------------------
-    subdivision_names = {'bezirke': [], 'municipal': []}
-
-    if admin_level in ('cantonal', 'bezirke'):
-        print("\nC. ADDITIONAL SUBDIVISIONS")
-        print("   You may add finer-grained areas to be unioned with the primary boundary.")
-
-        if admin_level == 'cantonal':
-            # Offer Bezirke
-            add_bez = input("\n   Add additional Bezirke outside the selected cantons? (y/n) [n]: ").strip().lower()
-            if add_bez == 'y':
-                print("   Loading Bezirke names ...")
-                bezirke_names = _load_boundary_names(
-                    os.path.join(paths.MAIN, BEZIRKE_GPKG)
-                )
-                subdivision_names['bezirke'] = _select_names_interactive(bezirke_names, 'Bezirke')
-
-            # Offer Municipalities
-            add_mun = input("\n   Add additional municipalities outside the selected cantons? (y/n) [n]: ").strip().lower()
-            if add_mun == 'y':
-                print("   Loading municipality names ...")
-                municipal_names = _load_boundary_names(
-                    os.path.join(paths.MAIN, MUNICIPALITIES_GPKG),
-                    objektart_filter='Gemeindegebiet',
-                )
-                subdivision_names['municipal'] = _select_names_interactive(municipal_names, 'municipalities')
-
-        elif admin_level == 'bezirke':
-            # Offer Municipalities
-            add_mun = input("\n   Add additional municipalities outside the selected Bezirke? (y/n) [n]: ").strip().lower()
-            if add_mun == 'y':
-                print("   Loading municipality names ...")
-                municipal_names = _load_boundary_names(
-                    os.path.join(paths.MAIN, MUNICIPALITIES_GPKG),
-                    objektart_filter='Gemeindegebiet',
-                )
-                subdivision_names['municipal'] = _select_names_interactive(municipal_names, 'municipalities')
-
-    elif admin_level == 'national':
-        print("\n   (Subdivisions not applicable at national level — skipped.)")
-    else:  # municipal
-        print("\n   (No finer subdivision available below municipal level — skipped.)")
-
-    # --- D. Boundary Buffer --------------------------------------------------
-    print("\nD. BOUNDARY BUFFER")
-    print("   Optional buffer (in metres) around the dissolved boundary.")
-    print("   Useful for capturing stops just outside the boundary that serve the area.")
-
-    while True:
-        buf_str = input("\n   Buffer distance in metres [0]: ").strip() or "0"
+    # --- B. GTFS output folder -----------------------------------------------
+    # Derive default output name from catchment gpkg primary attribute
+    _area_tag = 'filtered'
+    _ca_gpkg_path = os.path.join(paths.MAIN, paths.CATCHMENT_AREA_BUFFER_GPKG)
+    if os.path.isfile(_ca_gpkg_path):
         try:
-            buffer_m = float(buf_str)
-            if buffer_m < 0:
-                print("   Buffer must be >= 0.")
-                continue
-            break
-        except ValueError:
-            print("   Please enter a valid number.")
+            _ca_preview = gpd.read_file(_ca_gpkg_path)
+            _primary = str(_ca_preview.iloc[0].get('primary', '')).strip()
+            if _primary and _primary not in ('coordinates', 'nan', ''):
+                _area_tag = _primary.replace(', ', '_').replace(' ', '')[:30]
+        except Exception:
+            pass
+    default_output = f"GTFS_{_TIMETABLE_YEAR_TAG}_{_area_tag}"
 
-    # --- E. GTFS Output Folder -----------------------------------------------
-    default_output = f"GTFS_{_TIMETABLE_YEAR_TAG}_{area_label}"
-    print("\nE. GTFS OUTPUT FOLDER")
+    print("\nB. GTFS output folder")
     print(f"   Base path: {paths.GTFS_TRANSIT_DIR}")
     gtfs_output = input(
         f"\n   Enter output folder name [{default_output}]: "
     ).strip() or default_output
 
-    # --- Summary -------------------------------------------------------------
-    level_labels = {
-        'national':  'NATIONAL (all of Switzerland)',
-        'cantonal':  f"CANTONAL: {primary_names}",
-        'bezirke':   f"BEZIRKE: {primary_names}",
-        'municipal': f"MUNICIPAL: {primary_names}",
-    }
-    print("\n" + "-" * 70)
-    print("  CONFIGURATION SUMMARY")
-    print("-" * 70)
-    print(f"  GTFS input folder  : {gtfs_input}")
-    print(f"  Admin level        : {level_labels[admin_level]}")
-    if subdivision_names['bezirke']:
-        print(f"  + Bezirke          : {subdivision_names['bezirke']}")
-    if subdivision_names['municipal']:
-        print(f"  + Municipalities   : {subdivision_names['municipal']}")
-    print(f"  Boundary buffer    : {buffer_m:.0f} m")
-    print(f"  GTFS output folder : {gtfs_output}")
-    print("-" * 70)
-
     return {
         'gtfs_input_folder':  gtfs_input,
         'gtfs_output_folder': gtfs_output,
-        'admin_level':        admin_level,
-        'primary_names':      primary_names,
-        'subdivision_names':  subdivision_names,
-        'buffer_m':           buffer_m,
     }
 
 
-def _build_boundary_polygon(cfg):
-    """Dissolve and union all selected boundaries into a single polygon.
-
-    Parameters
-    ----------
-    cfg : dict
-        Output of ``_configure_pipeline()``.
-
-    Returns
-    -------
-    tuple (shapely geometry, CRS)
-        The dissolved boundary polygon in CODEBASE_CRS, and the raw CRS
-        as read from the primary GeoPackage (for reporting).
-    """
-    parts = []       # list of GeoDataFrames to union
-    raw_crs = None   # CRS of the first-read file (for report)
-
-    def _load_and_filter(gpkg_path, names=None, objektart_filter=None):
-        nonlocal raw_crs
-        layers = gpd.list_layers(gpkg_path)
-        gdf = gpd.read_file(gpkg_path, layer=layers.iloc[0]['name'])
-        if raw_crs is None:
-            raw_crs = gdf.crs
-        if objektart_filter and 'objektart' in gdf.columns:
-            gdf = gdf[gdf['objektart'] == objektart_filter]
-        if names is not None:
-            gdf = gdf[gdf['name'].isin(names)]
-        return gdf
-
-    admin = cfg['admin_level']
-
-    # --- Primary boundary ---
-    if admin == 'national':
-        primary = _load_and_filter(
-            os.path.join(paths.MAIN, CANTONS_GPKG)
-        )
-    elif admin == 'cantonal':
-        primary = _load_and_filter(
-            os.path.join(paths.MAIN, CANTONS_GPKG),
-            names=cfg['primary_names'],
-        )
-    elif admin == 'bezirke':
-        primary = _load_and_filter(
-            os.path.join(paths.MAIN, BEZIRKE_GPKG),
-            names=cfg['primary_names'],
-        )
-    elif admin == 'municipal':
-        primary = _load_and_filter(
-            os.path.join(paths.MAIN, MUNICIPALITIES_GPKG),
-            names=cfg['primary_names'],
-            objektart_filter='Gemeindegebiet',
-        )
-    else:
-        raise ValueError(f"Unknown admin level: {admin}")
-
-    if primary.empty:
-        raise ValueError(
-            f"No boundary rows matched for admin_level={admin}, "
-            f"names={cfg['primary_names']}."
-        )
-    parts.append(primary)
-
-    # --- Subdivision: additional Bezirke ---
-    sub_bez = cfg['subdivision_names'].get('bezirke', [])
-    if sub_bez:
-        bez_gdf = _load_and_filter(
-            os.path.join(paths.MAIN, BEZIRKE_GPKG),
-            names=sub_bez,
-        )
-        if not bez_gdf.empty:
-            parts.append(bez_gdf)
-            print(f"  + Unioning {len(bez_gdf)} additional Bezirke")
-
-    # --- Subdivision: additional Municipalities ---
-    sub_mun = cfg['subdivision_names'].get('municipal', [])
-    if sub_mun:
-        mun_gdf = _load_and_filter(
-            os.path.join(paths.MAIN, MUNICIPALITIES_GPKG),
-            names=sub_mun,
-            objektart_filter='Gemeindegebiet',
-        )
-        if not mun_gdf.empty:
-            parts.append(mun_gdf)
-            print(f"  + Unioning {len(mun_gdf)} additional municipalities")
-
-    # --- Dissolve all parts into a single polygon ---
-    combined = pd.concat(parts, ignore_index=True)
-    dissolved = combined.dissolve().to_crs(CODEBASE_CRS)
-    polygon = dissolved.geometry.iloc[0]
-
-    # --- Apply buffer if requested ---
-    buffer_m = cfg.get('buffer_m', 0)
-    if buffer_m > 0:
-        polygon = polygon.buffer(buffer_m)
-        print(f"  Applied {buffer_m:.0f} m buffer to boundary")
-
-    print(f"  Boundary dissolved and reprojected to {CODEBASE_CRS}")
-    print(f"  Boundary envelope: {polygon.bounds}")
-
-    return polygon, raw_crs
-
-
-# Run configuration and apply to module-level constants
-_pipeline_cfg   = _configure_pipeline()
-GTFS_INPUT_FOLDER  = _pipeline_cfg['gtfs_input_folder']
-GTFS_OUTPUT_FOLDER = _pipeline_cfg['gtfs_output_folder']
+_gtfs_cfg = _configure_gtfs_folders()
+GTFS_INPUT_FOLDER  = _gtfs_cfg['gtfs_input_folder']
+GTFS_OUTPUT_FOLDER = _gtfs_cfg['gtfs_output_folder']
 
 
 # ===========================================================================
@@ -552,18 +229,11 @@ os.chdir(paths.MAIN)  # All path constants in paths.py are relative to MAIN
 
 print("=" * 70)
 print("catchment_filter_gtfs.py")
-print(f"  CATCHMENT_METHOD : {settings.CATCHMENT_METHOD}")
-print(f"  Admin level      : {_pipeline_cfg['admin_level']}")
-if _pipeline_cfg['primary_names']:
-    print(f"  Primary selection: {_pipeline_cfg['primary_names']}")
-if _pipeline_cfg['subdivision_names']['bezirke']:
-    print(f"  + Bezirke        : {_pipeline_cfg['subdivision_names']['bezirke']}")
-if _pipeline_cfg['subdivision_names']['municipal']:
-    print(f"  + Municipalities : {_pipeline_cfg['subdivision_names']['municipal']}")
-print(f"  Boundary buffer  : {_pipeline_cfg['buffer_m']:.0f} m")
-print(f"  GTFS source      : {os.path.join(paths.GTFS_TRANSIT_DIR, GTFS_INPUT_FOLDER)}")
-print(f"  GTFS output      : {os.path.join(paths.GTFS_TRANSIT_DIR, GTFS_OUTPUT_FOLDER)}")
-print(f"  Spatial CRS      : {CODEBASE_CRS}")
+print(f"  CATCHMENT_METHOD      : {settings.CATCHMENT_METHOD}")
+print(f"  Catchment boundary    : {paths.CATCHMENT_AREA_BUFFER_GPKG}")
+print(f"  GTFS source           : {os.path.join(paths.GTFS_TRANSIT_DIR, GTFS_INPUT_FOLDER)}")
+print(f"  GTFS output           : {os.path.join(paths.GTFS_TRANSIT_DIR, GTFS_OUTPUT_FOLDER)}")
+print(f"  Spatial CRS           : {CODEBASE_CRS}")
 print("=" * 70)
 
 _gtfs_output_dir = os.path.join(paths.GTFS_TRANSIT_DIR, GTFS_OUTPUT_FOLDER)
@@ -575,28 +245,27 @@ print(f"[0] Created output directory: {_gtfs_output_dir}")
 
 
 # ===========================================================================
-# Step 1 — boundary preparation (driven by TUI configuration)
+# Step 1 — load catchment boundary from initialisation.py output
 # ===========================================================================
 
-print(f"\n[1] Building spatial boundary from pipeline configuration ...")
-canton_polygon, boundary_raw_crs = _build_boundary_polygon(_pipeline_cfg)
-
-# Export boundary polygon as GeoPackage — single source of truth for downstream scripts
-_catchment_area_dir = os.path.join(paths.MAIN, 'data', 'Catchment_Area')
-os.makedirs(_catchment_area_dir, exist_ok=True)
-_boundary_gdf = gpd.GeoDataFrame(
-    {
-        'name':        ['catchment_area_boundary'],
-        'admin_level': [_pipeline_cfg['admin_level']],
-        'primary':     [', '.join(_pipeline_cfg['primary_names'])],
-        'buffer_m':    [_pipeline_cfg['buffer_m']],
-    },
-    geometry=[canton_polygon],
-    crs=CODEBASE_CRS,
-)
-_boundary_export_path = os.path.join(_catchment_area_dir, 'catchment_area_boundary.gpkg')
-_boundary_gdf.to_file(_boundary_export_path, driver='GPKG')
-print(f"  Saved catchment area boundary: {_boundary_export_path}")
+print(f"\n[1] Loading catchment boundary ...")
+_ca_gpkg_path = os.path.join(paths.MAIN, paths.CATCHMENT_AREA_BUFFER_GPKG)
+if not os.path.isfile(_ca_gpkg_path):
+    raise FileNotFoundError(
+        f"Catchment area buffer not found: {_ca_gpkg_path}\n"
+        f"Run initialisation.py first to define and export the catchment area."
+    )
+_ca_gdf = gpd.read_file(_ca_gpkg_path).to_crs(CODEBASE_CRS)
+canton_polygon  = _ca_gdf.geometry.iloc[0]
+_ca_row         = _ca_gdf.iloc[0]
+_ca_admin_level = str(_ca_row.get('admin_level', 'unknown'))
+_ca_primary     = str(_ca_row.get('primary', ''))
+_ca_buffer_m    = float(_ca_row.get('buffer_m', 0))
+print(f"  Loaded: {_ca_gpkg_path}")
+print(f"  Admin level : {_ca_admin_level}")
+print(f"  Primary     : {_ca_primary}")
+print(f"  Buffer      : {_ca_buffer_m:.0f} m")
+print(f"  Bounds      : {canton_polygon.bounds}")
 
 
 # ===========================================================================
@@ -786,10 +455,7 @@ print(f"  Trips after route-type cascade: {len(trips_typed):,} / {len(trips_raw)
 # Step 5 — spatial filtering: stops within study area boundary
 # ===========================================================================
 
-_area_desc = (
-    'Switzerland' if _pipeline_cfg['admin_level'] == 'national'
-    else ', '.join(_pipeline_cfg['primary_names'])
-)
+_area_desc = _ca_primary if _ca_primary and _ca_primary not in ('coordinates', 'nan', '') else 'Switzerland'
 print(f"\n[5] Spatial filtering of stops to {_area_desc} ...")
 
 stops['stop_lon_f'] = pd.to_numeric(stops['stop_lon'], errors='coerce')
@@ -1067,13 +733,10 @@ if frequencies_present:
     _write(frequencies, 'frequencies.txt')
 
 # Write pipeline configuration sidecar so catchment_build_network.py can
-# auto-detect the GTFS folder and area description.
+# auto-detect the GTFS folder and catchment boundary.
 _sidecar = {
-    'gtfs_output_folder': GTFS_OUTPUT_FOLDER,
-    'admin_level':        _pipeline_cfg['admin_level'],
-    'primary_names':      _pipeline_cfg['primary_names'],
-    'subdivision_names':  _pipeline_cfg['subdivision_names'],
-    'buffer_m':           _pipeline_cfg['buffer_m'],
+    'gtfs_output_folder':    GTFS_OUTPUT_FOLDER,
+    'catchment_buffer_path': paths.CATCHMENT_AREA_BUFFER_GPKG,
 }
 _sidecar_path = _out_path('filter_config.json')
 with open(_sidecar_path, 'w', encoding='utf-8') as _f:
@@ -1133,17 +796,16 @@ report_lines = [
     "GTFS FILTER REPORT — catchment_filter_gtfs.py",
     "=" * 70,
     "",
-    "CONFIGURATION",
-    f"  CATCHMENT_METHOD : {settings.CATCHMENT_METHOD}",
-    f"  Admin level      : {_pipeline_cfg['admin_level']}",
-    f"  Primary selection: {_pipeline_cfg['primary_names'] or '(all)'}",
-    f"  + Bezirke        : {_pipeline_cfg['subdivision_names']['bezirke'] or '(none)'}",
-    f"  + Municipalities : {_pipeline_cfg['subdivision_names']['municipal'] or '(none)'}",
-    f"  Boundary buffer  : {_pipeline_cfg['buffer_m']:.0f} m",
+    "Configuration",
+    f"  CATCHMENT_METHOD      : {settings.CATCHMENT_METHOD}",
+    f"  Catchment buffer used : {paths.CATCHMENT_AREA_BUFFER_GPKG}",
+    f"  Admin level           : {_ca_admin_level}",
+    f"  Primary selection     : {_ca_primary or '(all)'}",
+    f"  Buffer applied        : {_ca_buffer_m:.0f} m",
     "",
-    "COORDINATE REFERENCE SYSTEMS",
-    f"  CRS of boundary as read from GeoPackage          : {boundary_raw_crs}",
-    f"  CRS used for all spatial operations              : {CODEBASE_CRS}",
+    "Coordinate reference systems",
+    f"  CRS of catchment boundary (GeoPackage)  : {CODEBASE_CRS}",
+    f"  CRS used for all spatial operations     : {CODEBASE_CRS}",
     f"  (EPSG:2056 confirmed as codebase standard — see catchment_pt.py,",
     f"   data_import.py, generate_infrastructure.py, and others)",
     "",
