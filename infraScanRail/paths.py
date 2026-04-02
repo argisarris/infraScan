@@ -29,14 +29,21 @@ HALTESTELLEN_OEV_GPKG = r"data/Spatial_Data/Railway_Infrastructure/HaltestellenO
 TLMREGIO_RAILWAY_SHP = r"data/Spatial_Data/Land_Use/Transportation/swissTLMRegio_Railway.shp"
 
 # --- Network Infrastructure ---
+# Root directory — all version subfolders live here
 NETWORK_INFRASTRUCTURE_DIR  = r"data/Infrastructure"
-NETWORK_INFRASTRUCTURE_BASE = r"data/Infrastructure/Base"
-NETWORK_INFRASTRUCTURE_CLEANED_NODES               = r"data/Infrastructure/Base/nodes.gpkg"
-NETWORK_INFRASTRUCTURE_CLEANED_SEGMENTS            = r"data/Infrastructure/Base/segments.gpkg"
-NETWORK_INFRASTRUCTURE_CLEANED_SEGMENTS_COMPOSITION = r"data/Infrastructure/Base/segments_composition.gpkg"
+# Raw/  : spatial-filtered BAV output (infrabuild_filter_network.py stage 1)
+NETWORK_INFRASTRUCTURE_RAW  = r"data/Infrastructure/Raw"
+NETWORK_INFRASTRUCTURE_RAW_NODES                = r"data/Infrastructure/Raw/nodes.gpkg"
+NETWORK_INFRASTRUCTURE_RAW_SEGMENTS             = r"data/Infrastructure/Raw/segments.gpkg"
+NETWORK_INFRASTRUCTURE_RAW_SEGMENTS_COMPOSITION = r"data/Infrastructure/Raw/segments_composition.gpkg"
+# Base/ : macroscopic-simplified network (infrabuild_filter_network.py stage 2)
+#         This is the selectable base version for network_builder and version_manager
+NETWORK_INFRASTRUCTURE_BASE          = r"data/Infrastructure/Base"
+NETWORK_INFRASTRUCTURE_BASE_NODES    = r"data/Infrastructure/Base/nodes.gpkg"
+NETWORK_INFRASTRUCTURE_BASE_SEGMENTS = r"data/Infrastructure/Base/segments.gpkg"
 
 # --- Infrastructure Plots ---
-INFRASTRUCTURE_PLOTS_DIR = r"plots/infrastructure"
+INFRASTRUCTURE_PLOTS_DIR = r"plots/Infrastructure"
 
 POPULATION_RASTER = r"data\independent_variable\processed\replacement.pop20_ArcGisExport.tif"
 EMPLOYMENT_RASTER = r"data\independent_variable\processed\replacement.empl20_ArcGisExport.tif"

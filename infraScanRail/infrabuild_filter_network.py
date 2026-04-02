@@ -2,10 +2,10 @@
 Filter Infrastructure Network Module
 
 Loads Swiss BAV railway geopackages, cleans the data, joins route attributes
-onto segments, filters everything to the catchment area boundary, and produces
+onto segments, filters everything to the catchment area buffer, and produces
 two output geopackages:
 
-  - nodes.gpkg             : Operating points within (and at the edge of) the catchment area
+  - nodes.gpkg             : Operating points within (and at the edge of) the catchment area buffer
   - segments.gpkg          : Track segments with BAV + route attributes
   - segments_composition.gpkg : TLMRegio breakdown per BAV segment (one row per
                                  physical piece: tunnel section, bridge section, etc.)
@@ -54,11 +54,59 @@ NODE_CLASSIFICATION_PATTERNS = {
 
 GAUGE_MAPPING = {
     'mm1435': 1435,
+    'mm1668': 1668,
+    'mm1520': 1520,
     'mm1000': 1000,
     'mm900':  900,
     'mm800':  800,
     'mm750':  750,
     'mm600':  600,
+}
+
+# Betriebspunkttyp_Bezeichnung (German, from HaltestellenOeV) → English node_class
+BETRIEBSPUNKT_TYPE_MAPPING = {
+    # Approved / Main Categories
+    'Haltestelle': 'station',
+    'Haltestelle und Bedienpunkt': 'station',
+    'Verzweigung, Abzweigung, Spaltweiche': 'junction',
+    'Anschlusspunkt': 'junction',
+    'Spurtrennung': 'junction',
+    'Ausweiche': 'junction',
+    'Wendeschleife': 'turning_loop',
+    
+    # Will be dropped during macroscopic filtering:
+    'Haltestelle ausser Betrieb': 'abandoned_station',
+    'Dienststation': 'operational_yard',
+    'Bedienpunkt': 'service_point',
+    'Zugeordneter Betriebspunkt': 'assigned_service_point',
+    'Spurwechsel': 'switch',
+    'Fehlerprofil/Kilometer-Sprung': 'km_change',
+    'Gleisende': 'track_end',
+    'Eigentumsgrenze': 'property_border',
+    'Landesgrenze': 'border',
+    
+    # Existing ones
+    'Bahnhof': 'station',
+    'Haltepunkt': 'halt',
+    'Abzweigung': 'junction',
+    'Blockstelle': 'junction',
+    'Betriebsanlage': 'operational_yard',
+    'Güterbahnhof': 'freight_yard',
+    'Güteranlage': 'freight_yard',
+    'Depot': 'depot',
+    'Depotanlage': 'depot',
+    'Fahrzeugdepot': 'depot',
+    'Grenzbahnhof': 'border',
+    'Grenzpunkt': 'border',
+    'km-Sprung': 'km_change',
+}
+
+TRANSPORT_MODE_MAPPING = {
+    'Zug': 'train',
+    'Bus': 'bus',
+    'Tram': 'tram',
+    'Zahnradbahn': 'cog_railway',
+    'Standseilbahn': 'funicular',
 }
 
 # TLMRegio CONSTRUCT field → English label
@@ -281,12 +329,12 @@ def load_tlmregio(filepath: Optional[str] = None) -> gpd.GeoDataFrame:
 
 def load_catchment_boundary(filepath: Optional[str] = None) -> gpd.GeoDataFrame:
     if filepath is None:
-        filepath = Path(paths.MAIN) / paths.CATCHMENT_AREA_BOUNDARY_GPKG
+        filepath = Path(paths.MAIN) / paths.CATCHMENT_AREA_BUFFER_GPKG
     if not Path(filepath).exists():
         raise FileNotFoundError(f"Catchment boundary not found: {filepath}")
     gdf = gpd.read_file(filepath)
     gdf = _ensure_crs(gdf, filepath)
-    print(f"Loaded catchment boundary ({len(gdf)} polygon(s))")
+    print(f"Loaded catchment area buffer ({len(gdf)} polygon(s))")
     return gdf
 
 
@@ -448,6 +496,11 @@ def enrich_nodes(nodes: gpd.GeoDataFrame,
     nodes['node_class'] = authoritative.where(authoritative.notna(),
                                                nodes['NAME'].apply(classify_node))
 
+    # Normalise German Betriebspunkttyp_Bezeichnung values to English
+    nodes['node_class'] = nodes['node_class'].apply(
+        lambda x: BETRIEBSPUNKT_TYPE_MAPPING.get(str(x), x) if pd.notna(x) else x
+    )
+
     matched_type = authoritative.notna().sum()
     print(f"  Node classification: {matched_type}/{len(nodes)} from HaltestellenOeV "
           f"({len(nodes) - matched_type} pattern fallback)")
@@ -455,6 +508,15 @@ def enrich_nodes(nodes: gpd.GeoDataFrame,
     # --- transport_mode: Verkehrsmittel_Bezeichnung ----------------------------
     mode_lookup = dict(zip(bp_num, betriebspunkte['Verkehrsmittel_Bezeichnung']))
     nodes['transport_mode'] = node_ids.map(mode_lookup)
+
+    # Normalise German Verkehrsmittel_Bezeichnung values to English
+    def translate_modes(val):
+        if pd.isna(val):
+            return val
+        parts = [TRANSPORT_MODE_MAPPING.get(p.strip(), p.strip()) for p in str(val).split('/')]
+        return ' / '.join(parts)
+
+    nodes['transport_mode'] = nodes['transport_mode'].apply(translate_modes)
 
     # --- platform_count: Haltekante aggregation --------------------------------
     # Haltekante.rHaltestelle → Betriebspunkt.xtf_id → Betriebspunkt.Nummer
@@ -774,8 +836,8 @@ def run_filter_network(
     Args:
         output_dir:         Where to write the three geopackages.
                             Defaults to paths.NETWORK_INFRASTRUCTURE_BASE.
-        catchment_filepath: Catchment boundary file.
-                            Defaults to paths.CATCHMENT_AREA_BOUNDARY_GPKG.
+        catchment_filepath: Catchment area buffer file.
+                            Defaults to paths.CATCHMENT_AREA_BUFFER_GPKG.
 
     Returns:
         (filtered_nodes, filtered_segments, composition, lookups)
@@ -784,7 +846,7 @@ def run_filter_network(
     print("Filter Infrastructure Network")
     print("=" * 60)
 
-    output_dir = Path(output_dir or (Path(paths.MAIN) / paths.NETWORK_INFRASTRUCTURE_BASE))
+    output_dir = Path(output_dir or (Path(paths.MAIN) / paths.NETWORK_INFRASTRUCTURE_RAW))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Load -----------------------------------------------------------------
@@ -847,21 +909,33 @@ def run_filter_network(
 
 
 # =============================================================================
-# CLI
+# Entry Point
 # =============================================================================
 
 if __name__ == "__main__":
-    import argparse
+    import os
+    os.chdir(paths.MAIN)
 
-    parser = argparse.ArgumentParser(
-        description="Filter BAV infrastructure to catchment area and export geopackages"
+    print("=" * 60)
+    print("infraScanRail — Filter Infrastructure Network")
+    print("=" * 60)
+    print("Loads BAV railway geopackages, cleans and enriches the data,")
+    print("filters to the catchment area, and exports to Raw/.")
+    print("\nOutputs: data/Infrastructure/Raw/nodes.gpkg")
+    print("         data/Infrastructure/Raw/segments.gpkg")
+    print("         data/Infrastructure/Raw/segments_composition.gpkg")
+
+    raw_path = Path(paths.MAIN) / paths.NETWORK_INFRASTRUCTURE_RAW
+    raw_ready = (
+        (raw_path / "nodes.gpkg").exists() and
+        (raw_path / "segments.gpkg").exists()
     )
-    parser.add_argument("--output",   "-o", default=None, help="Output directory")
-    parser.add_argument("--boundary", "-b", default=None, help="Catchment boundary file")
 
-    args = parser.parse_args()
+    if raw_ready:
+        print("\n   Raw/ already exists.")
+        ans = input("   Re-run the filter and overwrite Raw/? (y/n) [n]: ").strip().lower() or "n"
+        if ans != 'y':
+            print("   Nothing to do. Exiting.")
+            raise SystemExit(0)
 
-    run_filter_network(
-        output_dir=args.output,
-        catchment_filepath=args.boundary,
-    )
+    run_filter_network()
