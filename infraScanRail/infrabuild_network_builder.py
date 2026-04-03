@@ -24,6 +24,7 @@ import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.legend_handler import HandlerBase
 from pathlib import Path
 from typing import List, Optional, Tuple
 from dataclasses import dataclass, field
@@ -34,6 +35,8 @@ import math
 import sys
 import uuid
 import zipfile
+from matplotlib.patches import Rectangle
+from matplotlib_map_utils.core.north_arrow import NorthArrow, north_arrow
 
 sys.path.insert(0, str(Path(__file__).parent))
 import paths
@@ -44,13 +47,13 @@ import paths
 # =============================================================================
 
 GAUGE_COLORS = {
-    1435: '#000000',  # black           – standard gauge
+    1435: '#000000',  # black           – Standard gauge
     1668: '#B8860B',  # dark goldenrod  – Iberian gauge
     1520: '#8B0000',  # dark red        – Russian/broad gauge
-    1000: '#7B00D4',  # violet          – metre gauge
-    900:  '#FFD700',  # gold
-    800:  '#FF4500',  # orange-red
-    750:  '#FF6347',  # tomato
+    1000: '#7B00D4',  # violet          – Metre gauge
+    1067: "#0011FF",  # dark blue       - Cape gauge
+    1676: "#D6F814",  # orange-red
+    1600: '#FF6347',  # tomato
     600:  '#FF69B4',  # hot pink
 }
 GAUGE_DEFAULT = '#808080'
@@ -59,7 +62,7 @@ GAUGE_DEFAULT = '#808080'
 # Raw BAV Elektrifizierung strings are classified via _classify_electrification().
 ELECTRIFICATION_COLORS = {
     'no_electrification': '#000000',  # black       – nicht elektrifiziert
-    'dc':                 '#ADD8E6',  # light blue  – Gleichstrom
+    'dc':                 "#046DAA",  # light blue  – Gleichstrom
     'ac_16_7hz':          '#2ca02c',  # green       – Wechselstrom 15 kV / 16.7 Hz
     'ac_25kv':            '#d62728',  # red         – Wechselstrom 25 kV
     'unknown':            '#7f7f7f',  # grey
@@ -524,16 +527,15 @@ _INFRA_WMS_SRC  = (
 
 def _multi_track_symbol_xml(sym_name: str, num_tracks: int) -> str:
     """XML for a line symbol with num_tracks parallel SimpleLine sub-layers."""
-    spacing = 0.40  # MM between adjacent track centre lines
+    width = '0.40'
     if num_tracks == 1:
-        offsets, width = [0.0], '0.50'
+        offsets = [0.0]
     elif num_tracks == 2:
-        offsets, width = [-spacing, spacing], '0.40'
+        offsets = [0.400, -0.400]
     elif num_tracks == 3:
-        offsets, width = [-spacing, 0.0, spacing], '0.50'
-    else:  # 4+
-        offsets = [(-1.5 + i) * spacing for i in range(4)]
-        width = '0.40'
+        offsets = [0.800, 0.0, -0.800]
+    else:
+        offsets = [1.200, 0.400, -0.400, -1.200]
 
     layers_xml = ''
     for off in offsets:
@@ -545,11 +547,8 @@ def _multi_track_symbol_xml(sym_name: str, num_tracks: int) -> str:
             <prop k="line_style" v="solid"/>
             <prop k="offset" v="{off:.3f}"/>
             <prop k="offset_unit" v="MM"/>
-            <prop k="offset_map_unit_scale" v="3x:0,0,0,0,0,0"/>
             <prop k="capstyle" v="square"/>
             <prop k="joinstyle" v="bevel"/>
-            <prop k="use_custom_dash" v="0"/>
-            <prop k="width_map_unit_scale" v="3x:0,0,0,0,0,0"/>
           </layer>"""
     return (
         f'    <symbol alpha="1" clip_to_extent="1" type="line"'
@@ -602,81 +601,96 @@ def _segments_maplayer_xml(layer_id: str, gpkg_relpath: str,
     )
 
 
-def _nodes_maplayer_xml(layer_id: str, gpkg_relpath: str,
-                         display_name: str) -> str:
-    """<maplayer> XML for nodes: white circles, black outline, CODE labels."""
-    marker_xml = (
-        '    <renderer-v2 forceraster="0" symbollevels="0" type="singleSymbol"'
-        ' enableorderby="0">\n'
-        '      <symbols>\n'
-        '        <symbol alpha="1" clip_to_extent="1" type="marker" name="0" force_rhr="0">\n'
-        '          <layer pass="0" class="SimpleMarker" locked="0" enabled="1">\n'
-        '            <prop k="angle" v="0"/>\n'
-        '            <prop k="color" v="255,255,255,255"/>\n'
-        '            <prop k="joinstyle" v="bevel"/>\n'
-        '            <prop k="name" v="circle"/>\n'
-        '            <prop k="offset" v="0,0"/>\n'
-        '            <prop k="offset_unit" v="MM"/>\n'
-        '            <prop k="outline_color" v="0,0,0,255"/>\n'
-        '            <prop k="outline_style" v="solid"/>\n'
-        '            <prop k="outline_width" v="0.25"/>\n'
-        '            <prop k="outline_width_unit" v="MM"/>\n'
-        '            <prop k="size" v="2.5"/>\n'
-        '            <prop k="size_unit" v="MM"/>\n'
-        '          </layer>\n'
-        '        </symbol>\n'
-        '      </symbols>\n'
-        '      <rotation/>\n'
-        '      <sizescale/>\n'
-        '    </renderer-v2>'
-    )
-    labeling_xml = (
-        '    <labeling type="simple">\n'
-        '      <settings calloutType="simple">\n'
-        '        <text-style fieldName="CODE" fontFamily="Arial" fontSize="8"\n'
-        '                    fontWeight="0" fontItalic="0" fontUnderline="0"\n'
-        '                    fontStrikeout="0" textColor="35,35,35,255"\n'
-        '                    textOpacity="1" blendMode="0" namedStyle="Regular"\n'
-        '                    isExpression="0" useSubstitutions="0"\n'
-        '                    multilineHeight="1" fontCapitals="0"\n'
-        '                    fontLetterSpacing="0" fontWordSpacing="0"\n'
-        '                    fontSizeUnit="Point" textOrientation="horizontal"\n'
-        '                    previewBkgrdColor="255,255,255,255"/>\n'
-        '        <text-buffer bufferDraw="1" bufferSize="1"\n'
-        '                     bufferColor="255,255,255,255" bufferOpacity="1"\n'
-        '                     bufferJoinStyle="128" bufferNoFill="1"\n'
-        '                     bufferSizeUnits="MM"\n'
-        '                     bufferSizeMapUnitScale="3x:0,0,0,0,0,0"\n'
-        '                     bufferBlendMode="0"/>\n'
-        '        <background shapeDraw="0"/>\n'
-        '        <shadow shadowDraw="0"/>\n'
-        '        <placement placement="1" centroidWhole="0" placementFlags="10"\n'
-        '                   priority="5" offsetType="0" quadOffset="4"\n'
-        '                   xOffset="2" yOffset="2" offsetUnits="MM"\n'
-        '                   dist="1" distInMapUnits="0"\n'
-        '                   distMapUnitScale="3x:0,0,0,0,0,0"\n'
-        '                   rotationAngle="0" geometryGenerator=""\n'
-        '                   geometryGeneratorEnabled="0"\n'
-        '                   geometryGeneratorType="PointGeometry"\n'
-        '                   isExpression="0" labelPerPart="0"/>\n'
-        '        <rendering drawLabels="1" obstacle="1" obstacleFactor="1"\n'
-        '                   obstacleType="1" limitNumLabels="0" maxNumLabels="2000"\n'
-        '                   minFeatureSize="0" fontMinPixelSize="3"\n'
-        '                   fontMaxPixelSize="10000" displayAll="0"\n'
-        '                   upsidedownLabels="0" mergeLines="0" zIndex="0"\n'
-        '                   scaleVisibility="0" scaleMin="1"\n'
-        '                   scaleMax="10000000" labelPerPart="0"/>\n'
-        '        <dd_properties/>\n'
-        '      </settings>\n'
-        '    </labeling>'
-    )
+def _nodes_maplayer_xml(layer_id: str, gpkg_relpath: str, display_name: str) -> str:
+    """<maplayer> XML for all nodes using a RuleRenderer."""
+    root_key = uuid.uuid4().hex
+    rules_xml = f"""\
+      <rules key="{root_key}">\
+        <rule key="{uuid.uuid4().hex}" filter="&quot;node_class&quot; = 'station' AND &quot;transport_mode&quot; LIKE '%train%'" label="Train Stations" symbol="0"/>\
+        <rule key="{uuid.uuid4().hex}" filter="&quot;node_class&quot; = 'station' AND (&quot;transport_mode&quot; LIKE '%tram%' OR &quot;transport_mode&quot; LIKE '%funicular%' OR &quot;transport_mode&quot; LIKE '%cog_railway%')" label="Tram / Funicular" symbol="1"/>\
+        <rule key="{uuid.uuid4().hex}" filter="&quot;node_class&quot; IN ('junction', 'turning_loop')" label="Junctions" symbol="2"/>\
+      </rules>"""
+
+    marker_xml = f"""\
+    <renderer-v2 forceraster="0" symbollevels="0" type="RuleRenderer" enableorderby="0">
+{rules_xml}
+      <symbols>
+        <symbol alpha="1" clip_to_extent="1" type="marker" name="0" force_rhr="0">
+          <layer pass="0" class="SimpleMarker" locked="0" enabled="1">
+            <prop k="angle" v="0"/>
+            <prop k="color" v="255,255,255,255"/>
+            <prop k="joinstyle" v="bevel"/>
+            <prop k="name" v="circle"/>
+            <prop k="offset" v="0,0"/>
+            <prop k="offset_unit" v="MM"/>
+            <prop k="outline_color" v="0,0,0,255"/>
+            <prop k="outline_style" v="solid"/>
+            <prop k="outline_width" v="0.25"/>
+            <prop k="outline_width_unit" v="MM"/>
+            <prop k="size" v="2.5"/>
+            <prop k="size_unit" v="MM"/>
+          </layer>
+        </symbol>
+        <symbol alpha="1" clip_to_extent="1" type="marker" name="1" force_rhr="0">
+          <layer pass="0" class="SimpleMarker" locked="0" enabled="1">
+            <prop k="angle" v="0"/>
+            <prop k="color" v="0,0,0,255"/>
+            <prop k="joinstyle" v="bevel"/>
+            <prop k="name" v="circle"/>
+            <prop k="offset" v="0,0"/>
+            <prop k="offset_unit" v="MM"/>
+            <prop k="outline_color" v="0,0,0,255"/>
+            <prop k="outline_style" v="solid"/>
+            <prop k="outline_width" v="0.25"/>
+            <prop k="outline_width_unit" v="MM"/>
+            <prop k="size" v="1.75"/>
+            <prop k="size_unit" v="MM"/>
+          </layer>
+        </symbol>
+        <symbol alpha="1" clip_to_extent="1" type="marker" name="2" force_rhr="0">
+          <layer pass="0" class="SimpleMarker" locked="0" enabled="1">
+            <prop k="angle" v="0"/>
+            <prop k="color" v="150,150,150,255"/>
+            <prop k="joinstyle" v="bevel"/>
+            <prop k="name" v="circle"/>
+            <prop k="offset" v="0,0"/>
+            <prop k="offset_unit" v="MM"/>
+            <prop k="outline_color" v="120,120,120,255"/>
+            <prop k="outline_style" v="solid"/>
+            <prop k="outline_width" v="0.20"/>
+            <prop k="outline_width_unit" v="MM"/>
+            <prop k="size" v="1.25"/>
+            <prop k="size_unit" v="MM"/>
+          </layer>
+        </symbol>
+      </symbols>
+      <rotation/>
+      <sizescale/>
+    </renderer-v2>"""
+
+    labeling_xml = """\
+    <labeling type="rule-based">
+      <rules>
+        <rule filter="&quot;node_class&quot; = 'station' AND &quot;transport_mode&quot; LIKE '%train%'">
+          <settings calloutType="simple">
+            <text-style fieldName="CODE" fontFamily="Arial" fontSize="8" fontWeight="0" fontItalic="0" fontUnderline="0" fontStrikeout="0" textColor="35,35,35,255" textOpacity="1" blendMode="0" namedStyle="Regular" isExpression="0" useSubstitutions="0" multilineHeight="1" fontCapitals="0" fontLetterSpacing="0" fontWordSpacing="0" fontSizeUnit="Point" textOrientation="horizontal" previewBkgrdColor="255,255,255,255"/>
+            <text-buffer bufferDraw="1" bufferSize="1" bufferColor="255,255,255,255" bufferOpacity="1" bufferJoinStyle="128" bufferNoFill="1" bufferSizeUnits="MM" bufferSizeMapUnitScale="3x:0,0,0,0,0,0" bufferBlendMode="0"/>
+            <background shapeDraw="0"/>
+            <shadow shadowDraw="0"/>
+            <placement placement="1" centroidWhole="0" placementFlags="10" priority="5" offsetType="0" quadOffset="4" xOffset="2" yOffset="2" offsetUnits="MM" dist="1" distInMapUnits="0" distMapUnitScale="3x:0,0,0,0,0,0" rotationAngle="0" geometryGenerator="" geometryGeneratorEnabled="0" geometryGeneratorType="PointGeometry" isExpression="0" labelPerPart="0"/>
+            <rendering drawLabels="1" obstacle="1" obstacleFactor="1" obstacleType="1" limitNumLabels="0" maxNumLabels="2000" minFeatureSize="0" fontMinPixelSize="3" fontMaxPixelSize="10000" displayAll="0" upsidedownLabels="0" mergeLines="0" zIndex="0" scaleVisibility="0" scaleMin="1" scaleMax="10000000" labelPerPart="0"/>
+            <dd_properties/>
+          </settings>
+        </rule>
+      </rules>
+    </labeling>"""
+
     return (
         f'  <maplayer geometry="Point" type="vector" hasScaleBasedVisibilityFlag="0">\n'
         f'    <id>{layer_id}</id>\n'
         f'    <datasource>{gpkg_relpath}|layername=nodes</datasource>\n'
         f'    <layername>{display_name}</layername>\n'
         f'    <provider encoding="UTF-8">ogr</provider>\n'
-        f'    <subset>&quot;node_class&quot; = \'station\' AND &quot;transport_mode&quot; LIKE \'%train%\'</subset>\n'
         f'    <srs>{_INFRA_SRS_BLOCK}</srs>\n'
         f'{marker_xml}\n'
         f'{labeling_xml}\n'
@@ -741,7 +755,7 @@ def _build_infra_qgz(qgz_path: str, version_dir: Path) -> None:
     """
     version = version_dir.name
     seg_id  = f'seg_{uuid.uuid4().hex[:8]}'
-    nod_id  = f'nod_{uuid.uuid4().hex[:8]}'
+    nd_id   = f'nd_{uuid.uuid4().hex[:8]}'
     ca_id   = f'ca_{uuid.uuid4().hex[:8]}'
     sa_id   = f'sa_{uuid.uuid4().hex[:8]}'
 
@@ -751,8 +765,8 @@ def _build_infra_qgz(qgz_path: str, version_dir: Path) -> None:
 
     seg_block = _segments_maplayer_xml(seg_id, 'segments.gpkg',
                                         f'Segments — {version}')
-    nod_block = _nodes_maplayer_xml(nod_id, 'nodes.gpkg',
-                                     f'Stations &amp; Halts — {version}')
+    nd_block  = _nodes_maplayer_xml(nd_id, 'nodes.gpkg',
+                                    f'Nodes — {version}')
     ca_block  = _boundary_maplayer_xml(ca_id, ca_relpath,
                                         'Catchment Area Boundary', '0,0,0,255')
     sa_block  = _boundary_maplayer_xml(sa_id, sa_relpath,
@@ -760,7 +774,7 @@ def _build_infra_qgz(qgz_path: str, version_dir: Path) -> None:
     wms_block = _wms_maplayer_xml()
 
     tree_xml = (
-        f'    <layer-tree-layer id="{nod_id}" name="Stations &amp; Halts — {version}" '
+        f'    <layer-tree-layer id="{nd_id}" name="Nodes — {version}" '
         f'checked="Qt::Checked" expanded="1" '
         f'source="nodes.gpkg|layername=nodes" providerKey="ogr"/>\n'
         f'    <layer-tree-layer id="{ca_id}" name="Catchment Area Boundary" '
@@ -793,7 +807,7 @@ def _build_infra_qgz(qgz_path: str, version_dir: Path) -> None:
     <custom-order enabled="0"/>
   </layer-tree-group>
   <projectlayers>
-{nod_block}
+{nd_block}
 {ca_block}
 {sa_block}
 {seg_block}
@@ -869,6 +883,38 @@ def build_networkx_graph(
 
 
 # =============================================================================
+# Node Classification
+# =============================================================================
+
+def _classify_nodes(nodes: gpd.GeoDataFrame):
+    """Split nodes GDF into (train_stations, tram_funicular, junctions).
+
+    train_stations : node_class == 'station' AND transport_mode contains 'train'
+    tram_funicular : node_class == 'station' AND transport_mode contains
+                     'tram', 'funicular', or 'cog_railway' (and NOT 'train')
+    junctions      : node_class in ('junction', 'turning_loop')
+    """
+    if nodes is None or nodes.empty:
+        empty = gpd.GeoDataFrame()
+        return empty, empty, empty
+
+    nc = (nodes['node_class']     if 'node_class'     in nodes.columns
+          else pd.Series([''] * len(nodes), index=nodes.index))
+    tm = (nodes['transport_mode'] if 'transport_mode' in nodes.columns
+          else pd.Series([''] * len(nodes), index=nodes.index))
+
+    is_station = nc.astype(str) == 'station'
+    has_train  = tm.astype(str).str.contains('train', na=False)
+    has_tram_f = tm.astype(str).str.contains(
+        'tram|funicular|cog_railway', na=False, regex=True)
+
+    train_stations = nodes[is_station & has_train]
+    tram_funicular = nodes[is_station & has_tram_f & ~has_train]
+    junctions      = nodes[nc.astype(str).isin(['junction', 'turning_loop'])]
+    return train_stations, tram_funicular, junctions
+
+
+# =============================================================================
 # Plotting Utilities
 # =============================================================================
 
@@ -876,22 +922,49 @@ def _get_line_width(num_tracks: int) -> float:
     return 1.0 + (num_tracks - 1) * 0.5
 
 
-def _add_north_arrow(ax, x=0.05, y=0.95, size=0.05):
-    ax.annotate('N', xy=(x, y), xytext=(x, y - size),
-                xycoords='axes fraction', ha='center', va='center',
-                fontsize=12, fontweight='bold',
-                arrowprops=dict(arrowstyle='->', lw=2))
+_SCALE_BAR_NICE_KM = [1, 2, 5, 10, 20, 50, 100, 200, 500]
 
 
-def _add_scale_bar(ax, length_km=10, location=(0.72, 0.05)):
-    length_m = length_km * 1000
-    xlim, ylim = ax.get_xlim(), ax.get_ylim()
-    x0 = xlim[0] + (xlim[1] - xlim[0]) * location[0]
-    y0 = ylim[0] + (ylim[1] - ylim[0]) * location[1]
-    ax.plot([x0, x0 + length_m], [y0, y0], 'k-', linewidth=2)
-    ax.plot([x0, x0], [y0 - 500, y0 + 500], 'k-', linewidth=1)
-    ax.plot([x0 + length_m, x0 + length_m], [y0 - 500, y0 + 500], 'k-', linewidth=1)
-    ax.text(x0 + length_m / 2, y0 + 800, f'{length_km} km', ha='center', fontsize=8)
+def _add_north_arrow(ax, location='upper left', scale=0.5):
+    """Draw a north arrow using matplotlib_map_utils."""
+    north_arrow(ax, location=location, scale=scale, rotation={"degrees": 0})
+
+
+def _add_scale_bar(ax, location=(0.72, 0.04)):
+    """Adaptive scale bar with 2-3 alternating black/white cells.
+
+    Automatically picks a round km value based on the current axes extent.
+    """
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    map_w = xlim[1] - xlim[0]
+    map_h = ylim[1] - ylim[0]
+
+    target_km = (map_w / 4.0) / 1000.0
+    total_km  = min(_SCALE_BAR_NICE_KM, key=lambda v: abs(v - target_km))
+    n_cells   = 4 if total_km >= 4 else 2
+    cell_m    = (total_km * 1000.0) / n_cells
+
+    x0    = xlim[0] + map_w * location[0]
+    y0    = ylim[0] + map_h * location[1]
+    bar_h = map_h * 0.008
+
+    for i in range(n_cells):
+        color = 'black' if i % 2 == 0 else 'white'
+        rect = Rectangle(
+            (x0 + i * cell_m, y0), cell_m, bar_h,
+            facecolor=color, edgecolor='black', linewidth=0.6, zorder=7,
+        )
+        ax.add_patch(rect)
+
+    for i in range(n_cells + 1):
+        val_km = (i * cell_m) / 1000.0
+        label  = (f'{val_km:.0f} km' if val_km == int(val_km)
+                  else f'{val_km:.1f} km')
+        ax.text(
+            x0 + i * cell_m, y0 + bar_h * 1.6,
+            label, ha='center', va='bottom', fontsize=7, zorder=7,
+        )
 
 
 def _clip_to_boundary(gdf: gpd.GeoDataFrame,
@@ -906,8 +979,32 @@ def _clip_to_boundary(gdf: gpd.GeoDataFrame,
         return gdf
 
 
-def _plot_lakes(ax, boundary: Optional[gpd.GeoDataFrame] = None) -> None:
-    """Overlay lakes from swissTLMRegio, optionally clipped to boundary."""
+def _clip_to_extent(gdf: gpd.GeoDataFrame, extent) -> gpd.GeoDataFrame:
+    """Clip gdf geometries precisely to the extent bounding box to fix mask bounds."""
+    if gdf is None or gdf.empty or extent is None:
+        return gdf
+    try:
+        from shapely.geometry import box as shapely_box
+        bbox = gpd.GeoDataFrame(
+            geometry=[shapely_box(extent[0], extent[2], extent[1], extent[3])],
+            crs=gdf.crs
+        )
+        clipped = gpd.clip(gdf, bbox)
+        return clipped if not clipped.empty else gpd.GeoDataFrame(columns=gdf.columns).set_crs(gdf.crs)
+    except Exception:
+        return gdf
+
+
+def _plot_lakes(ax, boundary: Optional[gpd.GeoDataFrame] = None,
+                extent=None) -> None:
+    """Overlay lakes from swissTLMRegio.
+
+    Clipping priority:
+      1. extent (xmin, xmax, ymin, ymax) — used for SA plots, clips to plot frame
+      2. boundary GeoDataFrame            — used for CA plots, clips to study polygon
+      3. Neither provided                 — no clipping (full coverage)
+    """
+    from shapely.geometry import box as shapely_box
     lakes_path = Path(paths.MAIN) / paths.LAKES_SHP
     if not lakes_path.exists():
         return
@@ -917,8 +1014,16 @@ def _plot_lakes(ax, boundary: Optional[gpd.GeoDataFrame] = None) -> None:
             lakes = lakes.set_crs('EPSG:2056')
         elif lakes.crs.to_epsg() != 2056:
             lakes = lakes.to_crs('EPSG:2056')
-        if boundary is not None and not boundary.empty:
+
+        if extent is not None:
+            clip_geom = gpd.GeoDataFrame(
+                geometry=[shapely_box(extent[0], extent[2], extent[1], extent[3])],
+                crs='EPSG:2056',
+            )
+            lakes = gpd.clip(lakes, clip_geom)
+        elif boundary is not None and not boundary.empty:
             lakes = _clip_to_boundary(lakes, boundary)
+
         if not lakes.empty:
             lakes.plot(ax=ax, facecolor='#a8cfe0', edgecolor='#5a9ab5',
                        linewidth=0.4, zorder=1)
@@ -961,6 +1066,7 @@ def plot_infrastructure(
     title: Optional[str] = None,
     figsize: Tuple[int, int] = (16, 12),
     show_labels: bool = True,
+    is_catchment: bool = False,
 ) -> plt.Figure:
     """Infrastructure overview: segments coloured by track count, nodes by class."""
     if title is None:
@@ -971,26 +1077,49 @@ def plot_infrastructure(
     segs  = _clip_to_boundary(network.segments, network.boundary)
     nodes = _clip_to_boundary(network.nodes,    network.boundary)
 
+    tracks_present = set()
+    has_other_tracks = False
+
     # Segments by track count
     if len(segs) > 0:
         for n_tracks, color in TRACK_COLORS.items():
             mask = segs['num_tracks'] == n_tracks
             if mask.any():
-                segs[mask].plot(
-                    ax=ax, color=color,
-                    linewidth=_get_line_width(n_tracks), alpha=0.75, zorder=2,
-                )
+                tracks_present.add(n_tracks)
+                for _, row in segs[mask].iterrows():
+                    _draw_parallel_tracks(
+                        ax,
+                        geom=row.geometry,
+                        num_tracks=n_tracks,
+                        color='black',
+                        linewidth=1.5,
+                        alpha=0.75,
+                        zorder=2,
+                        track_spacing_m=_TRACK_SPACING_M_CA if is_catchment else _TRACK_SPACING_M_SA
+                    )
         other = ~segs['num_tracks'].isin(TRACK_COLORS)
         if other.any():
-            segs[other].plot(
-                ax=ax, color=TRACK_DEFAULT, linewidth=2, alpha=0.7, zorder=2,
-            )
+            has_other_tracks = True
+            for _, row in segs[other].iterrows():
+                _draw_parallel_tracks(
+                    ax,
+                    geom=row.geometry,
+                    num_tracks=1,
+                    color=TRACK_DEFAULT,
+                    linewidth=1.5,
+                    alpha=0.7,
+                    zorder=2,
+                    track_spacing_m=_TRACK_SPACING_M_CA if is_catchment else _TRACK_SPACING_M_SA
+                )
+
+    nodes_present = set()
 
     # Nodes by class
     if len(nodes) > 0:
         for cls, color in NODE_COLORS.items():
             mask = nodes['node_class'] == cls
             if mask.any():
+                nodes_present.add(cls)
                 size   = 80 if cls == 'station' else 30
                 marker = 'o' if cls == 'station' else 's'
                 nodes[mask].plot(
@@ -1017,20 +1146,37 @@ def plot_infrastructure(
 
     # Legend
     legend = []
-    legend.append(Line2D([0], [0], color='none', label='─ Tracks ─'))
-    for n, color in TRACK_COLORS.items():
-        legend.append(Line2D([0], [0], color=color,
-                             linewidth=_get_line_width(n), label=f'{n} track(s)'))
-    legend.append(Line2D([0], [0], color='none', label=''))
-    legend.append(Line2D([0], [0], color='none', label='─ Nodes ─'))
-    for cls, color in NODE_COLORS.items():
-        marker = 'o' if cls == 'station' else 's'
-        size   = 10 if cls == 'station' else 7
-        legend.append(Line2D([0], [0], marker=marker, color='w',
-                             markerfacecolor=color, markersize=size,
-                             markeredgecolor='black' if cls == 'station' else None,
-                             label=cls.replace('_', ' ').title()))
-    ax.legend(handles=legend, loc='upper right', fontsize=8)
+    handler_map = {}
+    
+    if tracks_present or has_other_tracks:
+        legend.append(Line2D([0], [0], color='none', label='─ Tracks ─'))
+        for n in sorted(tracks_present):
+            agg_linewidth = 1.5 if n == 1 else n * 1.35 
+            handle = Line2D([0], [0], color='black', linewidth=agg_linewidth, label=f'{n} track(s)')
+            legend.append(handle)
+            handler_map[handle] = _MultiTrackLegendHandler()
+            handle.track_count = n
+            handle.total_width = agg_linewidth
+            handle.color = 'black'
+            
+        if has_other_tracks:
+            legend.append(Line2D([0], [0], color=TRACK_DEFAULT, linewidth=1, label='Other'))
+    
+    if nodes_present:
+        if tracks_present or has_other_tracks:
+            legend.append(Line2D([0], [0], color='none', label=''))
+        legend.append(Line2D([0], [0], color='none', label='─ Nodes ─'))
+        for cls, color in NODE_COLORS.items():
+            if cls in nodes_present:
+                marker = 'o' if cls == 'station' else 's'
+                size   = 10 if cls == 'station' else 7
+                legend.append(Line2D([0], [0], marker=marker, color='w',
+                                     markerfacecolor=color, markersize=size,
+                                     markeredgecolor='black' if cls == 'station' else None,
+                                     label=cls.replace('_', ' ').title()))
+    
+    if legend:
+        ax.legend(handles=legend, handler_map=handler_map, loc='upper right', fontsize=8)
 
     _add_north_arrow(ax)
     _add_scale_bar(ax)
@@ -1048,15 +1194,18 @@ def plot_gauge_map(
     output_path: Optional[Path] = None,
     title: Optional[str] = None,
     figsize: Tuple[int, int] = (16, 12),
+    show_outside: bool = False,
+    is_catchment: bool = False,
 ) -> plt.Figure:
     """OpenRailwayMap-style gauge map."""
     if title is None:
         title = f"Gauge Map — {network.version}"
     fig, ax = _base_plot(network, title, figsize, extent=extent)
     ax.set_facecolor('#f5f5f5')
-    _plot_lakes(ax, network.boundary)
-
-    segs     = _clip_to_boundary(network.segments, network.boundary)
+    if show_outside:
+        _plot_lakes(ax, extent=extent)
+    else:
+        _plot_lakes(ax, boundary=network.boundary)
 
     GAUGE_LABELS = {
         1435: '1435 mm (Standard)',
@@ -1069,17 +1218,46 @@ def plot_gauge_map(
         600:  '600 mm',
     }
 
+    segs_all = _clip_to_extent(network.segments, extent)
+    segs_in  = (_clip_to_boundary(network.segments, network.boundary)
+                if (show_outside and network.boundary is not None
+                    and not network.boundary.empty)
+                else None)
+    segs     = _clip_to_boundary(network.segments, network.boundary)
+
     gauges_present = set()
-    if len(segs) > 0:
-        for gauge, color in GAUGE_COLORS.items():
-            mask = segs['gauge'] == gauge
-            if mask.any():
-                gauges_present.add(gauge)
-                segs[mask].plot(ax=ax, color=color, linewidth=2.5, alpha=0.85)
-        unknown = ~segs['gauge'].isin(GAUGE_COLORS)
-        if unknown.any():
-            segs[unknown].plot(ax=ax, color=GAUGE_DEFAULT, linewidth=2, alpha=0.7)
-            gauges_present.add('unknown')
+    if show_outside and segs_in is not None:
+        # Ghost pass
+        if len(segs_all) > 0:
+            for gauge, color in GAUGE_COLORS.items():
+                mask = segs_all['gauge'] == gauge
+                if mask.any():
+                    gauges_present.add(gauge)
+                    segs_all[mask].plot(ax=ax, color=color, linewidth=2.5, alpha=0.40)
+            unknown = ~segs_all['gauge'].isin(GAUGE_COLORS)
+            if unknown.any():
+                segs_all[unknown].plot(ax=ax, color=GAUGE_DEFAULT, linewidth=2, alpha=0.40)
+                gauges_present.add('unknown')
+        # Solid pass
+        if len(segs_in) > 0:
+            for gauge, color in GAUGE_COLORS.items():
+                mask = segs_in['gauge'] == gauge
+                if mask.any():
+                    segs_in[mask].plot(ax=ax, color=color, linewidth=2.5, alpha=1.0)
+            unknown = ~segs_in['gauge'].isin(GAUGE_COLORS)
+            if unknown.any():
+                segs_in[unknown].plot(ax=ax, color=GAUGE_DEFAULT, linewidth=2, alpha=1.0)
+    else:
+        if len(segs) > 0:
+            for gauge, color in GAUGE_COLORS.items():
+                mask = segs['gauge'] == gauge
+                if mask.any():
+                    gauges_present.add(gauge)
+                    segs[mask].plot(ax=ax, color=color, linewidth=2.5, alpha=0.85)
+            unknown = ~segs['gauge'].isin(GAUGE_COLORS)
+            if unknown.any():
+                segs[unknown].plot(ax=ax, color=GAUGE_DEFAULT, linewidth=2, alpha=0.7)
+                gauges_present.add('unknown')
 
     legend = []
     for gauge, color in GAUGE_COLORS.items():
@@ -1107,25 +1285,55 @@ def plot_electrification_map(
     output_path: Optional[Path] = None,
     title: Optional[str] = None,
     figsize: Tuple[int, int] = (16, 12),
+    show_outside: bool = False,
+    is_catchment: bool = False,
 ) -> plt.Figure:
     """OpenRailwayMap-style electrification map (English legend, German-value-aware)."""
     if title is None:
         title = f"Electrification — {network.version}"
     fig, ax = _base_plot(network, title, figsize, extent=extent)
     ax.set_facecolor('#f5f5f5')
-    _plot_lakes(ax, network.boundary)
 
+    if show_outside:
+        _plot_lakes(ax, extent=extent)
+    else:
+        _plot_lakes(ax, boundary=network.boundary)
+
+    segs_all = _clip_to_extent(network.segments, extent)
+    segs_in  = (_clip_to_boundary(network.segments, network.boundary)
+                if (show_outside and network.boundary is not None and not network.boundary.empty)
+                else None)
     segs     = _clip_to_boundary(network.segments, network.boundary)
 
     cats_present = set()
-    if len(segs) > 0 and 'electrification' in segs.columns:
-        elec_cat = segs['electrification'].apply(_classify_electrification)
-        for cat, color in ELECTRIFICATION_COLORS.items():
-            mask = elec_cat == cat
-            if mask.any():
-                cats_present.add(cat)
-                lw = 2 if cat == 'no_electrification' else 3
-                segs[mask].plot(ax=ax, color=color, linewidth=lw, alpha=0.85, zorder=2)
+    
+    if show_outside and segs_in is not None:
+        if len(segs_all) > 0 and 'electrification' in segs_all.columns:
+            elec_cat_all = segs_all['electrification'].apply(_classify_electrification)
+            for cat, color in ELECTRIFICATION_COLORS.items():
+                mask = elec_cat_all == cat
+                if mask.any():
+                    cats_present.add(cat)
+                    lw = 2 if cat == 'no_electrification' else 3
+                    segs_all[mask].plot(ax=ax, color=color, linewidth=lw, alpha=0.40, zorder=2)
+                    
+        if len(segs_in) > 0 and 'electrification' in segs_in.columns:
+            elec_cat_in = segs_in['electrification'].apply(_classify_electrification)
+            for cat, color in ELECTRIFICATION_COLORS.items():
+                mask = elec_cat_in == cat
+                if mask.any():
+                    cats_present.add(cat)
+                    lw = 2 if cat == 'no_electrification' else 3
+                    segs_in[mask].plot(ax=ax, color=color, linewidth=lw, alpha=0.85, zorder=3)
+    else:
+        if len(segs) > 0 and 'electrification' in segs.columns:
+            elec_cat = segs['electrification'].apply(_classify_electrification)
+            for cat, color in ELECTRIFICATION_COLORS.items():
+                mask = elec_cat == cat
+                if mask.any():
+                    cats_present.add(cat)
+                    lw = 2 if cat == 'no_electrification' else 3
+                    segs[mask].plot(ax=ax, color=color, linewidth=lw, alpha=0.85, zorder=2)
 
 
     legend = [
@@ -1153,13 +1361,19 @@ def plot_construct_type_map(
     output_path: Optional[Path] = None,
     title: Optional[str] = None,
     figsize: Tuple[int, int] = (16, 12),
+    show_outside: bool = False,
+    is_catchment: bool = False,
 ) -> plt.Figure:
     """Tunnel / bridge / gallery construct type map."""
     if title is None:
         title = f"Construct Type — {network.version}"
     fig, ax = _base_plot(network, title, figsize, extent=extent)
     ax.set_facecolor('#f5f5f5')
-    _plot_lakes(ax, network.boundary)
+    
+    if show_outside:
+        _plot_lakes(ax, extent=extent)
+    else:
+        _plot_lakes(ax, boundary=network.boundary)
 
     segs     = _clip_to_boundary(network.segments, network.boundary)
 
@@ -1204,16 +1418,64 @@ def plot_construct_type_map(
 # Canonical Infrastructure Plot
 # =============================================================================
 
-_TRACK_SPACING_M = 15   # metres between parallel track centre lines in map coords
+class _MultiTrackLegendHandle:
+    """Placeholder object for rendering multi-track legend entries."""
+
+    def __init__(self, total_width: float, track_count: int, color: str = "black"):
+        self.total_width = total_width
+        self.track_count = track_count
+        self.color = color
+
+
+class _MultiTrackLegendHandler(HandlerBase):
+    """Custom legend handler that renders multiple parallel lines for tracks."""
+
+    def create_artists(
+        self,
+        legend,
+        orig_handle: "_MultiTrackLegendHandle",
+        xdescent,
+        ydescent,
+        width,
+        height,
+        fontsize,
+        trans,
+    ):
+        x0 = xdescent
+        x1 = xdescent + width
+        y = ydescent + height / 2.0
+
+        track_count = orig_handle.track_count
+        gap_factor = 0.4
+        
+        if track_count == 1:
+            individual_line_width = orig_handle.total_width
+            line_spacing = 0
+        else:
+            individual_line_width = orig_handle.total_width / (track_count + (track_count - 1) * gap_factor)
+            line_spacing = individual_line_width * (1 + gap_factor)
+
+        artists = []
+        for track_idx in range(track_count):
+            offset_y = y + (track_idx - (track_count - 1) / 2.0) * line_spacing
+            line = Line2D([x0, x1], [offset_y, offset_y], color=orig_handle.color, linewidth=individual_line_width, solid_capstyle="round")
+            line.set_transform(trans)
+            artists.append(line)
+
+        return artists
+
+
+_TRACK_SPACING_M_CA = 140   # CA track spacing
+_TRACK_SPACING_M_SA = 60    # SA track spacing
 
 
 def _draw_parallel_tracks(ax, geom, num_tracks: int,
-                           color: str = 'black', linewidth: float = 0.7) -> None:
+                           color: str = 'black', linewidth: float = 1.05, alpha: float = 1.0, zorder: int = 3, track_spacing_m: float = 30, linestyle: str = 'solid') -> None:
     """Draw num_tracks parallel offset lines for one segment geometry."""
     if num_tracks <= 0 or geom is None or geom.is_empty:
         return
     sub_lines = list(geom.geoms) if geom.geom_type == 'MultiLineString' else [geom]
-    offsets = [(i - (num_tracks - 1) / 2) * _TRACK_SPACING_M
+    offsets = [(i - (num_tracks - 1) / 2) * track_spacing_m
                for i in range(num_tracks)]
 
     for line in sub_lines:
@@ -1239,8 +1501,8 @@ def _draw_parallel_tracks(ax, geom, num_tracks: int,
             for part in parts:
                 if not part.is_empty and len(part.coords) >= 2:
                     xs, ys = zip(*[(c[0], c[1]) for c in part.coords])
-                    ax.plot(xs, ys, color=color, linewidth=linewidth,
-                            solid_capstyle='butt', zorder=3)
+                    ax.plot(xs, ys, color=color, linewidth=linewidth, linestyle=linestyle,
+                            solid_capstyle='butt', alpha=alpha, zorder=zorder)
 
 
 def plot_infrastructure_canonical(
@@ -1251,67 +1513,144 @@ def plot_infrastructure_canonical(
     figsize: Tuple[int, int] = (16, 12),
     show_labels: bool = True,
     is_catchment: bool = False,
+    show_outside: bool = False,
 ) -> plt.Figure:
     """Infrastructure overview: black parallel tracks by count,
     white station circles with CODE labels."""
     if title is None:
         title = f"Infrastructure — {network.version}"
     fig, ax = _base_plot(network, title, figsize, extent=extent)
-    _plot_lakes(ax, network.boundary)
+    if show_outside:
+        _plot_lakes(ax, extent=extent)
+    else:
+        _plot_lakes(ax, boundary=network.boundary)
 
+    segs_all = _clip_to_extent(network.segments, extent)
+    segs_in  = (_clip_to_boundary(network.segments, network.boundary)
+                if (show_outside and network.boundary is not None and not network.boundary.empty)
+                else None)
     segs  = _clip_to_boundary(network.segments, network.boundary)
-    nodes = _clip_to_boundary(network.nodes,    network.boundary)
 
-    # Segments as black parallel lines (one line per track)
-    if len(segs) > 0:
-        for _, row in segs.iterrows():
-            n = int(row.get('num_tracks', 1) or 1)
-            n = max(1, min(n, 6))
-            _draw_parallel_tracks(ax, row.geometry, n)
+    tracks_present = set()
 
-    # Stations: white fill, black outline
-    if len(nodes) > 0:
-        stations = nodes[nodes['node_class'] == 'station']
-        if is_catchment:
-            if 'transport_mode' in stations.columns:
-                stations = stations[stations['transport_mode'].astype(str).str.contains('train', na=False)]
-            markersize = 10
-        else:
-            markersize = 60
+    # Segments as back parallel lines (one line per track)
+    if show_outside and segs_in is not None:
+        if len(segs_all) > 0:
+            for _, row in segs_all.iterrows():
+                n = int(row.get('num_tracks', 1) or 1)
+                n = max(1, min(n, 4))
+                tracks_present.add(n)
+                _draw_parallel_tracks(ax, row.geometry, n, color='black', alpha=0.40, zorder=2, track_spacing_m=_TRACK_SPACING_M_CA if is_catchment else _TRACK_SPACING_M_SA)
+        if len(segs_in) > 0:
+            for _, row in segs_in.iterrows():
+                n = int(row.get('num_tracks', 1) or 1)
+                n = max(1, min(n, 4))
+                tracks_present.add(n)
+                _draw_parallel_tracks(ax, row.geometry, n, color='black', alpha=1.0, zorder=3, track_spacing_m=_TRACK_SPACING_M_CA if is_catchment else _TRACK_SPACING_M_SA)
+    else:
+        if len(segs) > 0:
+            for _, row in segs.iterrows():
+                n = int(row.get('num_tracks', 1) or 1)
+                n = max(1, min(n, 4))
+                tracks_present.add(n)
+                _draw_parallel_tracks(ax, row.geometry, n, color='black', alpha=1.0, zorder=3, track_spacing_m=_TRACK_SPACING_M_CA if is_catchment else _TRACK_SPACING_M_SA)
 
-        if len(stations) > 0:
-            stations.plot(ax=ax, facecolor='white', edgecolor='black',
-                          markersize=markersize, marker='o', linewidth=1.2, zorder=5)
-            if show_labels:
-                for _, row in stations.iterrows():
-                    code = row.get('CODE', '')
-                    if pd.notna(code) and str(code).strip():
-                        ax.annotate(
-                            str(code),
-                            xy=(row.geometry.x, row.geometry.y),
-                            xytext=(5, 5), textcoords='offset points',
-                            fontsize=7, fontweight='bold',
-                            bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
-                                      edgecolor='none', alpha=0.7),
-                            zorder=6,
-                        )
+    # Nodes: three layers via _classify_nodes
+    ts_all, tf_all, jn_all = _classify_nodes(network.nodes)
+
+    if show_outside and network.boundary is not None and not network.boundary.empty:
+        nodes_in    = _clip_to_boundary(network.nodes, network.boundary)
+        ts_in, tf_in, jn_in = _classify_nodes(nodes_in)
+        # Ghost pass — full network at 40%
+        _ms_ts = 20  if is_catchment else 60
+        _ms_tf = 5   if is_catchment else 25
+        _ms_jn = 5  if is_catchment else 5
         
-        if not is_catchment:
-            # Other nodes: small grey circles
-            others = nodes[nodes['node_class'] != 'station']
-            if len(others) > 0:
-                others.plot(ax=ax, color='#888888', markersize=15, marker='o', zorder=4)
+        if len(ts_all) > 0:
+            ts_all.plot(ax=ax, facecolor='white', edgecolor='black',
+                        markersize=_ms_ts, marker='o', linewidth=1.2,
+                        alpha=0.40, zorder=4)
+        if len(tf_all) > 0:
+            tf_all.plot(ax=ax, facecolor='black', edgecolor='black',
+                        markersize=_ms_tf, marker='o', linewidth=0.8,
+                        alpha=0.40, zorder=4)
+        if len(jn_all) > 0:
+            jn_all.plot(ax=ax, color='#888888', markersize=_ms_jn, marker='o',
+                        alpha=0.40, zorder=3)
+        # Solid pass — clipped network at full opacity
+        ts_draw, tf_draw, jn_draw = ts_in, tf_in, jn_in
+    else:
+        nodes_disp = _clip_to_boundary(network.nodes, network.boundary)
+        ts_draw, tf_draw, jn_draw = _classify_nodes(nodes_disp)
 
-    legend = [
-        Line2D([0], [0], color='black', linewidth=1.0, label='Single track'),
-        Line2D([0], [0], color='black', linewidth=2.0,
-               label='Multi-track (parallel lines)'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='white',
-               markeredgecolor='black', markersize=8, label='Station (CODE label)'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='#888888',
-               markersize=5, label='Junction / other node'),
-    ]
-    ax.legend(handles=legend, loc='upper right', fontsize=8)
+    _ms_ts = 20  if is_catchment else 60
+    _ms_tf = 5   if is_catchment else 25
+    _ms_jn = 5  if is_catchment else 5
+
+    if len(ts_draw) > 0:
+        ts_draw.plot(ax=ax, facecolor='white', edgecolor='black',
+                     markersize=_ms_ts, marker='o', linewidth=1.2,
+                     alpha=1.0, zorder=5)
+        if show_labels and not is_catchment:
+            for _, row in ts_draw.iterrows():
+                code = row.get('CODE', '')
+                if pd.notna(code) and str(code).strip():
+                    ax.annotate(
+                        str(code),
+                        xy=(row.geometry.x, row.geometry.y),
+                        xytext=(5, 5), textcoords='offset points',
+                        fontsize=7, fontweight='bold',
+                        bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
+                                  edgecolor='none', alpha=0.7),
+                        zorder=6,
+                    )
+
+    if len(tf_draw) > 0:
+        tf_draw.plot(ax=ax, facecolor='black', edgecolor='black',
+                     markersize=_ms_tf, marker='o', linewidth=0.8,
+                     alpha=1.0, zorder=5)
+
+    if len(jn_draw) > 0:
+        jn_draw.plot(ax=ax, color='#888888', markersize=_ms_jn, marker='o',
+                     alpha=1.0, zorder=4)
+
+    legend = []
+    handler_map = {}
+    
+    # Add track styles based on what was plotted
+    for n in sorted(tracks_present):
+        label_text = f'{n} track{"s" if n > 1 else ""}'
+        if n == 4:
+            label_text = '4+ tracks'
+        
+        # Increase total visual width for handler map sizing
+        agg_linewidth = 1.5 if n == 1 else n * 1.35 
+        handle = Line2D([0], [0], color='black', linewidth=agg_linewidth, label=label_text)
+        legend.append(handle)
+        handler_map[handle] = _MultiTrackLegendHandler()
+        handle.track_count = n
+        handle.total_width = agg_linewidth
+        handle.color = 'black'
+        
+    has_ts = len(ts_all) > 0 if show_outside else len(ts_draw) > 0
+    if has_ts:
+        legend.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='white',
+                             markeredgecolor='black', markersize=8, label='Train station'))
+    
+    has_tf = len(tf_all) > 0 if show_outside else len(tf_draw) > 0
+    if has_tf:
+        legend.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='black',
+                             markeredgecolor='black', markersize=6, label='Tram / Funicular'))
+
+    has_jn = len(jn_all) > 0 if show_outside else len(jn_draw) > 0
+    if has_jn:
+        legend.append(
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='#888888',
+                   markersize=5, label='Junction / turning loop')
+        )
+    
+    if legend:
+        ax.legend(handles=legend, handler_map=handler_map, loc='upper right', fontsize=8)
     _add_north_arrow(ax)
     _add_scale_bar(ax)
     plt.tight_layout()
@@ -1329,11 +1668,12 @@ def plot_infrastructure_canonical(
 _CONSTRUCT_TRACK_COLOR  = '#FF6600'   # orange — OpenRailwayMap track colour
 _CONSTRUCT_BRIDGE_RAIL  = '#000000'   # black border lines for bridges
 _CONSTRUCT_PORTAL_COLOR = '#000000'   # black portal bars for tunnels
-_PORTAL_BAR_M  = 30                   # perpendicular portal bar length (m)
-_BRIDGE_OFFSET_M = 8                  # offset of bridge border lines from centre (m)
+_BRIDGE_OFFSET_M = 30                 # offset of bridge border lines from centre (m)
+_PORTAL_BAR_M  = 4 * _BRIDGE_OFFSET_M # = 120 m — portal spans 4× bridge half-width
 
 
-def _draw_geom(ax, geom, color, linewidth, linestyle='solid', zorder=3) -> None:
+def _draw_geom(ax, geom, color, linewidth, linestyle='solid', zorder=3,
+               alpha: float = 1.0) -> None:
     """Draw a LineString or MultiLineString on ax."""
     if geom is None or geom.is_empty:
         return
@@ -1342,10 +1682,10 @@ def _draw_geom(ax, geom, color, linewidth, linestyle='solid', zorder=3) -> None:
         if not part.is_empty and len(part.coords) >= 2:
             xs, ys = zip(*part.coords)
             ax.plot(xs, ys, color=color, linewidth=linewidth, linestyle=linestyle,
-                    solid_capstyle='butt', zorder=zorder)
+                    solid_capstyle='butt', zorder=zorder, alpha=alpha)
 
 
-def _draw_tunnel_portals(ax, geom) -> None:
+def _draw_tunnel_portals(ax, geom, num_tracks: int = 1, track_spacing_m: float = 60, alpha: float = 1.0, zorder: int = 6) -> None:
     """Draw perpendicular portal bars at both ends of a tunnel piece."""
     if geom is None or geom.is_empty:
         return
@@ -1356,19 +1696,33 @@ def _draw_tunnel_portals(ax, geom) -> None:
     if len(all_coords) < 2:
         return
 
-    for pt, ref in ((all_coords[0], all_coords[1]),
-                    (all_coords[-1], all_coords[-2])):
+    for i, (pt, ref) in enumerate(((all_coords[0], all_coords[1]),
+                                   (all_coords[-1], all_coords[-2]))):
         dx, dy = ref[0] - pt[0], ref[1] - pt[1]
         length = math.sqrt(dx * dx + dy * dy)
         if length < 1e-6:
             continue
-        px, py = -dy / length, dx / length          # perpendicular unit vector
-        half = _PORTAL_BAR_M / 2
+        ux, uy = dx / length, dy / length          # Inward pointing unit vector
+        px, py = -uy, ux                           # Perpendicular
+        
+        width = (num_tracks - 1) * track_spacing_m + 2 * _BRIDGE_OFFSET_M
+        h = width / 2.0
+        depth = width / 3.0
+        
+        p1 = (pt[0] - px * h - ux * depth, pt[1] - py * h - uy * depth)
+        p2 = (pt[0] - px * h, pt[1] - py * h)
+        p3 = (pt[0] + px * h, pt[1] + py * h)
+        p4 = (pt[0] + px * h - ux * depth, pt[1] + py * h - uy * depth)
+
         ax.plot(
-            [pt[0] - px * half, pt[0] + px * half],
-            [pt[1] - py * half, pt[1] + py * half],
+            [p1[0], p2[0]], [p1[1], p2[1]],
             color=_CONSTRUCT_PORTAL_COLOR, linewidth=2.5,
-            solid_capstyle='butt', zorder=6,
+            solid_capstyle='butt', zorder=zorder, alpha=alpha,
+        )
+        ax.plot(
+            [p3[0], p4[0]], [p3[1], p4[1]],
+            color=_CONSTRUCT_PORTAL_COLOR, linewidth=2.5,
+            solid_capstyle='butt', zorder=zorder, alpha=alpha,
         )
 
 
@@ -1379,6 +1733,7 @@ def plot_construction_components(
     output_path: Optional[Path] = None,
     title: Optional[str] = None,
     figsize: Tuple[int, int] = (16, 12),
+    show_outside: bool = False,
 ) -> plt.Figure:
     """Study-area construction components map (OpenRailwayMap-inspired).
 
@@ -1387,13 +1742,26 @@ def plot_construction_components(
     Tunnel  — dashed orange track + perpendicular portal bar at each end
     Gallery — same treatment as tunnel
     """
+    composition_all = gpd.GeoDataFrame()
+    composition_in = None
     if not composition.empty:
+        if 'num_tracks' not in composition.columns and 'segment_id' in composition.columns and not network.segments.empty:
+            composition = composition.merge(network.segments[['segment_id', 'num_tracks']], on='segment_id', how='left')
+
+        composition_all = composition.copy()
+        composition_in = (_clip_to_boundary(composition, network.boundary)
+                          if show_outside and network.boundary is not None and not network.boundary.empty
+                          else None)
         composition = _clip_to_boundary(composition, network.boundary)
 
     if title is None:
         title = f"Construction Components — {network.version}"
     fig, ax = _base_plot(network, title, figsize, extent=extent)
-    _plot_lakes(ax, network.boundary)
+
+    if show_outside:
+        _plot_lakes(ax, extent=extent)
+    else:
+        _plot_lakes(ax, boundary=network.boundary)
 
     legend_handles: list = []
     legend_seen:    set  = set()
@@ -1406,79 +1774,140 @@ def plot_construction_components(
                        linestyle=ls, label=label)
             )
 
-    if not composition.empty and 'construct_type' in composition.columns:
-        for _, piece in composition.iterrows():
+    def _plot_comp_pass(comp_df, alpha, z_base):
+        if comp_df.empty or 'construct_type' not in comp_df.columns:
+            return
+        for _, piece in comp_df.iterrows():
             geom  = piece.geometry
             if geom is None or geom.is_empty:
                 continue
             ctype = str(piece.get('construct_type', 'normal')).lower()
+            try:
+                nt = piece.get('num_tracks', 1)
+                num_tracks = int(float(nt)) if pd.notna(nt) else 1
+            except (ValueError, TypeError):
+                num_tracks = 1
+            num_tracks = max(1, min(num_tracks, 4))
+            
+            # Construct type map only generated for sa
+            track_dist = _TRACK_SPACING_M_SA 
 
             if ctype == 'normal':
-                _draw_geom(ax, geom, _CONSTRUCT_TRACK_COLOR, 1.5, zorder=3)
-                _add_legend('Normal track', _CONSTRUCT_TRACK_COLOR, 2)
+                _draw_parallel_tracks(ax, geom, num_tracks, color=_CONSTRUCT_TRACK_COLOR, linewidth=1.1, zorder=z_base, alpha=alpha, track_spacing_m=track_dist)
+                if alpha == 1.0: _add_legend('Normal track', _CONSTRUCT_TRACK_COLOR, 2)
 
             elif ctype == 'bridge':
-                _draw_geom(ax, geom, _CONSTRUCT_TRACK_COLOR, 1.5, zorder=4)
+                _draw_parallel_tracks(ax, geom, num_tracks, color=_CONSTRUCT_TRACK_COLOR, linewidth=1.1, zorder=z_base+1, alpha=alpha, track_spacing_m=track_dist)
+                
+                # Push the bridge rail to the extremeties of the N tracks
+                outer_offset = ((num_tracks - 1) / 2.0) * track_dist + _BRIDGE_OFFSET_M
                 for side in ('left', 'right'):
                     try:
-                        sub_lines = (list(geom.geoms)
-                                     if geom.geom_type == 'MultiLineString'
-                                     else [geom])
+                        sub_lines = list(geom.geoms) if geom.geom_type == 'MultiLineString' else [geom]
                         for sub in sub_lines:
-                            border = sub.parallel_offset(
-                                _BRIDGE_OFFSET_M, side,
-                                resolution=8, join_style=2, mitre_limit=5,
-                            )
-                            if border is not None and not border.is_empty:
-                                _draw_geom(ax, border, _CONSTRUCT_BRIDGE_RAIL,
-                                           1.5, zorder=5)
+                            border = sub.parallel_offset(outer_offset, side, resolution=8, join_style=2, mitre_limit=5)
+                            if border and not border.is_empty:
+                                _draw_geom(ax, border, _CONSTRUCT_BRIDGE_RAIL, 1.0, zorder=z_base+2, alpha=alpha)
                     except Exception:
                         pass
-                _add_legend('Bridge (track)', _CONSTRUCT_TRACK_COLOR, 2)
-                if 'Bridge (border)' not in legend_seen:
-                    legend_seen.add('Bridge (border)')
-                    legend_handles.append(
-                        Line2D([0], [0], color=_CONSTRUCT_BRIDGE_RAIL,
-                               linewidth=1.5, label='Bridge (border rail)')
-                    )
+                if alpha == 1.0:
+                    _add_legend('Bridge (track)', _CONSTRUCT_TRACK_COLOR, 2)
+                    if 'Bridge (border)' not in legend_seen:
+                        legend_seen.add('Bridge (border)')
+                        legend_handles.append(
+                            Line2D([0], [0], color=_CONSTRUCT_BRIDGE_RAIL,
+                                   linewidth=2.0, label='Bridge (border rail)')
+                        )
 
             elif ctype in ('tunnel', 'gallery'):
-                _draw_geom(ax, geom, _CONSTRUCT_TRACK_COLOR, 1.5,
-                           linestyle='dashed', zorder=3)
-                _draw_tunnel_portals(ax, geom)
-                lbl = 'Tunnel' if ctype == 'tunnel' else 'Gallery'
-                _add_legend(lbl, _CONSTRUCT_TRACK_COLOR, 2, ls='dashed')
+                _draw_parallel_tracks(ax, geom, num_tracks, color=_CONSTRUCT_TRACK_COLOR, linewidth=1.1,
+                           linestyle='dashed', zorder=z_base, alpha=alpha, track_spacing_m=track_dist)
+                _draw_tunnel_portals(ax, geom, num_tracks=num_tracks, track_spacing_m=track_dist, alpha=alpha, zorder=z_base+3)
+                if alpha == 1.0:
+                    lbl = 'Tunnel' if ctype == 'tunnel' else 'Gallery'
+                    _add_legend(lbl, _CONSTRUCT_TRACK_COLOR, 2, ls='dashed')
 
             else:
-                _draw_geom(ax, geom, '#888888', 1.2, zorder=2)
+                _draw_parallel_tracks(ax, geom, num_tracks, color='#888888', linewidth=1.2, zorder=max(1, z_base-1), alpha=alpha, track_spacing_m=track_dist)
 
+    if show_outside and composition_in is not None:
+        _plot_comp_pass(composition_all, alpha=0.40, z_base=2)
+        _plot_comp_pass(composition_in, alpha=1.0, z_base=10)
+    elif not composition.empty and 'construct_type' in composition.columns:
+        _plot_comp_pass(composition, alpha=1.0, z_base=3)
     else:
         if len(network.segments) > 0:
             network.segments.plot(ax=ax, color='#888888', linewidth=1.2, zorder=2)
         print("  Warning: no composition data — falling back to plain segment plot.")
 
     # Stations overlay
-    if len(network.nodes) > 0:
-        stations = network.nodes[network.nodes['node_class'] == 'station']
-        if len(stations) > 0:
-            stations.plot(ax=ax, facecolor='white', edgecolor='black',
-                          markersize=60, marker='o', linewidth=1.2, zorder=7)
-            for _, row in stations.iterrows():
-                code = row.get('CODE', '')
-                if pd.notna(code) and str(code).strip():
-                    ax.annotate(
-                        str(code),
-                        xy=(row.geometry.x, row.geometry.y),
-                        xytext=(5, 5), textcoords='offset points',
-                        fontsize=7, fontweight='bold',
-                        bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
-                                  edgecolor='none', alpha=0.7),
-                        zorder=8,
-                    )
-    legend_handles.append(
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='white',
-               markeredgecolor='black', markersize=8, label='Station')
-    )
+    _ms_ts, _ms_tf, _ms_jn = 60, 20, 10
+    
+    ts_all, tf_all, jn_all = _classify_nodes(network.nodes)
+    if show_outside and network.boundary is not None and not network.boundary.empty:
+        ts_draw = _clip_to_boundary(ts_all, network.boundary)
+        tf_draw = _clip_to_boundary(tf_all, network.boundary)
+        jn_draw = _clip_to_boundary(jn_all, network.boundary)
+        
+        # Ghost pass — full network at 40%
+        if len(ts_all) > 0:
+            ts_all.plot(ax=ax, facecolor='white', edgecolor='black',
+                        markersize=_ms_ts, marker='o', linewidth=1.2,
+                        alpha=0.40, zorder=14)
+        if len(tf_all) > 0:
+            tf_all.plot(ax=ax, facecolor='black', edgecolor='black',
+                        markersize=_ms_tf, marker='o', linewidth=0.8,
+                        alpha=0.40, zorder=14)
+        if len(jn_all) > 0:
+            jn_all.plot(ax=ax, color='#888888', markersize=_ms_jn, marker='o',
+                        alpha=0.40, zorder=13)
+    else:
+        nodes_disp = _clip_to_boundary(network.nodes, network.boundary)
+        ts_draw, tf_draw, jn_draw = _classify_nodes(nodes_disp)
+        
+    if len(ts_draw) > 0:
+        ts_draw.plot(ax=ax, facecolor='white', edgecolor='black',
+                     markersize=_ms_ts, marker='o', linewidth=1.2,
+                     alpha=1.0, zorder=16)
+        for _, row in ts_draw.iterrows():
+            code = row.get('CODE', '')
+            if pd.notna(code) and str(code).strip():
+                ax.annotate(
+                    str(code),
+                    xy=(row.geometry.x, row.geometry.y),
+                    xytext=(5, 5), textcoords='offset points',
+                    fontsize=7, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
+                              edgecolor='none', alpha=0.7),
+                    zorder=17,
+                )
+
+    if len(tf_draw) > 0:
+        tf_draw.plot(ax=ax, facecolor='black', edgecolor='black',
+                     markersize=_ms_tf, marker='o', linewidth=0.8,
+                     alpha=1.0, zorder=16)
+
+    if len(jn_draw) > 0:
+        jn_draw.plot(ax=ax, color='#888888', markersize=_ms_jn, marker='o',
+                     alpha=1.0, zorder=15)
+
+    # Adding legends for nodes
+    has_ts = len(ts_all) > 0 if show_outside else len(ts_draw) > 0
+    if has_ts:
+        legend_handles.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='white',
+                             markeredgecolor='black', markersize=8, label='Train station'))
+    
+    has_tf = len(tf_all) > 0 if show_outside else len(tf_draw) > 0
+    if has_tf:
+        legend_handles.append(Line2D([0], [0], marker='o', color='w', markerfacecolor='black',
+                             markeredgecolor='black', markersize=6, label='Tram / Funicular'))
+
+    has_jn = len(jn_all) > 0 if show_outside else len(jn_draw) > 0
+    if has_jn:
+        legend_handles.append(
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='#888888',
+                   markersize=5, label='Junction / turning loop')
+        )
     ax.legend(handles=legend_handles, loc='upper right', fontsize=8)
     _add_north_arrow(ax)
     _add_scale_bar(ax)
@@ -1502,19 +1931,29 @@ def plot_owner_map(
     output_path: Optional[Path] = None,
     title: Optional[str] = None,
     figsize: Tuple[int, int] = (16, 12),
+    show_outside: bool = False,
+    is_catchment: bool = False,
 ) -> plt.Figure:
     import matplotlib.cm as cm
     
     if title is None:
         title = f"Owner Map - {network.version}"
     fig, ax = _base_plot(network, title, figsize, extent=extent)
-    _plot_lakes(ax, network.boundary)
-
-    segs = _clip_to_boundary(network.segments, network.boundary)
     
-    if len(segs) > 0 and 'route_owner' in segs.columns:
-        unique_owners = segs['route_owner'].dropna().unique()
-        
+    if show_outside:
+        _plot_lakes(ax, extent=extent)
+    else:
+        _plot_lakes(ax, boundary=network.boundary)
+
+    segs_all = _clip_to_extent(network.segments, extent)
+    segs_in  = (_clip_to_boundary(network.segments, network.boundary)
+                if (show_outside and network.boundary is not None and not network.boundary.empty)
+                else None)
+    segs = _clip_to_boundary(network.segments, network.boundary)
+
+    if len(segs_all) > 0 and 'route_owner' in segs_all.columns:
+        unique_owners = segs_all['route_owner'].dropna().unique()
+
         cmap = plt.get_cmap('tab20')
         colors = {}
         idx = 0
@@ -1524,13 +1963,31 @@ def plot_owner_map(
             else:
                 colors[o] = cmap(idx % 20)
                 idx += 1
-            
-        for owner, color in colors.items():
-            mask = segs['route_owner'] == owner
-            if mask.any():
-                segs[mask].plot(ax=ax, color=color, linewidth=2, alpha=0.8, zorder=2)
 
-        legend = [Line2D([0], [0], color=col, linewidth=2, label=str(own)) for own, col in colors.items()]
+        plotted_owners = set()
+        
+        if show_outside and segs_in is not None:
+            for owner, color in colors.items():
+                mask_all = segs_all['route_owner'] == owner
+                if mask_all.any():
+                    plotted_owners.add(owner)
+                    segs_all[mask_all].plot(ax=ax, color=color, linewidth=2, alpha=0.40, zorder=2)
+                    
+            if len(segs_in) > 0:
+                for owner, color in colors.items():
+                    mask_in = segs_in['route_owner'] == owner
+                    if mask_in.any():
+                        plotted_owners.add(owner)
+                        segs_in[mask_in].plot(ax=ax, color=color, linewidth=2, alpha=0.8, zorder=3)
+        else:
+            if len(segs) > 0:
+                for owner, color in colors.items():
+                    mask = segs['route_owner'] == owner
+                    if mask.any():
+                        plotted_owners.add(owner)
+                        segs[mask].plot(ax=ax, color=color, linewidth=2, alpha=0.8, zorder=2)
+
+        legend = [Line2D([0], [0], color=colors[own], linewidth=2, label=str(own)) for own in sorted(plotted_owners, key=lambda x: str(x))]
         if len(legend) <= 40:
             ax.legend(handles=legend, loc='upper right', fontsize=8, ncol=2)
             
@@ -1601,9 +2058,9 @@ if __name__ == "__main__":
     print("[Step 0 / Q2]  Which plots to generate?")
     print("─" * 60)
     print("\n  Catchment area (extent = catchment_area_boundary):")
-    print("    Infrastructure · Gauge · Electrification")
+    print("    Infrastructure · Gauge · Electrification · Track Owner")
     print("  Study area (extent = study_area_boundary):")
-    print("    Infrastructure · Gauge · Electrification · Construction components")
+    print("    Infrastructure · Gauge · Electrification · Track Owner · Construction components")
     print("\n  Options:")
     print("    1) All")
     print("    2) Catchment area only")
@@ -1621,9 +2078,11 @@ if __name__ == "__main__":
         ('ca_infra',     'Catchment — Infrastructure'),
         ('ca_gauge',     'Catchment — Gauge'),
         ('ca_elec',      'Catchment — Electrification'),
+        ('ca_owner',     'Catchment — Track Owner'),
         ('sa_infra',     'Study area — Infrastructure'),
         ('sa_gauge',     'Study area — Gauge'),
         ('sa_elec',      'Study area — Electrification'),
+        ('sa_owner',     'Study area — Track Owner'),
         ('sa_construct', 'Study area — Construction components'),
     ]
     _CA_KEYS = [k for k, _ in _ALL_PLOTS if k.startswith('ca_')]
@@ -1762,12 +2221,16 @@ if __name__ == "__main__":
                          'ca_gauge.pdf'),
             'ca_elec':  (plot_electrification_map,      _net_ca, _ca_ext,
                          'ca_electrification.pdf'),
+            'ca_owner': (plot_owner_map,                _net_ca, _ca_ext,
+                         'ca_owner.pdf'),
             'sa_infra': (plot_infrastructure_canonical, _net_sa, _sa_ext,
                          'sa_infrastructure.pdf'),
             'sa_gauge': (plot_gauge_map,                _net_sa, _sa_ext,
                          'sa_gauge.pdf'),
             'sa_elec':  (plot_electrification_map,      _net_sa, _sa_ext,
                          'sa_electrification.pdf'),
+            'sa_owner': (plot_owner_map,                _net_sa, _sa_ext,
+                         'sa_owner.pdf'),
         }
 
         for _pk in _plot_set:
@@ -1779,6 +2242,7 @@ if __name__ == "__main__":
                 _fig = plot_construction_components(
                     _net_sa, _composition, extent=_sa_ext,
                     output_path=_plot_dir / "sa_construction_components.pdf",
+                    show_outside=True,
                 )
                 plt.close(_fig)
             else:
@@ -1786,6 +2250,10 @@ if __name__ == "__main__":
                 print(f"  {_plot_label_map[_pk]} ...")
                 
                 kwargs = {}
+                if _pk.startswith('sa_'):
+                    kwargs['show_outside'] = True
+                if _pk.startswith('ca_'):
+                    kwargs['is_catchment'] = True
                 if _pk == 'ca_infra':
                     kwargs['show_labels'] = False
                 
