@@ -60,6 +60,7 @@ GTFS_TRANSIT_DIR = r"data/Network/GTFS_Timetable"
 BUS_LINES_DIR = r"data/Network/Buslines"
 FEEDER_LINES_DIR = r"data/Network/Feeder_Lines"
 RAIL_PROCESSED_DIR = r"data/Network/processed"
+EDGES_IN_CORRIDOR_GPKG = r"data/Network/processed/edges_in_corridor.gpkg"
 
 STUDY_AREA_DIR           = r"data/Study_Area"
 STUDY_AREA_BOUNDARY_GPKG = r"data/Study_Area/study_area_boundary.gpkg"

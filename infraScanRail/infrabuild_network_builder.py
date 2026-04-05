@@ -112,12 +112,9 @@ CONSTRUCT_COLORS = {
 CONSTRUCT_DEFAULT = '#808080'
 
 NODE_COLORS = {
-    'station':       '#FF0000',
-    'junction':      '#0000FF',
-    'turning_loop':  '#FFA500',
-    'junction_tram': '#00FF00',
-    'halt':          '#FF69B4',
-    'border':        '#808080',
+    'station':           '#FF0000',
+    'abandoned_station': '#888888',
+    'junction':          '#0000FF',
 }
 NODE_DEFAULT = '#AAAAAA'
 
@@ -206,10 +203,6 @@ def load_version(
 # Macroscopic Simplification
 # =============================================================================
 
-# Node classes always removed from the macroscopic network
-_MACRO_DROP_ALWAYS = {'freight_yard', 'operational_yard', 'depot', 'km_change', 'abandoned', 'turning_loop', 'service_point'}
-# Node classes removed only when degree < 3
-_MACRO_DROP_IF_LOW_DEGREE = {'switch'}
 
 
 def _sub_lines(geom):
@@ -302,7 +295,7 @@ def filter_macroscopic_nodes(
         degree[fn] += 1
         degree[tn] += 1
 
-    _MACRO_KEEP = {'station', 'junction', 'turning_loop'}
+    _MACRO_KEEP = {'station', 'junction', 'abandoned_station'}
 
     def _is_candidate(row) -> bool:
         nc   = str(row.get('node_class', ''))
@@ -608,7 +601,7 @@ def _nodes_maplayer_xml(layer_id: str, gpkg_relpath: str, display_name: str) -> 
       <rules key="{root_key}">\
         <rule key="{uuid.uuid4().hex}" filter="&quot;node_class&quot; = 'station' AND &quot;transport_mode&quot; LIKE '%train%'" label="Train Stations" symbol="0"/>\
         <rule key="{uuid.uuid4().hex}" filter="&quot;node_class&quot; = 'station' AND (&quot;transport_mode&quot; LIKE '%tram%' OR &quot;transport_mode&quot; LIKE '%funicular%' OR &quot;transport_mode&quot; LIKE '%cog_railway%')" label="Tram / Funicular" symbol="1"/>\
-        <rule key="{uuid.uuid4().hex}" filter="&quot;node_class&quot; IN ('junction', 'turning_loop')" label="Junctions" symbol="2"/>\
+        <rule key="{uuid.uuid4().hex}" filter="&quot;node_class&quot; = 'junction'" label="Junctions" symbol="2"/>\
       </rules>"""
 
     marker_xml = f"""\
@@ -890,9 +883,10 @@ def _classify_nodes(nodes: gpd.GeoDataFrame):
     """Split nodes GDF into (train_stations, tram_funicular, junctions).
 
     train_stations : node_class == 'station' AND transport_mode contains 'train'
+                     OR node_class == 'abandoned_station'
     tram_funicular : node_class == 'station' AND transport_mode contains
                      'tram', 'funicular', or 'cog_railway' (and NOT 'train')
-    junctions      : node_class in ('junction', 'turning_loop')
+    junctions      : node_class == 'junction'
     """
     if nodes is None or nodes.empty:
         empty = gpd.GeoDataFrame()
@@ -904,13 +898,14 @@ def _classify_nodes(nodes: gpd.GeoDataFrame):
           else pd.Series([''] * len(nodes), index=nodes.index))
 
     is_station = nc.astype(str) == 'station'
+    is_abandoned = nc.astype(str) == 'abandoned_station'
     has_train  = tm.astype(str).str.contains('train', na=False)
     has_tram_f = tm.astype(str).str.contains(
         'tram|funicular|cog_railway', na=False, regex=True)
 
-    train_stations = nodes[is_station & has_train]
+    train_stations = nodes[is_station & has_train | is_abandoned]
     tram_funicular = nodes[is_station & has_tram_f & ~has_train]
-    junctions      = nodes[nc.astype(str).isin(['junction', 'turning_loop'])]
+    junctions      = nodes[nc.astype(str) == 'junction']
     return train_stations, tram_funicular, junctions
 
 
@@ -1505,6 +1500,50 @@ def _draw_parallel_tracks(ax, geom, num_tracks: int,
                             solid_capstyle='butt', alpha=alpha, zorder=zorder)
 
 
+def _draw_parallel_tracks_mixed(
+    ax, geom, colors: list,
+    linewidth: float = 1.05, alpha: float = 1.0,
+    zorder: int = 3, track_spacing_m: float = 30,
+) -> None:
+    """Like _draw_parallel_tracks but each track gets its own colour.
+
+    len(colors) determines how many parallel lines are drawn.
+    The outermost track (last offset) gets the last colour — use this for the
+    diff track (green = gained, red = lost).
+    """
+    num_tracks = len(colors)
+    if num_tracks == 0 or geom is None or geom.is_empty:
+        return
+    sub_lines = list(geom.geoms) if geom.geom_type == 'MultiLineString' else [geom]
+    offsets = [(i - (num_tracks - 1) / 2) * track_spacing_m for i in range(num_tracks)]
+
+    for line in sub_lines:
+        if line.length < 1:
+            continue
+        for offset_m, color in zip(offsets, colors):
+            if abs(offset_m) < 0.01:
+                draw_line = line
+            else:
+                side = 'left' if offset_m > 0 else 'right'
+                try:
+                    draw_line = line.parallel_offset(
+                        abs(offset_m), side, resolution=8,
+                        join_style=2, mitre_limit=5,
+                    )
+                    if draw_line is None or draw_line.is_empty:
+                        draw_line = line
+                except Exception:
+                    draw_line = line
+
+            parts = (list(draw_line.geoms)
+                     if draw_line.geom_type == 'MultiLineString' else [draw_line])
+            for part in parts:
+                if not part.is_empty and len(part.coords) >= 2:
+                    xs, ys = zip(*[(c[0], c[1]) for c in part.coords])
+                    ax.plot(xs, ys, color=color, linewidth=linewidth,
+                            solid_capstyle='butt', alpha=alpha, zorder=zorder)
+
+
 def plot_infrastructure_canonical(
     network: NetworkData,
     extent=None,
@@ -1651,6 +1690,215 @@ def plot_infrastructure_canonical(
     
     if legend:
         ax.legend(handles=legend, handler_map=handler_map, loc='upper right', fontsize=8)
+    _add_north_arrow(ax)
+    _add_scale_bar(ax)
+    plt.tight_layout()
+
+    if output_path:
+        fig.savefig(output_path, bbox_inches='tight')
+        print(f"  Saved → {output_path}")
+    return fig
+
+
+# =============================================================================
+# Diff Plot
+# =============================================================================
+
+_DIFF_RED   = '#d62728'
+_DIFF_GREEN = '#2ca02c'
+_DIFF_GREY  = '#aaaaaa'
+
+
+def plot_infrastructure_diff(
+    net_a: NetworkData,
+    net_b: NetworkData,
+    extent=None,
+    output_path: Optional[Path] = None,
+    title: Optional[str] = None,
+    figsize: Tuple[int, int] = (16, 12),
+    show_labels: bool = True,
+    is_catchment: bool = False,
+) -> plt.Figure:
+    """Diff plot: net_a is the reference, net_b is the comparison.
+
+    Segments
+    --------
+    - Removed (in A, not in B)          : red tracks
+    - Added   (in B, not in A)          : green tracks
+    - Track gained (n_b > n_a)          : n_b tracks drawn; outermost = green
+    - Track lost   (n_b < n_a)          : max(n_a,n_b)+1 tracks drawn; outermost = red
+    - Unchanged                         : black tracks, low opacity
+
+    Nodes
+    -----
+    - Removed : red markers
+    - Added   : green markers
+    - Unchanged: grey markers, low opacity
+    """
+    if title is None:
+        title = f"Infrastructure diff — {net_b.version} vs {net_a.version}"
+
+    # Use net_b's boundary/graph for the base plot frame
+    fig, ax = _base_plot(net_b, title, figsize, extent=extent)
+    if is_catchment:
+        _plot_lakes(ax, boundary=net_b.boundary)
+    else:
+        _plot_lakes(ax, extent=extent)
+
+    ts = _TRACK_SPACING_M_CA if is_catchment else _TRACK_SPACING_M_SA
+
+    # ── Clip ──────────────────────────────────────────────────────────────────
+    def _clip(gdf, network):
+        if extent is not None:
+            return _clip_to_extent(gdf, extent)
+        return _clip_to_boundary(gdf, network.boundary)
+
+    segs_a = _clip(net_a.segments, net_a)
+    segs_b = _clip(net_b.segments, net_b)
+    nodes_a = _clip(net_a.nodes, net_a)
+    nodes_b = _clip(net_b.nodes, net_b)
+
+    # ── Segment diff ──────────────────────────────────────────────────────────
+    ids_a = set(segs_a['segment_id'].dropna())
+    ids_b = set(segs_b['segment_id'].dropna())
+
+    removed_segs  = segs_a[segs_a['segment_id'].isin(ids_a - ids_b)]
+    added_segs    = segs_b[segs_b['segment_id'].isin(ids_b - ids_a)]
+    common_ids    = ids_a & ids_b
+
+    # For common segments compare num_tracks
+    common_a = segs_a[segs_a['segment_id'].isin(common_ids)].set_index('segment_id')
+    common_b = segs_b[segs_b['segment_id'].isin(common_ids)].set_index('segment_id')
+
+    unchanged_ids   = []
+    track_gained    = []   # list of (geom, n_a, n_b)
+    track_lost      = []   # list of (geom, n_a, n_b)
+
+    for sid in common_ids:
+        if sid not in common_a.index or sid not in common_b.index:
+            continue
+        n_a = int(common_a.loc[sid].get('num_tracks', 1) or 1)
+        n_b = int(common_b.loc[sid].get('num_tracks', 1) or 1)
+        geom = common_b.loc[sid].geometry
+        if n_b > n_a:
+            track_gained.append((geom, n_a, n_b))
+        elif n_b < n_a:
+            track_lost.append((geom, n_a, n_b))
+        else:
+            unchanged_ids.append(sid)
+
+    unchanged_segs = segs_b[segs_b['segment_id'].isin(unchanged_ids)]
+
+    # ── Draw segments ─────────────────────────────────────────────────────────
+    # 1) Unchanged — black, faded
+    for _, row in unchanged_segs.iterrows():
+        n = int(row.get('num_tracks', 1) or 1)
+        _draw_parallel_tracks(ax, row.geometry, n, color='black',
+                              linewidth=1.05, alpha=0.20, zorder=2,
+                              track_spacing_m=ts)
+
+    # 2) Removed — red, full opacity
+    for _, row in removed_segs.iterrows():
+        n = int(row.get('num_tracks', 1) or 1)
+        _draw_parallel_tracks(ax, row.geometry, n, color=_DIFF_RED,
+                              linewidth=1.4, alpha=0.9, zorder=4,
+                              track_spacing_m=ts)
+
+    # 3) Added — green, full opacity
+    for _, row in added_segs.iterrows():
+        n = int(row.get('num_tracks', 1) or 1)
+        _draw_parallel_tracks(ax, row.geometry, n, color=_DIFF_GREEN,
+                              linewidth=1.4, alpha=0.9, zorder=4,
+                              track_spacing_m=ts)
+
+    # 4) Track gained: draw n_b tracks, outermost = green
+    for geom, n_a, n_b in track_gained:
+        colors = ['black'] * n_a + [_DIFF_GREEN] * (n_b - n_a)
+        _draw_parallel_tracks_mixed(ax, geom, colors,
+                                    linewidth=1.2, alpha=0.9, zorder=3,
+                                    track_spacing_m=ts)
+
+    # 5) Track lost: draw n_a tracks (the original count), outermost = red
+    for geom, n_a, n_b in track_lost:
+        colors = ['black'] * n_b + [_DIFF_RED] * (n_a - n_b)
+        _draw_parallel_tracks_mixed(ax, geom, colors,
+                                    linewidth=1.2, alpha=0.9, zorder=3,
+                                    track_spacing_m=ts)
+
+    # ── Node diff ─────────────────────────────────────────────────────────────
+    names_a = set(nodes_a['NAME'].dropna()) if not nodes_a.empty else set()
+    names_b = set(nodes_b['NAME'].dropna()) if not nodes_b.empty else set()
+
+    removed_nodes   = nodes_a[nodes_a['NAME'].isin(names_a - names_b)]
+    added_nodes     = nodes_b[nodes_b['NAME'].isin(names_b - names_a)]
+    unchanged_nodes = nodes_b[nodes_b['NAME'].isin(names_a & names_b)]
+
+    ms_ts = 20 if is_catchment else 55
+    ms_jn = 5  if is_catchment else 8
+
+    def _plot_node_set(nodes_gdf, facecolor, edgecolor, alpha, zorder):
+        if nodes_gdf.empty:
+            return
+        ts_n, tf_n, jn_n = _classify_nodes(nodes_gdf)
+        for gdf in (ts_n, tf_n):
+            if not gdf.empty:
+                gdf.plot(ax=ax, facecolor=facecolor, edgecolor=edgecolor,
+                         markersize=ms_ts, marker='o', linewidth=1.2,
+                         alpha=alpha, zorder=zorder)
+        if not jn_n.empty:
+            jn_n.plot(ax=ax, color=facecolor, markersize=ms_jn, marker='o',
+                      alpha=alpha, zorder=zorder - 1)
+
+    _plot_node_set(unchanged_nodes, _DIFF_GREY,  _DIFF_GREY,      0.25, 5)
+    _plot_node_set(removed_nodes,   _DIFF_RED,   '#7f0000',        0.9,  7)
+    _plot_node_set(added_nodes,     _DIFF_GREEN, '#005a00',        0.9,  7)
+
+    # ── Labels (added/removed stations only) ─────────────────────────────────
+    if show_labels and not is_catchment:
+        for nodes_gdf, color in ((added_nodes, _DIFF_GREEN),
+                                 (removed_nodes, _DIFF_RED)):
+            ts_n, tf_n, _ = _classify_nodes(nodes_gdf)
+            for _, row in pd.concat([ts_n, tf_n]).iterrows():
+                code = row.get('CODE', '')
+                if pd.notna(code) and str(code).strip():
+                    ax.annotate(
+                        str(code),
+                        xy=(row.geometry.x, row.geometry.y),
+                        xytext=(5, 5), textcoords='offset points',
+                        fontsize=7, fontweight='bold', color=color,
+                        bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
+                                  edgecolor='none', alpha=0.7),
+                        zorder=8,
+                    )
+
+    # ── Legend ────────────────────────────────────────────────────────────────
+    legend = [Line2D([0], [0], color='none', label='─ Segments ─')]
+    legend.append(Line2D([0], [0], color='black',     linewidth=1.0, alpha=0.4,
+                         label='Unchanged'))
+    legend.append(Line2D([0], [0], color=_DIFF_GREEN, linewidth=1.4,
+                         label='Added'))
+    legend.append(Line2D([0], [0], color=_DIFF_RED,   linewidth=1.4,
+                         label='Removed'))
+    legend.append(Line2D([0], [0], color='none', label=''))
+    legend.append(Line2D([0], [0], color=_DIFF_GREEN, linewidth=2.5,
+                         label='Track gained (outermost)'))
+    legend.append(Line2D([0], [0], color=_DIFF_RED,   linewidth=2.5,
+                         label='Track lost (outermost)'))
+
+    legend.append(Line2D([0], [0], color='none', label='─ Nodes ─'))
+    legend.append(Line2D([0], [0], marker='o', color='w',
+                         markerfacecolor=_DIFF_GREY, markersize=6,
+                         alpha=0.5, label='Unchanged'))
+    legend.append(Line2D([0], [0], marker='o', color='w',
+                         markerfacecolor=_DIFF_GREEN,
+                         markeredgecolor='#005a00', markersize=8,
+                         label='Added'))
+    legend.append(Line2D([0], [0], marker='o', color='w',
+                         markerfacecolor=_DIFF_RED,
+                         markeredgecolor='#7f0000', markersize=8,
+                         label='Removed'))
+
+    ax.legend(handles=legend, loc='upper right', fontsize=8)
     _add_north_arrow(ax)
     _add_scale_bar(ax)
     plt.tight_layout()
@@ -2116,6 +2364,50 @@ if __name__ == "__main__":
 
     _plot_label_map = dict(_ALL_PLOTS)
 
+    # ── Step 0 / Q3: Diff plot? ───────────────────────────────────────────────
+    print("\n" + "─" * 60)
+    print("[Step 0 / Q3]  Diff plot")
+    print("─" * 60)
+
+    _do_diff = input("\n  Generate a diff plot? (y/n) [n]: ").strip().lower() or "n"
+    _ref_version  = None
+    _diff_scope   = None
+
+    if _do_diff == "y":
+        _diff_candidates = [
+            v for v in sorted(
+                d.name for d in _infra_root.iterdir()
+                if d.is_dir() and d.name != "Raw"
+                and (d / "nodes.gpkg").exists()
+                and (d / "segments.gpkg").exists()
+            )
+            if v != _chosen
+        ]
+        if not _diff_candidates:
+            print("  No other versions available — skipping diff.")
+            _do_diff = "n"
+        else:
+            print("\n  Compare against (reference version):")
+            for _i, _v in enumerate(_diff_candidates, 1):
+                _marker = "  [Base]" if _v == "Base" else ""
+                print(f"    {_i}) {_v}{_marker}")
+            while True:
+                _ref_raw = input("  Select (number): ").strip()
+                if _ref_raw.isdigit() and 1 <= int(_ref_raw) <= len(_diff_candidates):
+                    _ref_version = _diff_candidates[int(_ref_raw) - 1]
+                    break
+                print(f"  Invalid — enter 1–{len(_diff_candidates)}.")
+
+            print("\n  Extent:")
+            print("    1) Catchment area")
+            print("    2) Study area")
+            print("    3) Both")
+            while True:
+                _diff_scope = input("  Select (1–3) [3]: ").strip() or "3"
+                if _diff_scope in ("1", "2", "3"):
+                    break
+                print("  Enter 1, 2, or 3.")
+
     # ── Step 1: Build ─────────────────────────────────────────────────────────
     print("\n" + "─" * 60)
     print("[Step 1]  Network building")
@@ -2259,6 +2551,44 @@ if __name__ == "__main__":
                 
                 _fig = _fn(_net, extent=_ext, output_path=_plot_dir / _fname, **kwargs)
                 plt.close(_fig)
+
+    # ── Step 3: Diff plot ─────────────────────────────────────────────────────
+    if _do_diff == "y" and _ref_version is not None:
+        print("\n" + "─" * 60)
+        print("[Step 3]  Diff plot")
+        print("─" * 60)
+
+        print(f"\n  Loading reference '{_ref_version}'...")
+        _ref_nodes, _ref_segs = load_version(_ref_version)
+        _ref_G = build_networkx_graph(_ref_nodes, _ref_segs)
+
+        _diff_dir = Path(paths.MAIN) / paths.INFRASTRUCTURE_PLOTS_DIR / _chosen
+        _diff_dir.mkdir(parents=True, exist_ok=True)
+
+        _diff_pairs = []
+        if _diff_scope in ("1", "3"):
+            _diff_pairs.append(("ca", _ca_boundary, _ca_ext, True))
+        if _diff_scope in ("2", "3"):
+            _diff_pairs.append(("sa", _sa_boundary, _sa_ext, False))
+
+        for _scope_key, _bdry, _ext, _is_ca in _diff_pairs:
+            _ref_net  = NetworkData(nodes=_ref_nodes, segments=_ref_segs,
+                                    graph=_ref_G, version=_ref_version,
+                                    boundary=_bdry)
+            _comp_net = NetworkData(nodes=_nodes, segments=_segments,
+                                    graph=G, version=_chosen,
+                                    boundary=_bdry)
+            _diff_fname = f"diff_{_chosen}_vs_{_ref_version}_{_scope_key}.pdf"
+            print(f"  Diff ({_scope_key.upper()}) ...")
+            _fig = plot_infrastructure_diff(
+                net_a=_ref_net,
+                net_b=_comp_net,
+                extent=_ext,
+                output_path=_diff_dir / _diff_fname,
+                is_catchment=_is_ca,
+            )
+            plt.close(_fig)
+        print(f"  Diff plot(s) saved → {_diff_dir}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)

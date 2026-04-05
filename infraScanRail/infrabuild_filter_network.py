@@ -39,17 +39,25 @@ import paths
 
 SWISS_CRS = "EPSG:2056"
 
+# BAV node name patterns used by classify_node() — documented here for reference.
+# The function implements priority / spacing rules directly; this dict is not iterated.
 NODE_CLASSIFICATION_PATTERNS = {
+    # turning_loop — checked first (Wds beats any junction suffix in same name)
+    '(Wds)':      'turning_loop',    # also: 'Wds ' (space after), ' Wds)' (before closing paren)
+    '(boucle)':   'turning_loop',    # French
+    # junction — German and French variants
     '(Abzw)':     'junction',
-    '(Wds)':      'turning_loop',
-    '(Vzw)':      'junction_tram',
-    '(Gbf)':      'freight_yard',
-    '(Bbf)':      'operational_yard',
-    '(Dep)':      'depot',
-    '(Grenze)':   'border',
-    '(Halt)':     'halt',
-    '(Spw)':      'switch',          # Spurwechsel – track switch point
-    '(km-Sprung)': 'km_change',      # Kilometer jump – km reference discontinuity
+    '(Vzw':       'junction',        # catches (Vzw), (Vzw Ost/Nord/Süd/West/…)
+    '(Verzw)':    'junction',        # long-form German variant
+    '(bif':       'junction',        # French bifurcation; catches (bif), (bif sud), (bif nord)
+    '(embr)':     'junction',        # French embranchement
+    # other
+    ' GB':        'freight_yard',    # space before GB, case-sensitive, no brackets
+    'Depot':      'depot',           # substring match
+    ' Grenze':    'border',          # space before Grenze, case-sensitive
+    '(Km-Sprung)': 'km_change',      # also: (saut-km), (saut km)
+    '(saut-km)':  'km_change',
+    '(saut km)':  'km_change',       # French variant with space instead of hyphen
 }
 
 GAUGE_MAPPING = {
@@ -64,41 +72,25 @@ GAUGE_MAPPING = {
 }
 
 # Betriebspunkttyp_Bezeichnung (German, from HaltestellenOeV) → English node_class
+# Only values verified to exist in the geopackage are included.
 BETRIEBSPUNKT_TYPE_MAPPING = {
-    # Approved / Main Categories
-    'Haltestelle': 'station',
-    'Haltestelle und Bedienpunkt': 'station',
+    'Haltestelle':                          'station',
+    'Haltestelle und Bedienpunkt':          'station',
+    'Haltestelle ausser Betrieb':           'abandoned_station',
+    'Bedienpunkt':                          'service_point',
+    'Zugeordneter Betriebspunkt':           'assigned_service_point',
     'Verzweigung, Abzweigung, Spaltweiche': 'junction',
-    'Anschlusspunkt': 'junction',
-    'Spurtrennung': 'junction',
-    'Ausweiche': 'junction',
-    'Wendeschleife': 'turning_loop',
-    
-    # Will be dropped during macroscopic filtering:
-    'Haltestelle ausser Betrieb': 'abandoned_station',
-    'Dienststation': 'operational_yard',
-    'Bedienpunkt': 'service_point',
-    'Zugeordneter Betriebspunkt': 'assigned_service_point',
-    'Spurwechsel': 'switch',
-    'Fehlerprofil/Kilometer-Sprung': 'km_change',
-    'Gleisende': 'track_end',
-    'Eigentumsgrenze': 'property_border',
-    'Landesgrenze': 'border',
-    
-    # Existing ones
-    'Bahnhof': 'station',
-    'Haltepunkt': 'halt',
-    'Abzweigung': 'junction',
-    'Blockstelle': 'junction',
-    'Betriebsanlage': 'operational_yard',
-    'Güterbahnhof': 'freight_yard',
-    'Güteranlage': 'freight_yard',
-    'Depot': 'depot',
-    'Depotanlage': 'depot',
-    'Fahrzeugdepot': 'depot',
-    'Grenzbahnhof': 'border',
-    'Grenzpunkt': 'border',
-    'km-Sprung': 'km_change',
+    'Anschlusspunkt':                       'junction',
+    'Spurtrennung':                         'junction',
+    'Ausweiche':                            'junction',
+    'Blockstelle':                          'junction',
+    'Wendeschleife':                        'turning_loop',
+    'Dienststation':                        'operational_yard',
+    'Eigentumsgrenze':                      'property_border',
+    'Landesgrenze':                         'border',
+    'Spurwechsel':                          'switch',
+    'Fehlerprofil/Kilometer-Sprung':        'km_change',
+    'Gleisende':                            'track_end',
 }
 
 TRANSPORT_MODE_MAPPING = {
@@ -161,13 +153,45 @@ GAUGE_TO_OBJVAL = {
 # =============================================================================
 
 def classify_node(name: str) -> str:
+    """
+    Classify a BAV node from its Betriebspunkt_Name using Phase-1 pattern matching.
+
+    All patterns are case-sensitive (matching the source data).
+    Wds / boucle → turning_loop takes priority over all junction patterns.
+    Returns 'unclassified' when no pattern matches.
+
+    Junction patterns cover German and French naming conventions:
+        (Abzw), (Vzw*), (Verzw)  – German Abzweigung / Verzweigung
+        (bif*)                   – French bifurcation
+        (embr)                   – French embranchement
+
+    Turning-loop patterns:
+        (Wds), Wds <space>, <space>Wds)  – catches (Wds), bare 'Wds ', and
+                                            combined forms like (Vzw Wds)
+        (boucle)                          – French boucle
+    """
     if pd.isna(name):
-        return 'unknown'
-    name_str = str(name)
-    for pattern, cls in NODE_CLASSIFICATION_PATTERNS.items():
-        if pattern in name_str:
-            return cls
-    return 'station'
+        return 'unclassified'
+    s = str(name)
+
+    # turning_loop — checked first; Wds beats any junction suffix in same name
+    has_wds = '(Wds)' in s or 'Wds ' in s or ' Wds)' in s
+    if has_wds or '(boucle)' in s:
+        return 'turning_loop'
+
+    # junction — German and French variants
+    if '(Vzw' in s or '(Abzw)' in s or '(Verzw)' in s or '(bif' in s or '(embr)' in s:
+        return 'junction'
+
+    if ' GB' in s:
+        return 'freight_yard'
+    if 'Depot' in s:
+        return 'depot'
+    if ' Grenze' in s:
+        return 'border'
+    if '(Km-Sprung)' in s or '(saut-km)' in s or '(saut km)' in s:
+        return 'km_change'
+    return 'unclassified'
 
 
 def parse_gauge(gauge_str) -> int:
@@ -364,26 +388,26 @@ def clean_nodes(raw_nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     Standardise BAV node data.
 
     Output columns:
-        node_id     – xtf_id (used for topology joins with segments)
-        ID_point    – Betriebspunkt_Nummer (used for GTFS and HaltestellenOeV matching)
-        NAME, CODE  – station name and abbreviation
-        N, E        – Northing and Easting (EPSG:2056)
-        parent_node – rUebergeordnet
+        node_id              – xtf_id (used for topology joins with segments)
+        Betriebspunkt_Nummer – stable numeric public ID (matching key for HaltestellenOeV)
+        NAME, CODE           – station name and abbreviation
+        N, E                 – Northing and Easting (EPSG:2056)
+        parent_node          – rUebergeordnet
 
-    node_class, node_type_source, platform_count are added by enrich_nodes().
+    node_class, transport_mode, platform_count, track_count are added later.
     """
     print("Cleaning nodes...")
     print(f"  Columns: {list(raw_nodes.columns)}")
 
     out = gpd.GeoDataFrame(geometry=raw_nodes.geometry.copy(), crs=raw_nodes.crs)
 
-    out['node_id']  = raw_nodes['xtf_id']
-    out['ID_point'] = raw_nodes.get('Betriebspunkt_Nummer', pd.NA)
-    out['NAME']     = raw_nodes.get('Betriebspunkt_Name', pd.NA)
-    out['CODE']     = raw_nodes.get('Betriebspunkt_Abkuerzung', pd.NA)
-    out['E']        = out.geometry.x
-    out['N']        = out.geometry.y
-    out['parent_node']  = raw_nodes.get('rUebergeordnet', pd.NA)
+    out['node_id']              = raw_nodes['xtf_id']
+    out['Betriebspunkt_Nummer'] = raw_nodes.get('Betriebspunkt_Nummer', pd.NA)
+    out['NAME']                 = raw_nodes.get('Betriebspunkt_Name', pd.NA)
+    out['CODE']                 = raw_nodes.get('Betriebspunkt_Abkuerzung', pd.NA)
+    out['E']                    = out.geometry.x
+    out['N']                    = out.geometry.y
+    out['parent_node']          = raw_nodes.get('rUebergeordnet', pd.NA)
 
     n_before = len(out)
     out = out.drop_duplicates(subset=['node_id'], keep='first')
@@ -457,66 +481,83 @@ def clean_segments(raw_segments: gpd.GeoDataFrame,
 
 
 # =============================================================================
-# Node enrichment from HaltestellenOeV
+# Node classification and enrichment
 # =============================================================================
 
-def enrich_nodes(nodes: gpd.GeoDataFrame,
-                 betriebspunkte: gpd.GeoDataFrame,
-                 haltekanten: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+def classify_nodes_bav(nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
-    Enrich nodes with authoritative type classification, transport mode, and
-    platform counts from HaltestellenOeV.gpkg.
+    Phase-1 node classification from BAV Betriebspunkt_Name patterns.
 
-    node_class:
-        Betriebspunkttyp_Bezeichnung (German, as-is) for matched nodes (~98.6 %).
-        Falls back to pattern-match on station name abbreviations for the rest.
+    Applied after catchment filtering.  Sets node_class for all nodes that
+    match a known pattern; unmatched nodes are labelled 'unclassified' and
+    will be resolved in Phase 2 (enrich_nodes_oev).
+    """
+    print("Phase-1: classifying nodes from BAV name patterns...")
+    nodes = nodes.copy()
+    nodes['node_class'] = nodes['NAME'].apply(classify_node)
+    n_classified   = (nodes['node_class'] != 'unclassified').sum()
+    n_unclassified = (nodes['node_class'] == 'unclassified').sum()
+    print(f"  Classified: {n_classified}  |  Unclassified (→ OeV Phase 2): {n_unclassified}")
+    return nodes
 
-    transport_mode:
-        Verkehrsmittel_Bezeichnung – the transport mode serving the node
-        (e.g. "Eisenbahn", "Tram", "Bus", …).  NaN for unmatched nodes.
 
-    platform_count:
-        Number of Haltekanten per operating point.
-        NaN for nodes that are not public transport stops (junctions, switches, …).
+def enrich_nodes_oev(
+    nodes: gpd.GeoDataFrame,
+    betriebspunkte: gpd.GeoDataFrame,
+    haltekanten: gpd.GeoDataFrame,
+    boundary: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """
+    Phase-2 node enrichment from HaltestellenOeV.gpkg.
+
+    Steps
+    -----
+    1. Match BAV nodes via Betriebspunkt_Nummer ↔ betriebspunkte.Nummer
+    2. Import transport_mode (translated to English)
+    3. Fill node_class for 'unclassified' nodes from Betriebspunkttyp_Bezeichnung
+    4. Count platforms (Haltekanten) per operating point; enforce only for stations
+    5. Add OeV-only nodes: Verkehrsmittel_Code ∋ {B,C,E,F}, not in BAV, within boundary
 
     Join keys:
-        nodes.ID_point (Betriebspunkt_Nummer) → betriebspunkte.Nummer
-        haltekanten.rHaltestelle              → betriebspunkte.xtf_id
+        nodes.Betriebspunkt_Nummer → betriebspunkte.Nummer
+        haltekanten.rHaltestelle   → betriebspunkte.xtf_id
     """
-    print("Enriching nodes from HaltestellenOeV...")
+    print("Phase-2: enriching nodes from HaltestellenOeV...")
     nodes = nodes.copy()
 
-    bp_num  = betriebspunkte['Nummer'].astype('Int64')
-    node_ids = nodes['ID_point'].astype('Int64')
+    # Ensure betriebspunkte CRS matches nodes
+    if betriebspunkte.crs is None:
+        betriebspunkte = betriebspunkte.set_crs(SWISS_CRS)
+    elif betriebspunkte.crs.to_epsg() != 2056:
+        betriebspunkte = betriebspunkte.to_crs(SWISS_CRS)
 
-    # --- node_class: authoritative classification ------------------------------
-    bp_lookup = dict(zip(bp_num, betriebspunkte['Betriebspunkttyp_Bezeichnung']))
-    authoritative = node_ids.map(bp_lookup)
+    bp_num   = betriebspunkte['Nummer'].astype('Int64')
+    node_ids = nodes['Betriebspunkt_Nummer'].astype('Int64')
 
-    nodes['node_class'] = authoritative.where(authoritative.notna(),
-                                               nodes['NAME'].apply(classify_node))
-
-    # Normalise German Betriebspunkttyp_Bezeichnung values to English
-    nodes['node_class'] = nodes['node_class'].apply(
-        lambda x: BETRIEBSPUNKT_TYPE_MAPPING.get(str(x), x) if pd.notna(x) else x
-    )
-
-    matched_type = authoritative.notna().sum()
-    print(f"  Node classification: {matched_type}/{len(nodes)} from HaltestellenOeV "
-          f"({len(nodes) - matched_type} pattern fallback)")
-
-    # --- transport_mode: Verkehrsmittel_Bezeichnung ----------------------------
-    mode_lookup = dict(zip(bp_num, betriebspunkte['Verkehrsmittel_Bezeichnung']))
-    nodes['transport_mode'] = node_ids.map(mode_lookup)
-
-    # Normalise German Verkehrsmittel_Bezeichnung values to English
-    def translate_modes(val):
+    # --- transport_mode -------------------------------------------------------
+    def _translate_modes(val):
         if pd.isna(val):
             return val
         parts = [TRANSPORT_MODE_MAPPING.get(p.strip(), p.strip()) for p in str(val).split('/')]
         return ' / '.join(parts)
 
-    nodes['transport_mode'] = nodes['transport_mode'].apply(translate_modes)
+    mode_lookup = dict(zip(bp_num, betriebspunkte['Verkehrsmittel_Bezeichnung']))
+    nodes['transport_mode'] = node_ids.map(mode_lookup).apply(_translate_modes)
+
+    # --- node_class: fill only unclassified nodes ----------------------------
+    bp_type_lookup = dict(zip(bp_num, betriebspunkte['Betriebspunkttyp_Bezeichnung']))
+    oev_class_raw  = node_ids.map(bp_type_lookup)
+    oev_class      = oev_class_raw.apply(
+        lambda x: BETRIEBSPUNKT_TYPE_MAPPING.get(str(x), 'unclassified') if pd.notna(x) else 'unclassified'
+    )
+
+    unclassified_mask = nodes['node_class'] == 'unclassified'
+    nodes.loc[unclassified_mask, 'node_class'] = oev_class[unclassified_mask]
+
+    n_filled  = int((unclassified_mask & (nodes['node_class'] != 'unclassified')).sum())
+    still_unc = int((nodes['node_class'] == 'unclassified').sum())
+    print(f"  OeV match: {oev_class_raw.notna().sum()}/{len(nodes)} nodes found in HaltestellenOeV")
+    print(f"  Classification: {n_filled} filled from OeV  |  {still_unc} still unclassified")
 
     # --- platform_count: Haltekante aggregation --------------------------------
     # Haltekante.rHaltestelle → Betriebspunkt.xtf_id → Betriebspunkt.Nummer
@@ -535,9 +576,101 @@ def enrich_nodes(nodes: gpd.GeoDataFrame,
 
     nodes['platform_count'] = node_ids.map(nummer_to_platforms)
 
-    matched_plats = nodes['platform_count'].notna().sum()
-    print(f"  Platform counts: {matched_plats} nodes have platform data")
+    # Enforce: only stations get a platform_count value
+    nodes.loc[nodes['node_class'] != 'station', 'platform_count'] = pd.NA
 
+    matched_plats = nodes['platform_count'].notna().sum()
+    print(f"  Platform counts: {matched_plats} station nodes have platform data")
+
+    # --- Add OeV-only nodes (B/C/E/F mode, not in BAV set, within boundary) --
+    existing_nummers = set(nodes['Betriebspunkt_Nummer'].dropna().astype('Int64'))
+    rail_mode_mask   = betriebspunkte['Verkehrsmittel_Code'].fillna('').apply(
+        lambda c: bool(set(str(c)) & {'B', 'C', 'E', 'F'})
+    )
+    new_bp = betriebspunkte[rail_mode_mask].copy()
+    new_bp['_Nummer_int'] = new_bp['Nummer'].astype('Int64')
+    new_bp = new_bp[~new_bp['_Nummer_int'].isin(existing_nummers)].copy()
+
+    boundary_geom = boundary.geometry.union_all()
+    new_bp        = new_bp[new_bp.geometry.within(boundary_geom)].copy()
+
+    if len(new_bp) > 0:
+        def _plat_count(nummer_int):
+            n = int(nummer_int) if pd.notna(nummer_int) else None
+            return nummer_to_platforms.get(n, pd.NA) if n is not None else pd.NA
+
+        oev_class_new = new_bp['Betriebspunkttyp_Bezeichnung'].apply(
+            lambda x: BETRIEBSPUNKT_TYPE_MAPPING.get(str(x), 'unclassified') if pd.notna(x) else 'unclassified'
+        )
+
+        oev_nodes = gpd.GeoDataFrame({
+            'node_id':              new_bp['_Nummer_int'].values,
+            'Betriebspunkt_Nummer': new_bp['_Nummer_int'].values,
+            'NAME':                 new_bp['Name'].values,
+            'CODE':                 new_bp['Abkuerzung'].values,
+            'E':                    new_bp.geometry.x.values,
+            'N':                    new_bp.geometry.y.values,
+            'parent_node':          new_bp['rUebergeordneteHaltestelle'].values,
+            'node_class':           oev_class_new.values,
+            'transport_mode':       new_bp['Verkehrsmittel_Bezeichnung'].apply(_translate_modes).values,
+            'platform_count':       new_bp['_Nummer_int'].apply(_plat_count).values,
+            'geometry':             new_bp.geometry.values,
+        }, crs=nodes.crs)
+
+        # Enforce: only stations get a platform_count value
+        oev_nodes.loc[oev_nodes['node_class'] != 'station', 'platform_count'] = pd.NA
+
+        nodes = pd.concat([nodes, oev_nodes], ignore_index=True)
+        print(f"  Added {len(oev_nodes)} OeV-only nodes (not in BAV, within boundary)")
+    else:
+        print("  No new OeV-only nodes to add")
+
+    return nodes
+
+
+def add_track_count(
+    nodes: gpd.GeoDataFrame,
+    segments: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """
+    Add track_count column and enforce nullable-integer types on both track columns.
+
+    track_count (stations only):
+        max(platform_count, max num_tracks of adjacent filtered segments).
+        Defaults to 0 when neither source has data.  Non-station nodes get pd.NA.
+
+    Both platform_count and track_count are stored as Int64 (no decimal point;
+    NA preserved for non-stations).
+
+    Must be called while segments still carry from_node / to_node as BAV xtf_ids
+    (i.e. before substitute_node_names).
+    """
+    print("Computing track counts...")
+    nodes = nodes.copy()
+
+    # Build node_id → max(num_tracks) from all adjacent filtered segments
+    node_max_tracks: dict = {}
+    for row in segments[['from_node', 'to_node', 'num_tracks']].itertuples(index=False):
+        for nid in (row.from_node, row.to_node):
+            if nid is None or (isinstance(nid, float) and pd.isna(nid)):
+                continue
+            node_max_tracks[nid] = max(node_max_tracks.get(nid, 0), int(row.num_tracks))
+
+    def _track_count(row):
+        if row.get('node_class') != 'station':
+            return pd.NA
+        seg_tracks  = node_max_tracks.get(row['node_id'], 0)
+        plat_tracks = int(row['platform_count']) if pd.notna(row.get('platform_count')) else 0
+        return max(seg_tracks, plat_tracks)
+
+    nodes['track_count'] = nodes.apply(_track_count, axis=1)
+
+    # Cast both columns to nullable integer (no decimal point, NA preserved)
+    nodes['platform_count'] = nodes['platform_count'].astype('Int64')
+    nodes['track_count']    = nodes['track_count'].astype('Int64')
+
+    n_tracks = nodes['track_count'].notna().sum()
+    print(f"  track_count set for {n_tracks} station nodes")
     return nodes
 
 
@@ -774,6 +907,18 @@ def build_segments_composition(
         return gpd.GeoDataFrame()
 
     composition = gpd.GeoDataFrame(output_rows, crs=SWISS_CRS)
+
+    # Replace TLMRegio-derived track_config / railway_type with the authoritative
+    # values from the BAV segments (num_tracks, gauge), matched by segment_id.
+    seg_lookup = (
+        filtered_segments[['segment_id', 'num_tracks', 'gauge']]
+        .drop_duplicates(subset='segment_id')
+        .set_index('segment_id')
+    )
+    composition['num_tracks'] = composition['segment_id'].map(seg_lookup['num_tracks'])
+    composition['gauge']      = composition['segment_id'].map(seg_lookup['gauge'])
+    composition = composition.drop(columns=['track_config', 'railway_type'])
+
     print(f"  → {len(composition)} composition pieces")
     print(f"     construct_type: {composition['construct_type'].value_counts().to_dict()}")
     return composition
@@ -810,8 +955,8 @@ def build_node_lookups(nodes: gpd.GeoDataFrame) -> Dict[str, dict]:
     for _, row in nodes.iterrows():
         nid = row['node_id']
         lookups['by_node_id'][nid] = nid
-        if pd.notna(row.get('ID_point')):
-            lookups['by_bp_nummer'][row['ID_point']] = nid
+        if pd.notna(row.get('Betriebspunkt_Nummer')):
+            lookups['by_bp_nummer'][row['Betriebspunkt_Nummer']] = nid
         if pd.notna(row.get('NAME')) and row['NAME']:
             lookups['by_name'][str(row['NAME']).lower().strip()] = nid
         if pd.notna(row.get('CODE')) and row['CODE']:
@@ -862,13 +1007,21 @@ def run_filter_network(
     nodes    = clean_nodes(raw_nodes)
     segments = clean_segments(raw_segments, raw_routes)
 
-    # --- Enrich nodes ---------------------------------------------------------
-    print("\n--- Enriching nodes ---")
-    nodes = enrich_nodes(nodes, betriebspunkte, haltekanten)
-
     # --- Filter ---------------------------------------------------------------
     print("\n--- Filtering to catchment ---")
     nodes, segments = filter_to_catchment(nodes, segments, boundary)
+
+    # --- Phase-1 classification: BAV name patterns ----------------------------
+    print("\n--- Classifying nodes (BAV patterns) ---")
+    nodes = classify_nodes_bav(nodes)
+
+    # --- Phase-2 enrichment: HaltestellenOeV ---------------------------------
+    print("\n--- Enriching nodes (HaltestellenOeV) ---")
+    nodes = enrich_nodes_oev(nodes, betriebspunkte, haltekanten, boundary)
+
+    # --- Track counts ---------------------------------------------------------
+    print("\n--- Computing track counts ---")
+    nodes = add_track_count(nodes, segments)
 
     # --- Composition (built while from/to are still xtf_ids for overlay) ------
     print("\n--- Building segments_composition ---")
