@@ -746,9 +746,23 @@ def _add_node(
             break
         print("  Invalid — enter 1–6.")
 
+    # Generate a synthetic Betriebspunkt_Nummer above the BAV range (max + 1,
+    # floored at 9_000_000 so synthetic nodes are clearly distinguishable).
+    existing_ids = nodes['Betriebspunkt_Nummer'].dropna()
+    try:
+        max_existing = int(existing_ids.astype(float).max())
+    except (ValueError, TypeError):
+        max_existing = 0
+    synthetic_bpnr = max(max_existing + 1, 9_000_000)
+    # Ensure uniqueness in the unlikely case of multiple additions in one session
+    while synthetic_bpnr in existing_ids.astype(float).values:
+        synthetic_bpnr += 1
+
+    synthetic_node_id = f"synth_{synthetic_bpnr}"
+
     new_node = {
-        'node_id':              None,
-        'Betriebspunkt_Nummer': None,
+        'node_id':              synthetic_node_id,
+        'Betriebspunkt_Nummer': synthetic_bpnr,
         'NAME':                 name,
         'CODE':                 code,
         'E':                    node_E,
@@ -760,6 +774,7 @@ def _add_node(
         'parent_node':          None,
         'geometry':             Point(node_E, node_N),
     }
+    print(f"  Assigned synthetic Betriebspunkt_Nummer: {synthetic_bpnr}")
 
     # Apply segment split
     segments, composition = _split_segment_at(
@@ -1148,6 +1163,232 @@ def _edit_composition(
 
 
 # =============================================================================
+# Import operations
+# =============================================================================
+
+def _import_nodes(
+    current_nodes: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """Import and update nodes from another version."""
+    infra_root = Path(paths.MAIN) / paths.NETWORK_INFRASTRUCTURE_DIR
+    versions = list_versions(infra_root)
+    idx = _pick_one(versions, "Version to import nodes from")
+    if idx is None:
+        return current_nodes
+    source_version = versions[idx]
+    
+    print(f"  Loading nodes from '{source_version}'...")
+    source_nodes = gpd.read_file(infra_root / source_version / 'nodes.gpkg').reset_index(drop=True)
+    
+    diff_items = []  # tuples of (source_idx, status, current_idx_to_drop, description)
+    
+    # Helper to generate a match key
+    def get_node_key(row):
+        nid = str(row.get('node_id', ''))
+        bpn = str(row.get('Betriebspunkt_Nummer', ''))
+        name = str(row.get('NAME', ''))
+        if nid != 'None' and nid != 'nan' and nid != '' and bpn != 'None' and bpn != 'nan' and bpn != '':
+            return f"{nid}_{bpn}"
+        return f"NAME_{name}"
+        
+    curr_keys = current_nodes.apply(get_node_key, axis=1)
+    
+    for i, s_row in source_nodes.iterrows():
+        s_key = get_node_key(s_row)
+        match_idx = current_nodes.index[curr_keys == s_key].tolist()
+        
+        if not match_idx:
+            diff_items.append((i, "New", None, f"New node '{s_row.get('NAME', 'Unknown')}'"))
+        else:
+            c_idx = match_idx[0]
+            c_row = current_nodes.loc[c_idx]
+            
+            changes = []
+            for col in ['E', 'N', 'node_class', 'transport_mode', 'platform_count', 'NAME']:
+                s_val = s_row.get(col)
+                c_val = c_row.get(col)
+                if pd.isna(s_val) and pd.isna(c_val): continue
+                if str(s_val) != str(c_val):
+                    changes.append(f"{col}: {c_val} -> {s_val}")
+            
+            if not s_row.geometry.equals(c_row.geometry):
+                changes.append("geometry changed")
+                
+            if changes:
+                desc = f"Update node '{s_row.get('NAME', 'Unknown')}' ({', '.join(changes)})"
+                diff_items.append((i, "Changed", c_idx, desc))
+
+    if not diff_items:
+        print("  No new or modified nodes found in the selected version.")
+        return current_nodes
+        
+    print("\n  Available imports:")
+    for j, (_, status, _, desc) in enumerate(diff_items, 1):
+        print(f"    {j}) [{status}] {desc}")
+        
+    ans = input("\n  Enter numbers to import (comma-separated), 'all', or Enter to cancel: ").strip().lower()
+    if not ans:
+        return current_nodes
+        
+    selected_indices = []
+    if ans == 'all':
+        selected_indices = range(len(diff_items))
+    else:
+        for part in ans.split(','):
+            part = part.strip()
+            if part.isdigit():
+                val = int(part) - 1
+                if 0 <= val < len(diff_items):
+                    selected_indices.append(val)
+                    
+    if not selected_indices:
+        print("  No valid choices selected.")
+        return current_nodes
+        
+    new_rows = []
+    drop_indices = []
+    
+    for idx_in_diff in selected_indices:
+        s_idx, status, c_idx, desc = diff_items[idx_in_diff]
+        new_rows.append(source_nodes.loc[s_idx])
+        if status == "Changed" and c_idx is not None:
+            drop_indices.append(c_idx)
+            
+    if drop_indices:
+        current_nodes = current_nodes.drop(index=drop_indices)
+        
+    if new_rows:
+        current_nodes = pd.concat([current_nodes, gpd.GeoDataFrame(new_rows, crs=SWISS_CRS)], ignore_index=True)
+        
+    print(f"  Successfully imported {len(selected_indices)} node(s).")
+    return current_nodes
+
+
+def _import_segments(
+    current_segs: gpd.GeoDataFrame,
+    current_comp: gpd.GeoDataFrame,
+) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """Import and update segments (and their composition) from another version."""
+    infra_root = Path(paths.MAIN) / paths.NETWORK_INFRASTRUCTURE_DIR
+    versions = list_versions(infra_root)
+    idx = _pick_one(versions, "Version to import segments from")
+    if idx is None:
+        return current_segs, current_comp
+    source_version = versions[idx]
+    
+    print(f"  Loading segments and composition from '{source_version}'...")
+    source_dir = infra_root / source_version
+    source_segs = gpd.read_file(source_dir / 'segments.gpkg').reset_index(drop=True)
+    if (source_dir / 'segments_composition.gpkg').exists():
+        source_comp = gpd.read_file(source_dir / 'segments_composition.gpkg').reset_index(drop=True)
+    else:
+        source_comp = gpd.GeoDataFrame(columns=current_comp.columns)
+    
+    diff_items = []
+    
+    def get_seg_key(row):
+        sid = str(row.get('segment_id', ''))
+        sname = str(row.get('segment_name', ''))
+        return f"{sid}_{sname}"
+        
+    curr_keys = current_segs.apply(get_seg_key, axis=1)
+    
+    for i, s_row in source_segs.iterrows():
+        s_key = get_seg_key(s_row)
+        match_idx = current_segs.index[curr_keys == s_key].tolist()
+        
+        if not match_idx:
+            desc = f"New segment '{s_row.get('segment_id', '')}' ({s_row.get('from_name', '')} -> {s_row.get('to_name', '')})"
+            diff_items.append((i, "New", None, desc))
+        else:
+            c_idx = match_idx[0]
+            c_row = current_segs.loc[c_idx]
+            
+            changes = []
+            for col in ['num_tracks', 'gauge', 'electrification', 'length_m', 'km_start', 'km_end', 'from_name', 'to_name']:
+                s_val = s_row.get(col)
+                c_val = c_row.get(col)
+                if pd.isna(s_val) and pd.isna(c_val): continue
+                if str(s_val) != str(c_val):
+                    changes.append(f"{col}")
+            
+            if not s_row.geometry.equals(c_row.geometry):
+                changes.append("geometry")
+                
+            # Check composition difference by row count and total length
+            s_c = source_comp[source_comp['segment_id'] == s_row.get('segment_id', '')]
+            c_c = current_comp[current_comp['segment_id'] == c_row.get('segment_id', '')]
+            if len(s_c) != len(c_c):
+                changes.append("composition count")
+                
+            if changes:
+                desc = f"Update segment '{s_row.get('segment_id', '')}' ({', '.join(changes)})"
+                diff_items.append((i, "Changed", c_idx, desc))
+                
+    if not diff_items:
+        print("  No new or modified segments found in the selected version.")
+        return current_segs, current_comp
+        
+    print("\n  Available imports:")
+    for j, (_, status, _, desc) in enumerate(diff_items, 1):
+        print(f"    {j}) [{status}] {desc}")
+        
+    ans = input("\n  Enter numbers to import (comma-separated), 'all', or Enter to cancel: ").strip().lower()
+    if not ans:
+        return current_segs, current_comp
+        
+    selected_indices = []
+    if ans == 'all':
+        selected_indices = range(len(diff_items))
+    else:
+        for part in ans.split(','):
+            part = part.strip()
+            if part.isdigit():
+                val = int(part) - 1
+                if 0 <= val < len(diff_items):
+                    selected_indices.append(val)
+                    
+    if not selected_indices:
+        print("  No valid choices selected.")
+        return current_segs, current_comp
+        
+    new_seg_rows = []
+    new_comp_rows = []
+    drop_seg_indices = []
+    drop_comp_seg_ids = []
+    
+    for idx_in_diff in selected_indices:
+        s_idx, status, c_idx, desc = diff_items[idx_in_diff]
+        s_row = source_segs.loc[s_idx]
+        s_id = s_row.get('segment_id')
+        
+        new_seg_rows.append(s_row)
+        if s_id:
+            s_comp_pieces = source_comp[source_comp['segment_id'] == s_id]
+            if not s_comp_pieces.empty:
+                new_comp_rows.extend(s_comp_pieces.to_dict('records'))
+            
+        if status == "Changed" and c_idx is not None:
+            drop_seg_indices.append(c_idx)
+            drop_comp_seg_ids.append(current_segs.at[c_idx, 'segment_id'])
+            
+    if drop_seg_indices:
+        current_segs = current_segs.drop(index=drop_seg_indices)
+    if drop_comp_seg_ids:
+        current_comp = current_comp[~current_comp['segment_id'].isin(drop_comp_seg_ids)]
+        
+    if new_seg_rows:
+        current_segs = pd.concat([current_segs, gpd.GeoDataFrame(new_seg_rows, crs=SWISS_CRS)], ignore_index=True)
+    if new_comp_rows:
+        geoms = [r.pop('geometry', None) for r in new_comp_rows]
+        new_comp_gdf = gpd.GeoDataFrame(new_comp_rows, geometry=geoms, crs=SWISS_CRS)
+        current_comp = pd.concat([current_comp, new_comp_gdf], ignore_index=True)
+        
+    print(f"  Successfully imported {len(selected_indices)} segment(s) and their compositions.")
+    return current_segs, current_comp
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -1169,8 +1410,9 @@ def main():
                 print("    1) Remove a node")
                 print("    2) Adjust a node")
                 print("    3) Add a node")
-                print("    4) Proceed to segment editing  →")
-                c = input("  Select (1-4): ").strip()
+                print("    4) Import nodes from another version")
+                print("    5) Proceed to segment editing  →")
+                c = input("  Select (1-5): ").strip()
 
                 if c == '1':
                     nodes, segments, composition = _remove_node(nodes, segments, composition)
@@ -1179,6 +1421,8 @@ def main():
                 elif c == '3':
                     nodes, segments, composition = _add_node(nodes, segments, composition)
                 elif c == '4':
+                    nodes = _import_nodes(nodes)
+                elif c == '5':
                     phase = 2
                     break
                 else:
@@ -1192,9 +1436,10 @@ def main():
                 print("    1) Remove a segment")
                 print("    2) Adjust a segment")
                 print("    3) Add a segment")
-                print("    4) Proceed to composition editing  →")
-                print("    5) ← Back to node editing")
-                c = input("  Select (1-5): ").strip()
+                print("    4) Import segments from another version")
+                print("    5) Proceed to composition editing  →")
+                print("    6) ← Back to node editing")
+                c = input("  Select (1-6): ").strip()
 
                 if c == '1':
                     segments, composition = _remove_segment(segments, composition)
@@ -1203,9 +1448,11 @@ def main():
                 elif c == '3':
                     segments, composition = _add_segment(nodes, segments, composition)
                 elif c == '4':
+                    segments, composition = _import_segments(segments, composition)
+                elif c == '5':
                     phase = 3
                     break
-                elif c == '5':
+                elif c == '6':
                     phase = 1
                     break
                 else:
