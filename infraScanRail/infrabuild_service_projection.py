@@ -17,6 +17,7 @@ Usage:
 
 import sys
 import os
+import json
 import shutil
 from pathlib import Path
 from collections import deque
@@ -79,6 +80,10 @@ MODE_COLOURS = {
 # less than this much more than the cheapest candidate overall, the terminal is
 # preferred for terminal (first/last) stops at hub stations.
 TERMINAL_PREFERENCE_M: int = 1500
+
+# Source-layer names for long-distance and inter-regional rail services
+# (mirrors _QGZ_LAYER_NAMES entries for route_types 102 and 103)
+_LD_IR_LAYERS: frozenset = frozenset({"long_distance_rail", "inter_regional_rail"})
 
 # =============================================================================
 # QGIS project styling constants (mirrored from catchment_build_network.py)
@@ -598,6 +603,114 @@ def build_hub_topology(
                 )
 
     return hub_topology
+
+
+# =============================================================================
+# Boundary Station Detection
+# =============================================================================
+
+def detect_boundary_station_candidates(
+    G: nx.Graph,
+    nodes: gpd.GeoDataFrame,
+    buffer_geom,
+    threshold_m: float = 5000,
+) -> List[int]:
+    """
+    Detect candidate boundary stations: leaf station nodes (degree=1 in the
+    working graph) whose geometry lies within `threshold_m` metres of the
+    catchment area buffer boundary edge.
+
+    These stations mark where rail lines enter the catchment area from outside —
+    the BAV network is spatially clipped at the buffer, so through-stations at
+    the boundary appear as degree-1 leaf nodes.
+
+    Returns a sorted list of Betriebspunkt_Nummer (int).
+    """
+    if buffer_geom is None:
+        return []
+    buf_boundary = buffer_geom.boundary
+    candidates: List[int] = []
+    for _, row in nodes.iterrows():
+        if pd.isna(row.get("Betriebspunkt_Nummer")):
+            continue
+        nid = int(row["Betriebspunkt_Nummer"])
+        if G.nodes.get(nid, {}).get("node_class") != "station":
+            continue
+        if nid not in G or G.degree(nid) != 1:
+            continue
+        pt = row.geometry
+        if pt is None or pt.is_empty:
+            continue
+        if pt.distance(buf_boundary) <= threshold_m:
+            candidates.append(nid)
+    return sorted(candidates)
+
+
+# =============================================================================
+# Boundary Station — Persistence & Confirmation CLI
+# =============================================================================
+
+def _save_boundary_stations(boundary_ids: List[int], path: Path) -> None:
+    """Persist confirmed boundary station node IDs to JSON."""
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(boundary_ids, f, indent=2)
+
+
+def _load_boundary_stations(path: Path) -> Optional[List[int]]:
+    """Load persisted boundary station node IDs from JSON. Returns None if absent."""
+    if not path.exists():
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_boundary_mapping(mapping: Dict[str, int], path: Path) -> None:
+    """Persist stop_id → boundary_node_id mapping to JSON."""
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(mapping, f, indent=2)
+
+
+def _load_boundary_mapping(path: Path) -> Optional[Dict[str, int]]:
+    """Load persisted stop_id → boundary_node_id mapping. Returns None if absent."""
+    if not path.exists():
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _run_boundary_station_confirmation_cli(
+    candidates: List[int],
+    node_attrs: Dict[int, Dict],
+) -> List[int]:
+    """
+    Show the auto-detected boundary station candidates and let the user
+    remove false positives by entering comma-separated list indices.
+
+    Returns the confirmed list of node IDs.
+    """
+    print("\n  Candidate boundary stations (leaf stations ≤5 km from buffer edge):")
+    for i, nid in enumerate(candidates, 1):
+        name = node_attrs.get(nid, {}).get("name", str(nid))
+        print(f"    {i:3}) {name}  (node {nid})")
+
+    print(
+        "\n  Enter comma-separated indices to REMOVE (false positives), "
+        "or Enter to accept all:"
+    )
+    raw = input("  Remove: ").strip()
+    if not raw:
+        print(f"  All {len(candidates)} candidate(s) accepted.")
+        return list(candidates)
+
+    to_remove: set = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit() and 1 <= int(part) <= len(candidates):
+            to_remove.add(int(part) - 1)
+
+    confirmed = [nid for i, nid in enumerate(candidates) if i not in to_remove]
+    print(f"  Confirmed {len(confirmed)} boundary station(s).")
+    return confirmed
 
 
 # =============================================================================
@@ -1514,11 +1627,65 @@ def _preselect_rail_stop_nodes(
                     )
                     through_child = crossing_table.get(key) if key else None
 
+                    # One-sided fallback: exactly one of from_outlying / to_outlying
+                    # is None because one adjacent stop is outside the study buffer
+                    # (e.g. IC1/IC5 approaching from Bern/Aarau or departing to Bern/
+                    # Aarau).  Use the resolved side to scan the crossing table.
+                    # all_outlying includes hub-parent perimeter stations that never
+                    # appear in crossing table keys, so re-resolve against ct_outlying
+                    # (the set of stations that actually appear in crossing table keys).
+                    # If the scan is ambiguous, prefer the child with a forced gateway —
+                    # forced gateways mark DML-type tunnels used exclusively by
+                    # long-distance through services.
+                    # _skip_backtrack bypasses _is_same_gateway which cannot evaluate
+                    # direction when one adjacent node is None.
+                    _skip_backtrack = False
+                    _one_sided = (
+                        through_child is None
+                        and (from_outlying is None) != (to_outlying is None)
+                    )
+                    if _one_sided:
+                        ct_children = hub.get("children", {})
+                        ct_outlying = frozenset(
+                            o for key_ct in crossing_table.keys() for o in key_ct
+                        )
+                        # Use whichever side IS resolved; re-resolve against ct_outlying
+                        ref_node = next_node if from_outlying is None else prev_node
+                        resolved_ct = (
+                            _nearest_outlying(ref_node, ct_outlying, G)
+                            if ct_outlying else None
+                        )
+                        if resolved_ct is not None:
+                            matching = {
+                                child for key_ct, child in crossing_table.items()
+                                if resolved_ct in key_ct and child in valid_cands
+                            }
+                            if len(matching) == 1:
+                                through_child = next(iter(matching))
+                                _skip_backtrack = True
+                            elif len(matching) > 1:
+                                forced_side = {
+                                    c for c in matching
+                                    if any(
+                                        gdata.get("forced")
+                                        for gdata in ct_children.get(c, {}).get("gateways", {}).values()
+                                    )
+                                }
+                                if len(forced_side) == 1:
+                                    through_child = next(iter(forced_side))
+                                    _skip_backtrack = True
+
                     if through_child is not None and through_child in valid_cands:
                         # Backtracking check: do prev and next approach from the
-                        # same physical gateway of through_child?
+                        # same physical gateway of through_child?  Skip when the
+                        # child was resolved via forced-gateway fallback — the forced
+                        # gateway is physical proof of through-running and
+                        # _is_same_gateway would give a false positive with
+                        # prev_node=None.
                         children = hub.get("children", {})
-                        if _is_same_gateway(through_child, prev_node, next_node, children, G):
+                        if not _skip_backtrack and _is_same_gateway(
+                            through_child, prev_node, next_node, children, G
+                        ):
                             is_through = False  # falls through to terminating branch below
                         else:
                             best = through_child
@@ -2294,6 +2461,348 @@ def _run_phase1(
 
     print(f"\n  Phase 1 complete.")
     return rail_enriched, tram_enriched, func_enriched
+
+# =============================================================================
+# Phase 1.5 — Boundary Station Routing
+# =============================================================================
+
+def _collect_outside_stops_ld_ir(
+    rail_enriched: gpd.GeoDataFrame,
+    buffer_geom,
+) -> Dict[str, Dict]:
+    """
+    Collect unique stops from LD/IR services whose coordinates lie outside
+    buffer_geom.  Only rows whose _source_layer is in _LD_IR_LAYERS are examined.
+
+    Returns {stop_id: {name, E, N, services: set()}}
+    """
+    outside: Dict[str, Dict] = {}
+    if "_source_layer" not in rail_enriched.columns:
+        return outside
+
+    mask = rail_enriched["_source_layer"].isin(_LD_IR_LAYERS)
+    for _, row in rail_enriched[mask].iterrows():
+        svc = str(row.get("Service", "?"))
+        for sid_col, sname_col, e_col, n_col in [
+            ("FromCode", "FromStation", "x_origin", "y_origin"),
+            ("ToCode",   "ToStation",   "x_dest",   "y_dest"),
+        ]:
+            sid   = str(row.get(sid_col,   "")).strip()
+            sname = str(row.get(sname_col, "")).strip()
+            E     = float(row.get(e_col, 0) or 0)
+            N     = float(row.get(n_col, 0) or 0)
+            if not sid:
+                continue
+            pt = Point(E, N)
+            if buffer_geom is not None and pt.within(buffer_geom):
+                continue  # inside buffer — not an entry/exit stop
+            if sid not in outside:
+                outside[sid] = {"name": sname, "E": E, "N": N, "services": set()}
+            outside[sid]["services"].add(svc)
+
+    return outside
+
+
+def _run_destination_mapping_cli(
+    outside_stops: Dict[str, Dict],
+    confirmed_boundary_ids: List[int],
+    node_attrs: Dict[int, Dict],
+    existing_mapping: Optional[Dict[str, int]] = None,
+) -> Dict[str, int]:
+    """
+    Interactive CLI: assign each unique outside stop to a boundary station.
+
+    Displays existing assignments when editing a saved mapping so the user can
+    skip unchanged entries with Enter.  Returns {stop_id: boundary_node_id}.
+    """
+    if not outside_stops:
+        print("  No outside destinations found — nothing to map.")
+        return {}
+    if not confirmed_boundary_ids:
+        print("  No boundary stations confirmed — cannot map.")
+        return {}
+
+    mapping: Dict[str, int] = dict(existing_mapping or {})
+
+    print("\n  Available boundary stations:")
+    for i, nid in enumerate(confirmed_boundary_ids, 1):
+        name = node_attrs.get(nid, {}).get("name", str(nid))
+        print(f"    {i:3}) {name}  (node {nid})")
+
+    print(f"\n  Outside stops on LD/IR services ({len(outside_stops)} unique):")
+    for stop_id, info in outside_stops.items():
+        svc_sample = ", ".join(sorted(info["services"])[:5])
+        n_svc      = len(info["services"])
+        existing   = mapping.get(stop_id)
+        cur_str    = ""
+        if existing is not None:
+            cur_name = node_attrs.get(existing, {}).get("name", str(existing))
+            cur_str  = f"  [currently → {cur_name}]"
+
+        raw = input(
+            f"\n  '{info['name']}' ({n_svc} service(s): {svc_sample}){cur_str}\n"
+            f"    → boundary station number (or Enter to skip): "
+        ).strip()
+
+        if not raw:
+            continue
+        if raw.isdigit() and 1 <= int(raw) <= len(confirmed_boundary_ids):
+            chosen_nid  = confirmed_boundary_ids[int(raw) - 1]
+            mapping[stop_id] = chosen_nid
+            chosen_name = node_attrs.get(chosen_nid, {}).get("name", str(chosen_nid))
+            print(f"    → Assigned to: {chosen_name}")
+        else:
+            print(f"    Invalid input — skipped.")
+
+    return mapping
+
+
+def _apply_boundary_rerouting(
+    rail_enriched: gpd.GeoDataFrame,
+    boundary_mapping: Dict[str, int],
+    node_attrs: Dict[int, Dict],
+    G: nx.Graph,
+    seg_lookup: Dict,
+    buffer_geom,
+) -> gpd.GeoDataFrame:
+    """
+    Post-process rail_enriched: for LD/IR links where from_stop or to_stop has
+    a boundary mapping, replace straight-line geometry with:
+
+        straight_line(outside_coords → boundary_node)
+        + routed_path(boundary_node → inside_node)
+
+    Both entry and exit cases are handled symmetrically.  When both stops are
+    outside (service passing through), both segments are stitched together with
+    the graph-routed middle portion.
+
+    New columns added: boundary_entry_node, boundary_exit_node (pd.NA when unused).
+    Clears needs_correction on updated rows.
+    """
+    for col in ("boundary_entry_node", "boundary_exit_node"):
+        if col not in rail_enriched.columns:
+            rail_enriched[col] = pd.NA
+
+    if "_source_layer" not in rail_enriched.columns:
+        return rail_enriched
+
+    mask    = rail_enriched["_source_layer"].isin(_LD_IR_LAYERS)
+    updated = 0
+
+    for idx, row in rail_enriched[mask].iterrows():
+        from_id = str(row.get("FromCode", "")).strip()
+        to_id   = str(row.get("ToCode",   "")).strip()
+        from_E  = float(row.get("x_origin", 0) or 0)
+        from_N  = float(row.get("y_origin", 0) or 0)
+        to_E    = float(row.get("x_dest",   0) or 0)
+        to_N    = float(row.get("y_dest",   0) or 0)
+
+        from_bnode = boundary_mapping.get(from_id)
+        to_bnode   = boundary_mapping.get(to_id)
+        if from_bnode is None and to_bnode is None:
+            continue  # no mapping for either stop — nothing to do
+
+        from_pt      = Point(from_E, from_N)
+        to_pt        = Point(to_E,   to_N)
+        from_outside = buffer_geom is None or not from_pt.within(buffer_geom)
+        to_outside   = buffer_geom is None or not to_pt.within(buffer_geom)
+
+        # Determine effective routing endpoints on the BAV graph
+        if from_outside and from_bnode is not None:
+            route_from: Optional[int] = from_bnode
+        else:
+            nf = row.get("node_id_from")
+            route_from = int(nf) if pd.notna(nf) else None
+
+        if to_outside and to_bnode is not None:
+            route_to: Optional[int] = to_bnode
+        else:
+            nt = row.get("node_id_to")
+            route_to = int(nt) if pd.notna(nt) else None
+
+        if route_from is None or route_to is None:
+            continue
+
+        # Degenerate: boundary node equals the other matched endpoint
+        if route_from == route_to:
+            bE = node_attrs.get(route_from, {}).get("E", from_E)
+            bN = node_attrs.get(route_from, {}).get("N", from_N)
+            rail_enriched.at[idx, "geometry"] = LineString(
+                [(from_E, from_N), (bE, bN)]
+            )
+            if from_outside and from_bnode is not None:
+                rail_enriched.at[idx, "boundary_entry_node"] = route_from
+            rail_enriched.at[idx, "needs_correction"] = False
+            updated += 1
+            continue
+
+        # Route between the two effective endpoints on the BAV graph
+        routed_geom, via_st, via_jn, path_len, _, _ = route_between_nodes(
+            G, [route_from], [route_to], seg_lookup, node_attrs,
+        )
+        if routed_geom is None:
+            continue  # no graph path found — keep existing geometry
+
+        # Build combined geometry parts
+        geom_parts: List = []
+
+        if from_outside and from_bnode is not None:
+            bE = node_attrs.get(from_bnode, {}).get("E", from_E)
+            bN = node_attrs.get(from_bnode, {}).get("N", from_N)
+            geom_parts.append(LineString([(from_E, from_N), (bE, bN)]))
+            rail_enriched.at[idx, "boundary_entry_node"] = from_bnode
+
+        if routed_geom.geom_type == "LineString":
+            geom_parts.append(routed_geom)
+        elif hasattr(routed_geom, "geoms"):
+            geom_parts.extend(
+                g for g in routed_geom.geoms if g.geom_type == "LineString"
+            )
+
+        if to_outside and to_bnode is not None:
+            bE = node_attrs.get(to_bnode, {}).get("E", to_E)
+            bN = node_attrs.get(to_bnode, {}).get("N", to_N)
+            geom_parts.append(LineString([(bE, bN), (to_E, to_N)]))
+            rail_enriched.at[idx, "boundary_exit_node"] = to_bnode
+
+        combined = (
+            linemerge(geom_parts) if len(geom_parts) > 1
+            else (geom_parts[0] if geom_parts else routed_geom)
+        )
+
+        rail_enriched.at[idx, "geometry"]      = combined
+        rail_enriched.at[idx, "Via_Station"]   = via_st
+        rail_enriched.at[idx, "Via_Junction"]  = via_jn
+        rail_enriched.at[idx, "path_length_m"] = path_len
+        rail_enriched.at[idx, "needs_correction"] = False
+        updated += 1
+
+    print(f"  Boundary rerouting: {updated} link(s) updated.")
+    return rail_enriched
+
+
+def _run_phase1_5(
+    config: ProjectionConfig,
+    rail_enriched: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """
+    Phase 1.5: Boundary station detection and outside-destination rerouting.
+
+    Workflow
+    --------
+    a) Auto-detect boundary station candidates (leaf stations ≤5 km from buffer
+       edge); user confirms the list once — saved to boundary_stations.json.
+    b) Collect unique outside stops from LD/IR service links in rail_enriched.
+    c) User maps each outside stop to a boundary station — saved to
+       boundary_mapping.json.  On re-run, existing mapping is loaded and the
+       user can skip unchanged assignments.
+    d) Re-route affected links: straight_line(outside→boundary) + graph route
+       (boundary→inside stop), replacing the Phase-1 straight-line geometry.
+    e) Updated rail_enriched is saved to disk, overwriting the Phase-1 output
+       so Phase 2 and QGIS inspection see the improved geometry.
+
+    Returns the updated rail_enriched GeoDataFrame.
+    """
+    main_dir  = Path(paths.MAIN)
+    bs_path   = config.rail_output_dir / "boundary_stations.json"
+    bm_path   = config.rail_output_dir / "boundary_mapping.json"
+
+    print("\n" + "─" * 60)
+    print("  Phase 1.5 — Boundary Station Mapping")
+    print("─" * 60)
+
+    # Re-load infrastructure (may have been updated by Tier 4 during Phase 1).
+    # raw_nodes must be passed so missing junction nodes (e.g. Winterthur Nord)
+    # are healed into the graph — without them boundary rerouting takes long
+    # detours on severed corridors.
+    raw_nodes_path = config.raw_infra_dir / "nodes.gpkg"
+    raw_nodes_1_5  = gpd.read_file(raw_nodes_path) if raw_nodes_path.exists() else None
+    nodes      = gpd.read_file(config.infra_dir / "nodes.gpkg")
+    bav_segs   = gpd.read_file(config.infra_dir / "segments.gpkg")
+    G          = build_infra_graph(nodes, bav_segs, raw_nodes_1_5)
+    seg_lookup = build_segment_lookup(nodes, bav_segs, raw_nodes_1_5)
+    node_attrs = build_node_attrs(nodes)
+
+    # Load buffer geometry (same source as Phase 1)
+    buffer_geom = None
+    buf_path    = main_dir / paths.CATCHMENT_AREA_BUFFER_GPKG
+    if buf_path.exists():
+        buf_gdf     = gpd.read_file(buf_path)
+        buffer_geom = buf_gdf.geometry.union_all()
+
+    # ── a. Boundary station list ──────────────────────────────────────────────
+    existing_bs = _load_boundary_stations(bs_path)
+    if existing_bs is not None:
+        print(f"\n  Loaded {len(existing_bs)} boundary station(s) from {bs_path.name}.")
+        ans = input("  Re-detect and re-confirm? (y/n) [n]: ").strip().lower() or "n"
+        confirmed_bs: Optional[List[int]] = existing_bs if ans != "y" else None
+    else:
+        confirmed_bs = None
+
+    if confirmed_bs is None:
+        candidates = detect_boundary_station_candidates(G, nodes, buffer_geom)
+        print(f"\n  {len(candidates)} candidate boundary station(s) detected.")
+        if not candidates:
+            print("  No candidates found — Phase 1.5 skipped.")
+            return rail_enriched
+        confirmed_bs = _run_boundary_station_confirmation_cli(candidates, node_attrs)
+        _save_boundary_stations(confirmed_bs, bs_path)
+        print(f"  Boundary stations saved to {bs_path.name}.")
+
+    if not confirmed_bs:
+        print("  No boundary stations confirmed — Phase 1.5 skipped.")
+        return rail_enriched
+
+    # ── b. Collect outside stops from LD/IR services ──────────────────────────
+    outside_stops = _collect_outside_stops_ld_ir(rail_enriched, buffer_geom)
+    print(f"\n  {len(outside_stops)} unique outside stop(s) found on LD/IR services.")
+    if not outside_stops:
+        print("  Nothing to map — Phase 1.5 skipped.")
+        return rail_enriched
+
+    # ── c. Destination → boundary station mapping ─────────────────────────────
+    existing_bm = _load_boundary_mapping(bm_path)
+    if existing_bm is not None:
+        print(f"  Loaded {len(existing_bm)} mapping(s) from {bm_path.name}.")
+        ans = input("  Edit existing mapping? (y/n) [n]: ").strip().lower() or "n"
+        if ans == "y":
+            boundary_mapping = _run_destination_mapping_cli(
+                outside_stops, confirmed_bs, node_attrs,
+                existing_mapping=existing_bm,
+            )
+        else:
+            boundary_mapping = existing_bm
+    else:
+        boundary_mapping = _run_destination_mapping_cli(
+            outside_stops, confirmed_bs, node_attrs,
+        )
+
+    if not boundary_mapping:
+        print("  No mappings provided — Phase 1.5 skipped.")
+        return rail_enriched
+
+    _save_boundary_mapping(boundary_mapping, bm_path)
+    print(f"  Mapping saved to {bm_path.name}  ({len(boundary_mapping)} entry/ies).")
+
+    # ── d. Re-route affected LD/IR links ─────────────────────────────────────
+    print("\n  Applying boundary rerouting to LD/IR links...")
+    rail_enriched = _apply_boundary_rerouting(
+        rail_enriched, boundary_mapping, node_attrs, G, seg_lookup, buffer_geom,
+    )
+
+    # ── e. Overwrite Phase-1 on-disk output with updated geometry ─────────────
+    rail_out = config.rail_output_dir / "edges_in_corridor.gpkg"
+    if "_source_layer" in rail_enriched.columns:
+        for layer_name, layer_gdf in rail_enriched.groupby("_source_layer"):
+            layer_gdf = layer_gdf.drop(columns=["_source_layer"])
+            layer_gdf.to_file(rail_out, driver="GPKG", layer=layer_name)
+    else:
+        rail_enriched.to_file(rail_out, driver="GPKG")
+    print(f"  Updated rail output saved → {rail_out}")
+
+    print("\n  Phase 1.5 complete.")
+    return rail_enriched
+
 
 # =============================================================================
 # Phase 2a — QGIS Projects and Clipped Segment Geopackages
@@ -3076,6 +3585,7 @@ def main() -> None:
 
     if mode == "map":
         rail_enriched, tram_enriched, func_enriched = _run_phase1(config)
+        rail_enriched = _run_phase1_5(config, rail_enriched)
     else:
         # Load existing projection for correction
         rail_out = config.rail_output_dir / "edges_in_corridor.gpkg"
@@ -3084,7 +3594,17 @@ def main() -> None:
             print(f"\n  ERROR: Projected files not found in {config.rail_output_dir}.")
             raise SystemExit(1)
         print(f"\n  Loading existing projection...")
-        rail_enriched = gpd.read_file(rail_out)
+        import fiona as _fiona
+        _rail_layers = _fiona.listlayers(rail_out)
+        _rail_gdfs   = []
+        for _lyr in _rail_layers:
+            _gdf = gpd.read_file(rail_out, layer=_lyr)
+            _gdf["_source_layer"] = _lyr
+            _rail_gdfs.append(_gdf)
+        rail_enriched = (
+            gpd.GeoDataFrame(pd.concat(_rail_gdfs, ignore_index=True), crs=SWISS_CRS)
+            if _rail_gdfs else gpd.GeoDataFrame()
+        )
         tram_enriched = gpd.read_file(feeder_out, layer="tram")
         func_enriched = gpd.read_file(feeder_out, layer="funicular")
         print(
@@ -3092,6 +3612,7 @@ def main() -> None:
             f"{len(tram_enriched)} tram segments, "
             f"{len(func_enriched)} funicular segments."
         )
+        rail_enriched = _run_phase1_5(config, rail_enriched)
 
     rail_enriched, tram_enriched, func_enriched = _run_phase2(
         config, rail_enriched, tram_enriched, func_enriched
