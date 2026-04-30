@@ -45,6 +45,9 @@ NETWORK_INFRASTRUCTURE_BASE_SEGMENTS = r"data/Infrastructure/Base/segments.gpkg"
 # --- Infrastructure Plots ---
 INFRASTRUCTURE_PLOTS_DIR = r"plots/Infrastructure"
 
+# --- Network Plots ---
+NETWORK_PLOTS_DIR = r"plots/Network"
+
 POPULATION_RASTER = r"data\independent_variable\processed\replacement.pop20_ArcGisExport.tif"
 EMPLOYMENT_RASTER = r"data\independent_variable\processed\replacement.empl20_ArcGisExport.tif"
 POPULATION_SCENARIO_CANTON_ZH_2050 = r"data\Scenario\KTZH_00000705_00001741.csv"
@@ -59,6 +62,7 @@ MUNICIPAL_BOUNDARIES_GPKG = r"data/Spatial_Data/Boundaries/SwissBoundaries_Munic
 GTFS_TRANSIT_DIR = r"data/Network/GTFS_Timetable"
 BUS_LINES_DIR = r"data/Network/Buslines"
 FEEDER_LINES_DIR = r"data/Network/Feeder_Lines"
+RAIL_LINES_DIR = r"data/Network/Rail_Lines"
 RAIL_PROCESSED_DIR = r"data/Network/processed"
 EDGES_IN_CORRIDOR_GPKG = r"data/Network/processed/edges_in_corridor.gpkg"
 

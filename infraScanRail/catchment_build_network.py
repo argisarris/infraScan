@@ -11,8 +11,8 @@
 #     paths.FEEDER_LINES_DIR / PT_FEEDER_OUTPUT_FOLDER / PT_FEEDER_LINES_FILE
 #
 #   Rail (S-Bahn / regional / inter-regional / long-distance):
-#     paths.RAIL_PROCESSED_DIR / RAIL_OUTPUT_FOLDER / RAIL_STOPS_FILE
-#     paths.RAIL_PROCESSED_DIR / RAIL_OUTPUT_FOLDER / RAIL_LINES_FILE
+#     paths.RAIL_LINES_DIR / RAIL_OUTPUT_FOLDER / RAIL_STOPS_FILE
+#     paths.RAIL_LINES_DIR / RAIL_OUTPUT_FOLDER / RAIL_LINES_FILE
 #
 # Each lines GeoPackage contains one layer per route_type, each with one
 # feature per (route_id, direction_id, variant_rank) using structural
@@ -25,6 +25,8 @@ import statistics
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, Optional
 
 import pandas as pd
 import geopandas as gpd
@@ -48,7 +50,7 @@ PT_FEEDER_OUTPUT_FOLDER = 'FP2026_ZH_network'       # subfolder of paths.FEEDER_
 PT_FEEDER_STOPS_FILE    = 'pt_feeder_stops.gpkg'
 PT_FEEDER_LINES_FILE    = 'pt_feeder_lines.gpkg'
 
-RAIL_OUTPUT_FOLDER      = 'FP2026_ZH_network'       # subfolder of paths.RAIL_PROCESSED_DIR
+RAIL_OUTPUT_FOLDER      = 'FP2026_ZH_network'       # subfolder of paths.RAIL_LINES_DIR
 RAIL_STOPS_FILE         = 'rail_stops.gpkg'
 RAIL_LINES_FILE         = 'rail_lines.gpkg'
 
@@ -197,6 +199,19 @@ ZVV_SEGMENT_LAYER      = 'ZVV_LINIEN_L'
 ZVV_SBAHN_LAYER        = 'ZVV_S_BAHN_LINIEN_L'
 ZVV_MATCH_TOLERANCE_M  = 150   # max distance (m) for spatial stop crosswalk
 
+# ---------------------------------------------------------------------------
+# Projection-first geometry — uses infrabuild_service_projection.py outputs
+# as primary geometry source for track-based modes.
+# Set PROJECTION_SVC_VERSION / PROJECTION_INFRA_VERSION to match the version
+# pair produced by infrabuild_service_projection.py, or set either to None to
+# disable projection geometry and fall back to ZVV only.
+# ---------------------------------------------------------------------------
+PROJECTION_SVC_VERSION:   Optional[str] = "FP2026_ZH_network"
+PROJECTION_INFRA_VERSION: Optional[str] = "Base"
+
+# Flag segment when |proj_length/zvv_length − 1| exceeds this threshold.
+ZVV_DIVERGENCE_THRESHOLD: float = 0.30
+
 # S-Bahn snapping — relaxed tolerance and quality gates for whole-line projection
 SBAHN_SNAP_TOLERANCE_M = 2000  # max per-point distance (m) for S-Bahn line snapping
 SBAHN_MAX_SINUOSITY    = 3.5   # max path_length / straight_distance for a snapped segment
@@ -311,6 +326,11 @@ _zvv_chain_index  = {}                  # (line_name, from_sid) → [(to_sid, ge
 _zvv_sbahn_index  = {}                  # line_name → [LineString, ...]
 _zvv_sbahn_jgraph = {}                  # line_name → {junction_id → [(part_idx, other_junction, geom)]}
 _zvv_match_counts = defaultdict(int)    # 'direct'|'chain'|'sbahn'|'sbahn_chain'|'fallback' → int
+
+# Module-level projection geometry state (populated in Step 2b when projection is configured)
+_proj_rail_index:   Dict = {}  # (route_id, from_stop_id, to_stop_id) → LineString
+_proj_feeder_index: Dict = {}  # (route_id, from_stop_id, to_stop_id) → LineString
+_projection_available: bool = False
 
 
 def _load_zvv_geometry():
@@ -852,6 +872,149 @@ def _snap_to_sbahn_chained(from_pt, to_pt, line_name, max_hops=3):
                     best_result = result
 
     return best_result
+
+
+# ---------------------------------------------------------------------------
+# Projection geometry helpers
+# ---------------------------------------------------------------------------
+
+def _load_projection_geometry() -> bool:
+    """Load projected segment geometries from infrabuild_service_projection.py outputs.
+
+    Populates module-level dicts:
+      _proj_rail_index   — {(route_id, from_stop_id, to_stop_id): geometry}
+      _proj_feeder_index — {(route_id, from_stop_id, to_stop_id): geometry}
+
+    Only rows where needs_correction is False are indexed (straight-line
+    projection outputs are excluded so ZVV or straight-line fallback takes over).
+    Returns True if at least one file was loaded successfully.
+    """
+    global _proj_rail_index, _proj_feeder_index
+
+    if PROJECTION_SVC_VERSION is None or PROJECTION_INFRA_VERSION is None:
+        print("  Projection geometry disabled (version constants not set).")
+        return False
+
+    rail_path = (
+        Path(paths.MAIN)
+        / paths.RAIL_LINES_DIR
+        / PROJECTION_SVC_VERSION
+        / PROJECTION_INFRA_VERSION
+        / "edges_in_corridor.gpkg"
+    )
+    feeder_path = (
+        Path(paths.MAIN)
+        / paths.FEEDER_LINES_DIR
+        / PROJECTION_SVC_VERSION
+        / PROJECTION_INFRA_VERSION
+        / "pt_feeder_segments.gpkg"
+    )
+
+    loaded = False
+
+    if rail_path.exists():
+        import fiona as _fiona
+        for lname in _fiona.listlayers(str(rail_path)):
+            try:
+                gdf = gpd.read_file(str(rail_path), layer=lname)
+            except Exception:
+                continue
+            if "needs_correction" in gdf.columns:
+                gdf = gdf[~gdf["needs_correction"].astype(bool)]
+            for _, row in gdf.iterrows():
+                key = (
+                    str(row.get("Service", "")),
+                    str(row.get("FromCode", "")),
+                    str(row.get("ToCode", "")),
+                )
+                if key[0] and key[1] and key[2] and row.geometry is not None:
+                    _proj_rail_index[key] = row.geometry
+        print(f"  Projection rail index: {len(_proj_rail_index)} segments from {rail_path.name}")
+        loaded = True
+    else:
+        print(f"  WARNING: Projection rail file not found: {rail_path}")
+
+    if feeder_path.exists():
+        import fiona as _fiona
+        feeder_layers = {"tram", "funicular", "metro"}
+        for lname in _fiona.listlayers(str(feeder_path)):
+            if lname not in feeder_layers:
+                continue
+            try:
+                gdf = gpd.read_file(str(feeder_path), layer=lname)
+            except Exception:
+                continue
+            if "needs_correction" in gdf.columns:
+                gdf = gdf[~gdf["needs_correction"].astype(bool)]
+            for _, row in gdf.iterrows():
+                key = (
+                    str(row.get("route_id", "")),
+                    str(row.get("from_stop_id", "")),
+                    str(row.get("to_stop_id", "")),
+                )
+                if key[0] and key[1] and key[2] and row.geometry is not None:
+                    _proj_feeder_index[key] = row.geometry
+        print(f"  Projection feeder index: {len(_proj_feeder_index)} segments from {feeder_path.name}")
+        loaded = True
+    else:
+        print(f"  WARNING: Projection feeder file not found: {feeder_path}")
+
+    return loaded
+
+
+def _get_proj_segment_geom(
+    from_sid: str,
+    to_sid: str,
+    route_id: str,
+    is_feeder: bool = False,
+) -> Optional[object]:
+    """Return projected geometry for a stop pair, or None if not available."""
+    index = _proj_feeder_index if is_feeder else _proj_rail_index
+    return index.get((str(route_id), str(from_sid), str(to_sid)))
+
+
+def _build_linestring_proj(
+    stop_sequence,
+    route_id: str,
+    stop_coord: dict,
+    is_feeder: bool = False,
+    line_name: str = "",
+) -> Optional[LineString]:
+    """Assemble a full-route LineString from projected stop-pair segments.
+
+    For each consecutive stop pair, tries projection first, then ZVV, then
+    straight-line.  Merges all pieces with linemerge().
+    Returns None when fewer than two stops can be resolved.
+    """
+    geom_parts = []
+    for i in range(len(stop_sequence) - 1):
+        from_sid = stop_sequence[i]
+        to_sid   = stop_sequence[i + 1]
+
+        seg_geom = _get_proj_segment_geom(from_sid, to_sid, route_id, is_feeder)
+
+        if seg_geom is None and _zvv_geometry_available:
+            seg_geom = _get_zvv_segment_geom(from_sid, to_sid, line_name)
+
+        if seg_geom is None:
+            from_pt = stop_coord.get(from_sid)
+            to_pt   = stop_coord.get(to_sid)
+            if from_pt is not None and to_pt is not None:
+                seg_geom = LineString([(from_pt.x, from_pt.y), (to_pt.x, to_pt.y)])
+
+        if seg_geom is not None:
+            if seg_geom.geom_type == "LineString":
+                geom_parts.append(seg_geom)
+            elif hasattr(seg_geom, "geoms"):
+                geom_parts.extend(g for g in seg_geom.geoms if g.geom_type == "LineString")
+
+    if not geom_parts:
+        return None
+    merged = linemerge(geom_parts)
+    if merged.geom_type == "MultiLineString":
+        # Return as-is — caller handles MultiLineString
+        return merged
+    return merged
 
 
 def _get_zvv_segment_geom(from_sid, to_sid, line_name):
@@ -1545,6 +1708,8 @@ def _hex_to_rgba(hex_colour, alpha=255):
 
 # --- QGIS project (.qgz) generation ---
 
+_QGIS_VERSION = "3.44.9-Solothurn"
+
 _SRS_BLOCK = """<spatialrefsys nativeFormat="wkt">
       <proj4>+proj=somerc +lat_0=46.9524055555556 +lon_0=7.43958333333333 +k_0=1 +x_0=2600000 +y_0=1200000 +ellps=bessel +towgs84=674.374,15.056,405.346,0,0,0,0 +units=m +no_defs</proj4>
       <srsid>47</srsid>
@@ -1705,7 +1870,7 @@ def _build_qgz(qgz_path, layers):
     layers_xml   = "\n".join(maplayer_blocks)
 
     qgs = f"""<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
-<qgis projectname="Network Build" version="3.44.3-Solothurn">
+<qgis projectname="Network Build" version="{_QGIS_VERSION}">
   <homePath path=""/>
   <title>Network Build</title>
   <autotransaction active="0"/>
@@ -1843,7 +2008,7 @@ def _configure_pipeline():
     default_output = gtfs_input.replace('GTFS_', '', 1) + '_network' if gtfs_input.startswith('GTFS_') else gtfs_input + '_network'
     print("\nE. OUTPUT FOLDER")
     print(f"   PT-Feeder base: {paths.FEEDER_LINES_DIR}")
-    print(f"   Rail base:      {paths.RAIL_PROCESSED_DIR}")
+    print(f"   Rail base:      {paths.RAIL_LINES_DIR}")
     output_folder = input(
         f"\n   Enter output folder name [{default_output}]: "
     ).strip() or default_output
@@ -1900,7 +2065,7 @@ WRITE_OFFPEAK        = _pipeline_cfg['write_offpeak']
 os.chdir(paths.MAIN)
 
 _pt_out_dir       = os.path.join(paths.FEEDER_LINES_DIR,   PT_FEEDER_OUTPUT_FOLDER)
-_rail_out_dir     = os.path.join(paths.RAIL_PROCESSED_DIR,  RAIL_OUTPUT_FOLDER)
+_rail_out_dir     = os.path.join(paths.RAIL_LINES_DIR,  RAIL_OUTPUT_FOLDER)
 _pt_allday_dir    = os.path.join(_pt_out_dir,   'All_Day')
 _pt_peak_dir      = os.path.join(_pt_out_dir,   'Peak')
 _pt_offpeak_dir   = os.path.join(_pt_out_dir,   'Off_Peak')
@@ -2200,7 +2365,7 @@ else:
 
 
 # ---------------------------------------------------------------------------
-# Step 2b — load ZVV geometry (optional)
+# Step 2b — load projection geometry (primary) and ZVV geometry (fallback)
 # ---------------------------------------------------------------------------
 
 _zvv_geometry_available = False
@@ -2211,6 +2376,11 @@ if USE_ZVV_GEOMETRY:
         print("  ZVV geometry disabled — using straight-line geometry.")
 else:
     print("\n[2b] ZVV geometry disabled (USE_ZVV_GEOMETRY = False)")
+
+print("\n[2b] Loading projection geometry ...")
+_projection_available = _load_projection_geometry()
+if not _projection_available:
+    print("  Projection geometry disabled — ZVV or straight-line will be used.")
 
 
 # ---------------------------------------------------------------------------
@@ -2737,10 +2907,17 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
                 # stop_ids are parent-station level — direct lookup in stop_coord
                 # Ships (route_type 1000) always use straight lines — they don't follow
                 # road/rail geometry and ZVV line data doesn't represent actual routes.
-                if _zvv_geometry_available and route_type_int != 1000:
+                # Priority: projection geometry → ZVV → straight-line.
+                _is_feeder_line = (mode_class_tag != 'rail')
+                geom = None
+                if _projection_available and route_type_int != 1000:
+                    geom = _build_linestring_proj(
+                        seq, route_id, stop_coord,
+                        is_feeder=_is_feeder_line,
+                        line_name=short_name,
+                    )
+                if geom is None and _zvv_geometry_available and route_type_int != 1000:
                     geom = _build_linestring_zvv(seq, stop_coord, short_name)
-                else:
-                    geom = None
                 if geom is None:
                     geom = _build_linestring(seq, stop_coord)
                 if geom is None:
@@ -3041,33 +3218,59 @@ def build_segments(lines_by_type, mode_class_tag):
                 if from_pt is None or to_pt is None:
                     continue
 
+                # Priority: projection → ZVV → straight-line
+                _is_feeder_seg = (mode_class_tag != 'rail')
+                _seg_route_id  = row['route_id']
+                _seg_line_name = row['line_short_name']
+                zvv_divergence_flag = False
+
+                proj_geom = None
+                if _projection_available:
+                    proj_geom = _get_proj_segment_geom(
+                        from_sid, to_sid, _seg_route_id, is_feeder=_is_feeder_seg)
+
+                zvv_geom = None
                 if _zvv_geometry_available:
-                    zvv_geom = _get_zvv_segment_geom(
-                        from_sid, to_sid, row['line_short_name'])
-                    geom = zvv_geom if zvv_geom is not None else \
-                        LineString([(from_pt.x, from_pt.y), (to_pt.x, to_pt.y)])
+                    zvv_geom = _get_zvv_segment_geom(from_sid, to_sid, _seg_line_name)
+
+                if proj_geom is not None:
+                    geom = proj_geom
+                    # Cross-check against ZVV when both are available
+                    if zvv_geom is not None:
+                        proj_len = proj_geom.length
+                        zvv_len  = zvv_geom.length
+                        if zvv_len > 0 and abs(proj_len / zvv_len - 1) > ZVV_DIVERGENCE_THRESHOLD:
+                            zvv_divergence_flag = True
+                            print(
+                                f"  [ZVV check] divergence on {_seg_route_id} "
+                                f"{from_sid}→{to_sid}: "
+                                f"proj={proj_len:.0f}m ZVV={zvv_len:.0f}m"
+                            )
+                elif zvv_geom is not None:
+                    geom = zvv_geom
                 else:
                     geom = LineString([(from_pt.x, from_pt.y), (to_pt.x, to_pt.y)])
 
                 seg_rec = {
-                    'route_id':         row['route_id'],
-                    'direction_id':     row['direction_id'],
-                    'variant_rank':     row['variant_rank'],
-                    'line_short_name':  row['line_short_name'],
-                    'mode_label':       row['mode_label'],
-                    'mode_class':       mode_class_tag,
-                    'from_stop_id':     from_sid,
-                    'to_stop_id':       to_sid,
-                    'from_stop_name':   stop_name.get(from_sid, ''),
-                    'to_stop_name':     stop_name.get(to_sid, ''),
-                    'from_stop_E':      from_pt.x,
-                    'from_stop_N':      from_pt.y,
-                    'to_stop_E':        to_pt.x,
-                    'to_stop_N':        to_pt.y,
-                    'travel_time_min':  seg_times[i]['travel_time_min'],
-                    'InVehWait_min':    seg_times[i]['InVehWait_min'],
-                    'service_period':   row['service_period'],
-                    'geometry':         geom,
+                    'route_id':           row['route_id'],
+                    'direction_id':       row['direction_id'],
+                    'variant_rank':       row['variant_rank'],
+                    'line_short_name':    row['line_short_name'],
+                    'mode_label':         row['mode_label'],
+                    'mode_class':         mode_class_tag,
+                    'from_stop_id':       from_sid,
+                    'to_stop_id':         to_sid,
+                    'from_stop_name':     stop_name.get(from_sid, ''),
+                    'to_stop_name':       stop_name.get(to_sid, ''),
+                    'from_stop_E':        from_pt.x,
+                    'from_stop_N':        from_pt.y,
+                    'to_stop_E':          to_pt.x,
+                    'to_stop_N':          to_pt.y,
+                    'travel_time_min':    seg_times[i]['travel_time_min'],
+                    'InVehWait_min':      seg_times[i]['InVehWait_min'],
+                    'service_period':     row['service_period'],
+                    'zvv_divergence_flag': zvv_divergence_flag,
+                    'geometry':           geom,
                 }
                 segment_records.setdefault(rt, []).append(seg_rec)
 

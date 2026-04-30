@@ -549,44 +549,50 @@ def _split_segment_at(
     id_B = f"c{new_node_code}_{to_code}"
 
     row_A = {
-        'segment_id':      id_A,
-        'segment_name':    id_A,
-        'from_name':       S['from_name'],
-        'to_name':         new_node_name,
-        'from_N':          S.get('from_N', pd.NA),
-        'from_E':          S.get('from_E', pd.NA),
-        'to_N':            split_pt.y,
-        'to_E':            split_pt.x,
-        'length_m':        geom_A.length,
-        'num_tracks':      S['num_tracks'],
-        'gauge':           S['gauge'],
-        'electrification': S['electrification'],
-        'km_start':        S['km_start'],
-        'km_end':          km_mid,
-        'route_number':    S['route_number'],
-        'route_name':      S['route_name'],
-        'route_owner':     S['route_owner'],
-        'geometry':        geom_A,
+        'segment_id':                    id_A,
+        'segment_name':                  id_A,
+        'from_name':                     S['from_name'],
+        'to_name':                       new_node_name,
+        'from_N':                        S.get('from_N', pd.NA),
+        'from_E':                        S.get('from_E', pd.NA),
+        'to_N':                          split_pt.y,
+        'to_E':                          split_pt.x,
+        'length_m':                      geom_A.length,
+        'num_tracks':                    S['num_tracks'],
+        'gauge':                         S['gauge'],
+        'electrification':               S['electrification'],
+        'km_start':                      S['km_start'],
+        'km_end':                        km_mid,
+        'route_number':                  S['route_number'],
+        'route_name':                    S['route_name'],
+        'route_owner':                   S['route_owner'],
+        'average_speed':                 S.get('average_speed', pd.NA),
+        'predominant_speed':             S.get('predominant_speed', pd.NA),
+        'predominant_speed_coverage_pct': S.get('predominant_speed_coverage_pct', 0.0),
+        'geometry':                      geom_A,
     }
     row_B = {
-        'segment_id':      id_B,
-        'segment_name':    id_B,
-        'from_name':       new_node_name,
-        'to_name':         S['to_name'],
-        'from_N':          split_pt.y,
-        'from_E':          split_pt.x,
-        'to_N':            S.get('to_N', pd.NA),
-        'to_E':            S.get('to_E', pd.NA),
-        'length_m':        geom_B.length,
-        'num_tracks':      S['num_tracks'],
-        'gauge':           S['gauge'],
-        'electrification': S['electrification'],
-        'km_start':        km_mid,
-        'km_end':          S['km_end'],
-        'route_number':    S['route_number'],
-        'route_name':      S['route_name'],
-        'route_owner':     S['route_owner'],
-        'geometry':        geom_B,
+        'segment_id':                    id_B,
+        'segment_name':                  id_B,
+        'from_name':                     new_node_name,
+        'to_name':                       S['to_name'],
+        'from_N':                        split_pt.y,
+        'from_E':                        split_pt.x,
+        'to_N':                          S.get('to_N', pd.NA),
+        'to_E':                          S.get('to_E', pd.NA),
+        'length_m':                      geom_B.length,
+        'num_tracks':                    S['num_tracks'],
+        'gauge':                         S['gauge'],
+        'electrification':               S['electrification'],
+        'km_start':                      km_mid,
+        'km_end':                        S['km_end'],
+        'route_number':                  S['route_number'],
+        'route_name':                    S['route_name'],
+        'route_owner':                   S['route_owner'],
+        'average_speed':                 S.get('average_speed', pd.NA),
+        'predominant_speed':             S.get('predominant_speed', pd.NA),
+        'predominant_speed_coverage_pct': S.get('predominant_speed_coverage_pct', 0.0),
+        'geometry':                      geom_B,
     }
 
     # Remove original segment, add A and B
@@ -853,12 +859,16 @@ def _adjust_segment(
 
     COLS = [
         'from_name', 'to_name', 'length_m', 'num_tracks', 'gauge', 'electrification',
-        'km_start', 'km_end', 'route_number', 'route_name', 'route_owner'
+        'km_start', 'km_end', 'route_number', 'route_name', 'route_owner', 'average_speed',
     ]
     header  = ", ".join(COLS)
     current = ", ".join(str(row.get(c, '')) for c in COLS)
     print(f"\n  {header}")
     print(f"  {current}")
+    print(
+        f"  OSM-derived (read-only): predominant_speed={row.get('predominant_speed', 'N/A')}  "
+        f"coverage_pct={row.get('predominant_speed_coverage_pct', 'N/A')}"
+    )
 
     pieces = composition[composition['segment_id'] == row['segment_id']]
     comp_strs = [f"{p['construct_type']} {float(p['piece_length_m']):.0f}m" for _, p in pieces.iterrows()]
@@ -873,12 +883,12 @@ def _adjust_segment(
 
         EDITABLE = [
             'num_tracks', 'gauge', 'electrification',
-            'km_start', 'km_end', 'route_number', 'route_name', 'route_owner'
+            'km_start', 'km_end', 'route_number', 'route_name', 'route_owner', 'average_speed',
         ]
         for col, val in zip(COLS, parts):
             if val == '' or col not in EDITABLE:
                 continue
-            if col in ('km_start', 'km_end'):
+            if col in ('km_start', 'km_end', 'average_speed'):
                 try:
                     segments.at[row_idx, col] = float(val)
                 except ValueError:
@@ -947,7 +957,7 @@ def _add_segment(
     geom = LineString([(f_node['E'], f_node['N']), (t_node['E'], t_node['N'])])
     
     COLS = [
-        'num_tracks', 'gauge', 'electrification', 'route_number', 
+        'num_tracks', 'gauge', 'electrification', 'route_number',
         'route_name', 'route_owner', 'km_start', 'km_end'
     ]
     print(f"\n  Attributes: {', '.join(COLS)}")
@@ -956,7 +966,7 @@ def _add_segment(
     if len(parts) != len(COLS):
         print("  Invalid number of parts. Cancelled.")
         return segments, composition
-    
+
     vals = {}
     for col, v in zip(COLS, parts):
         if col in ('num_tracks', 'gauge'):
@@ -967,28 +977,37 @@ def _add_segment(
         else:
             vals[col] = v if v else pd.NA
 
+    spd_raw = input("  Average / predominant speed (km/h, Enter for none): ").strip()
+    try:
+        avg_speed = float(spd_raw) if spd_raw else pd.NA
+    except ValueError:
+        avg_speed = pd.NA
+
     seg_id  = f"c{f_node['CODE']}_{t_node['CODE']}"
     seg_len = geom.length
 
     new_seg = {
-        'segment_id':      seg_id,
-        'segment_name':    seg_id,
-        'from_name':       f_node['NAME'],
-        'to_name':         t_node['NAME'],
-        'from_N':          f_node['N'],
-        'from_E':          f_node['E'],
-        'to_N':            t_node['N'],
-        'to_E':            t_node['E'],
-        'length_m':        seg_len,
-        'num_tracks':      vals.get('num_tracks', pd.NA),
-        'gauge':           vals.get('gauge', pd.NA),
-        'electrification': vals.get('electrification', pd.NA),
-        'km_start':        vals.get('km_start', pd.NA),
-        'km_end':          vals.get('km_end', pd.NA),
-        'route_number':    vals.get('route_number', pd.NA),
-        'route_name':      vals.get('route_name', pd.NA),
-        'route_owner':     vals.get('route_owner', pd.NA),
-        'geometry':        geom,
+        'segment_id':                    seg_id,
+        'segment_name':                  seg_id,
+        'from_name':                     f_node['NAME'],
+        'to_name':                       t_node['NAME'],
+        'from_N':                        f_node['N'],
+        'from_E':                        f_node['E'],
+        'to_N':                          t_node['N'],
+        'to_E':                          t_node['E'],
+        'length_m':                      seg_len,
+        'num_tracks':                    vals.get('num_tracks', pd.NA),
+        'gauge':                         vals.get('gauge', pd.NA),
+        'electrification':               vals.get('electrification', pd.NA),
+        'km_start':                      vals.get('km_start', pd.NA),
+        'km_end':                        vals.get('km_end', pd.NA),
+        'route_number':                  vals.get('route_number', pd.NA),
+        'route_name':                    vals.get('route_name', pd.NA),
+        'route_owner':                   vals.get('route_owner', pd.NA),
+        'average_speed':                 avg_speed,
+        'predominant_speed':             avg_speed,
+        'predominant_speed_coverage_pct': 1.0 if pd.notna(avg_speed) else 0.0,
+        'geometry':                      geom,
     }
 
     print("\n  Now define the segment composition:")

@@ -75,15 +75,36 @@ MODE_COLOURS = {
     "fallback": "#e07b00",   # orange (straight-line / unmatched)
 }
 
-# Maximum extra distance (metres) to still prefer a dead-end terminal hub node
+# Maximum extra travel time (seconds) to still prefer a dead-end terminal hub node
 # over a cheaper through-running child.  If the cheapest terminal node costs
 # less than this much more than the cheapest candidate overall, the terminal is
 # preferred for terminal (first/last) stops at hub stations.
-TERMINAL_PREFERENCE_M: int = 1500
+# (~1500 m at 45 km/h ≈ 120 s; set to 300 s for a wider tolerance margin.)
+TERMINAL_PREFERENCE_S: int = 300
 
-# Source-layer names for long-distance and inter-regional rail services
-# (mirrors _QGZ_LAYER_NAMES entries for route_types 102 and 103)
-_LD_IR_LAYERS: frozenset = frozenset({"long_distance_rail", "inter_regional_rail"})
+# Default routing speeds (km/h) used when OSM maxspeed data is absent.
+# Mixed-mode segments use the minimum (most conservative) of the applicable values.
+RAIL_DEFAULT_SPEED_KMH: int        = 50   # train (all gauges)
+TRAM_DEFAULT_SPEED_KMH: int        = 30   # urban tram / light rail
+FUNICULAR_DEFAULT_SPEED_KMH: int   = 20   # funicular
+COG_RAILWAY_DEFAULT_SPEED_KMH: int = 15   # cog railway
+
+_MODE_DEFAULT_SPEEDS: Dict[str, int] = {
+    "train":       RAIL_DEFAULT_SPEED_KMH,
+    "tram":        TRAM_DEFAULT_SPEED_KMH,
+    "funicular":   FUNICULAR_DEFAULT_SPEED_KMH,
+    "cog_railway": COG_RAILWAY_DEFAULT_SPEED_KMH,
+}
+
+# Layers subject to boundary gateway rerouting (Phase 1.5).
+# Services in these layers that start/end outside the buffer are re-routed
+# via the nearest confirmed boundary station.
+_GATEWAY_LAYERS: frozenset = frozenset({
+    "long_distance_rail",
+    "inter_regional_rail",
+    "regional_rail",
+    "sbahn",
+})
 
 # =============================================================================
 # QGIS project styling constants (mirrored from catchment_build_network.py)
@@ -160,8 +181,8 @@ class ProjectionConfig:
     svc_version: str
     infra_dir: Path          # data/Infrastructure/<infra_version>/
     svc_dir: Path            # data/Network/Feeder_Lines/<svc_version>/
-    rail_input: Path         # data/Network/processed/<svc_version>/rail_segments.gpkg
-    rail_output_dir: Path    # data/Network/processed/<svc>/<infra>/
+    rail_input: Path         # data/Network/Rail_Lines/<svc_version>/rail_segments.gpkg
+    rail_output_dir: Path    # data/Network/Rail_Lines/<svc>/<infra>/
     feeder_output_dir: Path  # data/Network/Feeder_Lines/<svc>/<infra>/
     raw_infra_dir: Path      # data/Infrastructure/Raw/
 
@@ -169,6 +190,33 @@ class ProjectionConfig:
 # =============================================================================
 # Infrastructure Graph
 # =============================================================================
+
+def _default_speed(mode, gauge=None) -> float:
+    """Return the default routing speed (km/h) for a segment.
+
+    Prefers transport_mode; falls back to gauge when mode is absent.
+    Mixed-mode segments use the minimum (most conservative) value.
+    """
+    if mode is not None and not (isinstance(mode, float) and np.isnan(mode)):
+        mode_str = str(mode).strip()
+        if mode_str:
+            speeds = [
+                _MODE_DEFAULT_SPEEDS.get(m.strip(), RAIL_DEFAULT_SPEED_KMH)
+                for m in mode_str.split('/')
+                if m.strip()
+            ]
+            if speeds:
+                return float(min(speeds))
+    # Gauge fallback for NaN-mode segments
+    if gauge is None or (isinstance(gauge, float) and np.isnan(gauge)):
+        return float(RAIL_DEFAULT_SPEED_KMH)
+    g = int(gauge)
+    if g <= 900:
+        return float(FUNICULAR_DEFAULT_SPEED_KMH)
+    if g == 1000:
+        return float(TRAM_DEFAULT_SPEED_KMH)
+    return float(RAIL_DEFAULT_SPEED_KMH)
+
 
 def _build_name_to_id(nodes: gpd.GeoDataFrame) -> Dict[str, int]:
     """
@@ -281,9 +329,23 @@ def build_infra_graph(
             skipped += 1
             continue
 
+        seg_length_m = float(seg.get("length_m", 0))
+        raw_speed    = seg.get("average_speed")
+        speed_kmh    = (
+            float(raw_speed)
+            if raw_speed is not None
+            and not (isinstance(raw_speed, float) and np.isnan(raw_speed))
+            else _default_speed(seg.get("transport_mode"), seg.get("gauge"))
+        )
+        travel_time_s = (
+            seg_length_m / (speed_kmh / 3.6)
+            if speed_kmh > 0
+            else seg_length_m / (RAIL_DEFAULT_SPEED_KMH / 3.6)
+        )
         G.add_edge(
             fn, tn,
-            weight=float(seg.get("length_m", 0)),
+            weight=travel_time_s,      # routing metric: travel time in seconds
+            length_m=seg_length_m,     # physical distance for path_length_m output
             segment_id=seg.get("segment_id", ""),
             geometry=seg.geometry,
         )
@@ -1039,7 +1101,7 @@ def route_between_nodes(
                 geoms.append(raw_geom)
             elif hasattr(raw_geom, 'geoms'):
                 geoms.extend([g for g in raw_geom.geoms if g.geom_type == "LineString"])
-            total_length += float(G[path[i]][path[i + 1]].get("weight", 0))
+            total_length += float(G[path[i]][path[i + 1]].get("length_m", 0))
 
     final_geom = linemerge(geoms) if geoms else None
 
@@ -1502,7 +1564,7 @@ def _preselect_rail_stop_nodes(
 
     For terminal stops (first or last in the sequence) the candidate with the
     shortest approach distance is chosen, with a preference boost of
-    TERMINAL_PREFERENCE_M for terminal (single-approach) nodes.
+    TERMINAL_PREFERENCE_S for terminal (single-approach) nodes.
 
     For stops not associated with any hub in hub_topology the original bilateral
     cost minimisation is used unchanged.
@@ -1694,7 +1756,7 @@ def _preselect_rail_stop_nodes(
                         # terminal preference.  Pairs with no crossing entry are
                         # typically same-side (both approaching from Langstrasse,
                         # etc.) and would backtrack through any through-running
-                        # child.  Apply TERMINAL_PREFERENCE_M tolerance so a
+                        # child.  Apply TERMINAL_PREFERENCE_S tolerance so a
                         # terminal node wins over a through-running child by a
                         # thin cost margin.
                         _blt = lambda c: _bilateral(c, prev_node, next_node)
@@ -1706,7 +1768,7 @@ def _preselect_rail_stop_nodes(
                         if _term_cands_b:
                             _cheapest_term_b = min(_term_cands_b, key=_blt)
                             _extra_b = _blt(_cheapest_term_b) - _blt(_cheapest_all_b)
-                            best = _cheapest_term_b if _extra_b <= TERMINAL_PREFERENCE_M else _cheapest_all_b
+                            best = _cheapest_term_b if _extra_b <= TERMINAL_PREFERENCE_S else _cheapest_all_b
                         else:
                             best = _cheapest_all_b
 
@@ -1714,7 +1776,7 @@ def _preselect_rail_stop_nodes(
                 # mutated to False inside the through-branch (backtracking case).
                 if not is_through:
                     # Step (e): terminating service (or backtracking through service)
-                    # Prefer terminal child nodes; apply TERMINAL_PREFERENCE_M tolerance.
+                    # Prefer terminal child nodes; apply TERMINAL_PREFERENCE_S tolerance.
                     approaching    = prev_node if i > 0 else next_node
                     cheapest_all   = min(valid_cands, key=lambda c: _approach_cost(c, approaching))
                     terminal_cands = [
@@ -1727,7 +1789,7 @@ def _preselect_rail_stop_nodes(
                             _approach_cost(cheapest_term, approaching)
                             - _approach_cost(cheapest_all, approaching)
                         )
-                        best = cheapest_term if extra <= TERMINAL_PREFERENCE_M else cheapest_all
+                        best = cheapest_term if extra <= TERMINAL_PREFERENCE_S else cheapest_all
                     else:
                         best = cheapest_all
 
@@ -1867,6 +1929,8 @@ def enrich_feeder_segments(
 # so both scripts produce visually identical projects.
 
 import zipfile as _zipfile
+
+_QGIS_VERSION = "3.44.9-Solothurn"
 
 _QGZ_SRS_BLOCK = """<spatialrefsys nativeFormat="wkt">
       <proj4>+proj=somerc +lat_0=46.9524055555556 +lon_0=7.43958333333333 +k_0=1 +x_0=2600000 +y_0=1200000 +ellps=bessel +towgs84=674.374,15.056,405.346,0,0,0,0 +units=m +no_defs</proj4>
@@ -2027,7 +2091,7 @@ def _build_qgz(qgz_path: str, layers: List[dict]) -> None:
     layers_xml = "\n".join(maplayer_blocks)
 
     qgs = f"""<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
-<qgis projectname="Network Build" version="3.44.3-Solothurn">
+<qgis projectname="Network Build" version="{_QGIS_VERSION}">
   <homePath path=""/>
   <title>Network Build</title>
   <autotransaction active="0"/>
@@ -2268,7 +2332,7 @@ def _run_phase0() -> Optional[Tuple[ProjectionConfig, str]]:
         mode = "map"
 
     # Derive output paths
-    rail_output_dir = main / paths.RAIL_PROCESSED_DIR / svc_version / infra_version
+    rail_output_dir = main / paths.RAIL_LINES_DIR / svc_version / infra_version
     feeder_output_dir = (
         main / paths.FEEDER_LINES_DIR / svc_version / infra_version
     )
@@ -2287,7 +2351,7 @@ def _run_phase0() -> Optional[Tuple[ProjectionConfig, str]]:
     )
 
     # Dynamic Rail data input from Phase 0 svc_version folder
-    config.rail_input = main / paths.RAIL_PROCESSED_DIR / svc_version / "rail_segments.gpkg"
+    config.rail_input = main / paths.RAIL_LINES_DIR / svc_version / "rail_segments.gpkg"
 
     print(f"\n  Infrastructure : {infra_version}")
     print(f"  Service        : {svc_version}")
@@ -2466,13 +2530,14 @@ def _run_phase1(
 # Phase 1.5 — Boundary Station Routing
 # =============================================================================
 
-def _collect_outside_stops_ld_ir(
+def _collect_outside_stops_gateway(
     rail_enriched: gpd.GeoDataFrame,
     buffer_geom,
 ) -> Dict[str, Dict]:
     """
-    Collect unique stops from LD/IR services whose coordinates lie outside
-    buffer_geom.  Only rows whose _source_layer is in _LD_IR_LAYERS are examined.
+    Collect unique stops from gateway-layer services (LD, IR, RE, S-Bahn) whose
+    coordinates lie outside buffer_geom.  Only rows whose _source_layer is in
+    _GATEWAY_LAYERS are examined.
 
     Returns {stop_id: {name, E, N, services: set()}}
     """
@@ -2480,22 +2545,34 @@ def _collect_outside_stops_ld_ir(
     if "_source_layer" not in rail_enriched.columns:
         return outside
 
-    mask = rail_enriched["_source_layer"].isin(_LD_IR_LAYERS)
+    mask = rail_enriched["_source_layer"].isin(_GATEWAY_LAYERS)
     for _, row in rail_enriched[mask].iterrows():
         svc = str(row.get("Service", "?"))
-        for sid_col, sname_col, e_col, n_col in [
-            ("FromCode", "FromStation", "x_origin", "y_origin"),
-            ("ToCode",   "ToStation",   "x_dest",   "y_dest"),
+
+        from_E = float(row.get("x_origin", 0) or 0)
+        from_N = float(row.get("y_origin", 0) or 0)
+        to_E   = float(row.get("x_dest",   0) or 0)
+        to_N   = float(row.get("y_dest",   0) or 0)
+
+        from_inside = buffer_geom is None or Point(from_E, from_N).within(buffer_geom)
+        to_inside   = buffer_geom is None or Point(to_E,   to_N  ).within(buffer_geom)
+
+        # Only collect a stop if it is outside AND its partner in this link is
+        # inside — this restricts the mapping to boundary-crossing stops only.
+        # Stops where both endpoints are outside are skipped; they keep their
+        # Phase-1 straight-line geometry unchanged.
+        for sid_col, sname_col, e_col, n_col, this_inside, partner_inside in [
+            ("FromCode", "FromStation", "x_origin", "y_origin", from_inside, to_inside),
+            ("ToCode",   "ToStation",   "x_dest",   "y_dest",   to_inside,   from_inside),
         ]:
+            if this_inside or not partner_inside:
+                continue  # stop is inside, or partner is also outside
             sid   = str(row.get(sid_col,   "")).strip()
             sname = str(row.get(sname_col, "")).strip()
             E     = float(row.get(e_col, 0) or 0)
             N     = float(row.get(n_col, 0) or 0)
             if not sid:
                 continue
-            pt = Point(E, N)
-            if buffer_geom is not None and pt.within(buffer_geom):
-                continue  # inside buffer — not an entry/exit stop
             if sid not in outside:
                 outside[sid] = {"name": sname, "E": E, "N": N, "services": set()}
             outside[sid]["services"].add(svc)
@@ -2524,13 +2601,32 @@ def _run_destination_mapping_cli(
 
     mapping: Dict[str, int] = dict(existing_mapping or {})
 
+    boundary_id_set = set(confirmed_boundary_ids)
+
+    # Auto-assign outside stops that are themselves boundary stations.
+    # stop_id is the Betriebspunkt_Nummer as a string (e.g. "8506137").
+    auto_assigned_stops: set = set()
+    for stop_id, info in outside_stops.items():
+        try:
+            numeric_id = int(stop_id.split(":")[-1]) if ":" in stop_id else int(stop_id)
+        except (ValueError, AttributeError):
+            continue
+        if numeric_id in boundary_id_set:
+            mapping[stop_id] = numeric_id
+            auto_assigned_stops.add(stop_id)
+    if auto_assigned_stops:
+        print(f"\n  {len(auto_assigned_stops)} outside stop(s) are boundary stations — auto-assigned to themselves.")
+
     print("\n  Available boundary stations:")
     for i, nid in enumerate(confirmed_boundary_ids, 1):
         name = node_attrs.get(nid, {}).get("name", str(nid))
         print(f"    {i:3}) {name}  (node {nid})")
 
-    print(f"\n  Outside stops on LD/IR services ({len(outside_stops)} unique):")
+    print(f"\n  Outside stops on gateway-layer services ({len(outside_stops)} unique):")
     for stop_id, info in outside_stops.items():
+        if stop_id in auto_assigned_stops:
+            continue
+
         svc_sample = ", ".join(sorted(info["services"])[:5])
         n_svc      = len(info["services"])
         existing   = mapping.get(stop_id)
@@ -2566,8 +2662,9 @@ def _apply_boundary_rerouting(
     buffer_geom,
 ) -> gpd.GeoDataFrame:
     """
-    Post-process rail_enriched: for LD/IR links where from_stop or to_stop has
-    a boundary mapping, replace straight-line geometry with:
+    Post-process rail_enriched: for gateway-layer links (LD, IR, RE, S-Bahn)
+    where from_stop or to_stop has a boundary mapping, replace straight-line
+    geometry with:
 
         straight_line(outside_coords → boundary_node)
         + routed_path(boundary_node → inside_node)
@@ -2586,7 +2683,7 @@ def _apply_boundary_rerouting(
     if "_source_layer" not in rail_enriched.columns:
         return rail_enriched
 
-    mask    = rail_enriched["_source_layer"].isin(_LD_IR_LAYERS)
+    mask    = rail_enriched["_source_layer"].isin(_GATEWAY_LAYERS)
     updated = 0
 
     for idx, row in rail_enriched[mask].iterrows():
@@ -2606,6 +2703,9 @@ def _apply_boundary_rerouting(
         to_pt        = Point(to_E,   to_N)
         from_outside = buffer_geom is None or not from_pt.within(buffer_geom)
         to_outside   = buffer_geom is None or not to_pt.within(buffer_geom)
+
+        if from_outside and to_outside:
+            continue  # both stops outside — not a boundary-crossing link, keep Phase-1 geometry
 
         # Determine effective routing endpoints on the BAV graph
         if from_outside and from_bnode is not None:
@@ -2631,7 +2731,7 @@ def _apply_boundary_rerouting(
                 [(from_E, from_N), (bE, bN)]
             )
             if from_outside and from_bnode is not None:
-                rail_enriched.at[idx, "boundary_entry_node"] = route_from
+                rail_enriched.at[idx, "boundary_entry_node"] = str(route_from)
             rail_enriched.at[idx, "needs_correction"] = False
             updated += 1
             continue
@@ -2650,7 +2750,7 @@ def _apply_boundary_rerouting(
             bE = node_attrs.get(from_bnode, {}).get("E", from_E)
             bN = node_attrs.get(from_bnode, {}).get("N", from_N)
             geom_parts.append(LineString([(from_E, from_N), (bE, bN)]))
-            rail_enriched.at[idx, "boundary_entry_node"] = from_bnode
+            rail_enriched.at[idx, "boundary_entry_node"] = str(from_bnode)
 
         if routed_geom.geom_type == "LineString":
             geom_parts.append(routed_geom)
@@ -2663,7 +2763,7 @@ def _apply_boundary_rerouting(
             bE = node_attrs.get(to_bnode, {}).get("E", to_E)
             bN = node_attrs.get(to_bnode, {}).get("N", to_N)
             geom_parts.append(LineString([(bE, bN), (to_E, to_N)]))
-            rail_enriched.at[idx, "boundary_exit_node"] = to_bnode
+            rail_enriched.at[idx, "boundary_exit_node"] = str(to_bnode)
 
         combined = (
             linemerge(geom_parts) if len(geom_parts) > 1
@@ -2753,9 +2853,9 @@ def _run_phase1_5(
         print("  No boundary stations confirmed — Phase 1.5 skipped.")
         return rail_enriched
 
-    # ── b. Collect outside stops from LD/IR services ──────────────────────────
-    outside_stops = _collect_outside_stops_ld_ir(rail_enriched, buffer_geom)
-    print(f"\n  {len(outside_stops)} unique outside stop(s) found on LD/IR services.")
+    # ── b. Collect outside stops from gateway-layer services ─────────────────
+    outside_stops = _collect_outside_stops_gateway(rail_enriched, buffer_geom)
+    print(f"\n  {len(outside_stops)} unique outside stop(s) found on gateway-layer services.")
     if not outside_stops:
         print("  Nothing to map — Phase 1.5 skipped.")
         return rail_enriched
@@ -2784,8 +2884,8 @@ def _run_phase1_5(
     _save_boundary_mapping(boundary_mapping, bm_path)
     print(f"  Mapping saved to {bm_path.name}  ({len(boundary_mapping)} entry/ies).")
 
-    # ── d. Re-route affected LD/IR links ─────────────────────────────────────
-    print("\n  Applying boundary rerouting to LD/IR links...")
+    # ── d. Re-route affected gateway-layer links ─────────────────────────────
+    print("\n  Applying boundary rerouting to gateway-layer links...")
     rail_enriched = _apply_boundary_rerouting(
         rail_enriched, boundary_mapping, node_attrs, G, seg_lookup, buffer_geom,
     )
@@ -2957,7 +3057,6 @@ def _save_phase2_outputs(
         "Catchment area",
     )
 
-    print("\n  Open the .qgz files in QGIS to inspect routing before corrections.")
 
 # =============================================================================
 # Phase 2b — Corrections TUI
@@ -3129,7 +3228,7 @@ def _run_phase2(
 
     _save_phase2_outputs(config, rail_enriched, tram_enriched, func_enriched)
 
-    print("\n  Open the .qgz files in QGIS to identify routing errors.")
+    print("\n  Open the .qgz files in QGIS to inspect routing and identify any errors before making corrections.")
     ans = input("\n  Do you want to reroute any service? (y/n) [n]: ").strip().lower() or "n"
     if ans != "y":
         print("  No corrections made.")
@@ -3346,8 +3445,11 @@ def _plot_service_overview(
 
     fig, ax = plt.subplots(figsize=(16, 12))
     ax.set_aspect("equal")
+    ax.set_xlabel('E [m]', fontsize=10)
+    ax.set_ylabel('N [m]', fontsize=10)
+    ax.grid(True, alpha=0.3)
 
-    boundary_gdf.boundary.plot(ax=ax, color="black", linewidth=1.0)
+    boundary_gdf.plot(ax=ax, facecolor='none', edgecolor='black', linewidth=1.5, linestyle='--', alpha=0.6)
 
     if lakes_gdf is not None:
         try:
@@ -3375,14 +3477,14 @@ def _plot_service_overview(
             try:
                 segs_extent = gpd.clip(bav_segs, bbox_gdf)
                 if not segs_extent.empty:
-                    segs_extent.plot(ax=ax, color="#d0d0d0", linewidth=0.4, alpha=0.3, zorder=1)
+                    segs_extent.plot(ax=ax, color="#d0d0d0", linewidth=0.4, alpha=0.40, zorder=1)
             except Exception:
                 pass
         if not bav_segs_filtered.empty:
             try:
                 segs_inside = gpd.clip(bav_segs_filtered, boundary_gdf)
                 if not segs_inside.empty:
-                    segs_inside.plot(ax=ax, color="#d0d0d0", linewidth=0.5, alpha=0.7, zorder=1)
+                    segs_inside.plot(ax=ax, color="#d0d0d0", linewidth=0.5, alpha=1.0, zorder=2)
             except Exception:
                 pass
     else:
@@ -3405,7 +3507,8 @@ def _plot_service_overview(
             is_fallback = bool(row.get("needs_correction", False))
             line_colour = MODE_COLOURS["fallback"] if is_fallback else colour
             linestyle = "--" if is_fallback else "-"
-            linewidth = 1.2 if is_fallback else 1.8
+            base_width = 1.2 if is_fallback else 1.8
+            linewidth = base_width * 0.5 if mode in ("tram", "funicular") else base_width
 
             try:
                 clipped = geom.intersection(boundary_poly)
@@ -3436,43 +3539,94 @@ def _plot_service_overview(
                             cp = Point(cross_pt.coords[0])
 
                         if cp is not None and getattr(cp, "geom_type", "") == "Point":
-                            svc_text = str(row.get("line_short_name",
-                                           row.get("TrainType",
-                                           row.get("Service", ""))))
-                            if mode == "rail":
-                                query_key = (str(row.get("Service")), str(row.get("Direction")))
-                            else:
-                                query_key = (str(row.get("route_id")), str(row.get("direction_id")))
-                            dest_text = final_destinations.get(query_key, "")
-                            crossing_points.append({"pt": cp, "text": f"{svc_text} → {dest_text}", "colour": line_colour})
+                            # Only record exiting crossings (first coord inside, last coord outside).
+                            # Use covers() so stations exactly on the boundary edge are treated as
+                            # inside rather than outside (contains() is strictly interior-only).
+                            try:
+                                if geom.geom_type == 'LineString':
+                                    coords = list(geom.coords)
+                                else:
+                                    coords = []
+                                    for _part in geom.geoms:
+                                        coords.extend(list(_part.coords))
+                                first_inside = boundary_poly.covers(Point(coords[0]))
+                                last_inside  = boundary_poly.covers(Point(coords[-1]))
+                                if first_inside and not last_inside:
+                                    starts_inside = True   # exiting
+                                elif not first_inside and last_inside:
+                                    starts_inside = False  # entering — skip
+                                else:
+                                    starts_inside = True   # passthrough or ambiguous — include
+                            except Exception:
+                                starts_inside = True
+                            if starts_inside:
+                                svc_text = str(row.get("line_short_name",
+                                               row.get("TrainType",
+                                               row.get("Service", ""))))
+                                _last = coords[-1]
+                                _dx = _last[0] - cp.x
+                                _dy = _last[1] - cp.y
+                                _d  = (_dx**2 + _dy**2)**0.5
+                                _udx, _udy = (_dx/_d, _dy/_d) if _d > 0 else (1.0, 0.0)
+                                crossing_points.append({"pt": cp, "text": svc_text, "colour": line_colour, "udx": _udx, "udy": _udy})
 
-    train_gdf_clip = gpd.clip(train_stations, boundary_gdf.envelope.iloc[0])
-    train_gdf_clip.plot(ax=ax, color="#555555", markersize=4, zorder=3)
-    
-    # Display CODE for nodes and add terminating service boxes
-    for _, row in train_gdf_clip.iterrows():
-        code = str(row.get("CODE", ""))
+    # For SA: show all stations within the plot extent (ghost outside boundary);
+    # for CA: only show stations clipped to the boundary polygon.
+    if is_sa and extent is not None:
+        from shapely.geometry import box as _sbox
+        _ext_box = gpd.GeoDataFrame(
+            geometry=[_sbox(extent[0], extent[2], extent[1], extent[3])],
+            crs=train_stations.crs if train_stations.crs else SWISS_CRS)
+        train_gdf_clip = gpd.clip(train_stations, _ext_box)
+    else:
+        train_gdf_clip = gpd.clip(train_stations, boundary_gdf)
+
+    train_gdf_inside = gpd.clip(train_stations, boundary_gdf)
+    inside_ids = set(train_gdf_inside.index.tolist()) if not train_gdf_inside.empty else set()
+
+    _ms = 20 if not is_sa else 30
+    if is_sa:
+        # Ghost pass — all nodes within extent at 40% opacity, then solid inside on top.
+        train_gdf_clip.plot(ax=ax, facecolor='white', edgecolor='black',
+                            markersize=_ms, marker='o', linewidth=0.8, alpha=0.40, zorder=5)
+        train_gdf_inside.plot(ax=ax, facecolor='white', edgecolor='black',
+                              markersize=_ms, marker='o', linewidth=0.8, alpha=1.0, zorder=6)
+    else:
+        train_gdf_clip.plot(ax=ax, facecolor='white', edgecolor='black',
+                            markersize=_ms, marker='o', linewidth=0.8, alpha=1.0, zorder=5)
+
+    for idx, row in train_gdf_clip.iterrows():
+        code = str(row.get("CODE", "")).strip()
         bp_num = int(row.get("Betriebspunkt_Nummer", 0))
-        
-        # Display station code
+        is_inside = idx in inside_ids
+        termini = sorted(station_termini_texts.get(bp_num, set()))
+
+        if not is_inside:
+            continue
+
+        # SA: always show code; CA: only when a service terminates here.
+        if not (is_sa or termini):
+            continue
+
+        # Station code — bold, matching SA infrastructure plot style.
         ax.annotate(
             code,
             xy=(row.geometry.x, row.geometry.y),
-            xytext=(3, 3), textcoords="offset points",
-            fontsize=4.5, color="#333333", zorder=4
+            xytext=(5, 5), textcoords="offset points",
+            fontsize=7, fontweight='bold', color="#333333", zorder=7,
+            bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
+                      edgecolor='none', alpha=0.7),
         )
-        
-        # Display terminating lines
-        if bp_num in station_termini_texts:
-            terminating_lines = "\n".join(sorted(list(station_termini_texts[bp_num])))
+
+        # Terminating services — separate box to the right of the code label.
+        if termini:
             ax.annotate(
-                terminating_lines,
+                "  ".join(termini),
                 xy=(row.geometry.x, row.geometry.y),
-                xytext=(0, -8), textcoords="offset points",
-                fontsize=3.5, color="#333333",
-                ha='center', va='top',
-                bbox=dict(boxstyle="round,pad=0.2", fc="#f5f5f5", ec="#cccccc", alpha=0.8),
-                zorder=5
+                xytext=(30, 5), textcoords="offset points",
+                fontsize=5, color="#333333", zorder=7,
+                bbox=dict(boxstyle='round,pad=0.2', facecolor='#f5f5f5',
+                          edgecolor='#cccccc', linewidth=0.4, alpha=0.85),
             )
 
     grouped_cps = {}
@@ -3480,33 +3634,54 @@ def _plot_service_overview(
         cp = cp_info["pt"]
         key = (round(cp.x / 100) * 100, round(cp.y / 100) * 100)
         if key not in grouped_cps:
-            grouped_cps[key] = {"pt": cp, "texts": set(), "colour": cp_info["colour"]}
+            grouped_cps[key] = {"pt": cp, "texts": set(), "colour": cp_info["colour"],
+                                 "udx": cp_info["udx"], "udy": cp_info["udy"]}
         grouped_cps[key]["texts"].add(cp_info["text"])
 
-    bc_x = boundary_poly.centroid.x
+    if extent is not None:
+        _xmin, _xmax, _ymin, _ymax = extent[0], extent[1], extent[2], extent[3]
+    else:
+        _xmin, _xmax = ax.get_xlim()
+        _ymin, _ymax = ax.get_ylim()
+    # Stub length: 3% of shorter map dimension, at least 375 m.
+    _map_min = min(_xmax - _xmin, _ymax - _ymin)
+    _preferred_stub = max(375, _map_min * 0.03)
+
     for cp_info in list(grouped_cps.values()):
         cp = cp_info["pt"]
-        if cp.x < bc_x:
-            stub_end = Point(cp.x - 1500, cp.y)
-            offset = (-4, 0)
-            ha = "right"
+        ux = cp_info["udx"]
+        uy = cp_info["udy"]
+        # Cap stub so endpoint stays within the plot extent (90% of available space).
+        _margins = []
+        if ux > 0  and _xmax > cp.x:  _margins.append((_xmax - cp.x) / ux)
+        elif ux < 0 and _xmin < cp.x: _margins.append((_xmin - cp.x) / ux)
+        if uy > 0  and _ymax > cp.y:  _margins.append((_ymax - cp.y) / uy)
+        elif uy < 0 and _ymin < cp.y: _margins.append((_ymin - cp.y) / uy)
+        _avail = min(_margins) * 0.90 if _margins else _preferred_stub
+        stub_len = min(_preferred_stub, max(100, _avail))
+        stub_end = Point(cp.x + ux * stub_len, cp.y + uy * stub_len)
+
+        if abs(ux) >= abs(uy):
+            ha     = "right" if ux < 0 else "left"
+            va     = "center"
+            offset = (-4, 0) if ux < 0 else (4, 0)
         else:
-            stub_end = Point(cp.x + 1500, cp.y)
-            offset = (4, 0)
-            ha = "left"
-            
+            ha     = "center"
+            va     = "top" if uy < 0 else "bottom"
+            offset = (0, -4) if uy < 0 else (0, 4)
+
         stub_line = LineString([(cp.x, cp.y), (stub_end.x, stub_end.y)])
         stub_gdf = gpd.GeoDataFrame({"geometry": [stub_line]}, crs=SWISS_CRS)
         stub_gdf.plot(ax=ax, color=cp_info["colour"], linewidth=1.0, linestyle="--", zorder=3)
-        
+
         sorted_texts = sorted(list(cp_info["texts"]))
         table_text = "\n".join(sorted_texts)
-        
+
         ax.annotate(
             table_text,
             xy=(stub_end.x, stub_end.y),
             xytext=offset, textcoords="offset points",
-            fontsize=4, color="#333333", va="center", ha=ha,
+            fontsize=4, color="#333333", va=va, ha=ha,
             bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="grey", alpha=0.7), zorder=5
         )
 
@@ -3514,23 +3689,22 @@ def _plot_service_overview(
         Line2D([0], [0], color=MODE_COLOURS["rail"], linewidth=2, label="Rail"),
         Line2D([0], [0], color=MODE_COLOURS["tram"], linewidth=2, label="Tram"),
         Line2D([0], [0], color=MODE_COLOURS["funicular"], linewidth=2, label="Funicular"),
-        Line2D([0], [0], color=MODE_COLOURS["fallback"], linewidth=1.5, linestyle="--", label="Straight-line (unmatched)"),
-        Line2D([0], [0], color="#d0d0d0", linewidth=1.5, label="Unused (train stations only)"),
+        Line2D([0], [0], color=MODE_COLOURS["fallback"], linewidth=1.5, linestyle="--", label="Straight-line"),
+        Line2D([0], [0], color="#d0d0d0", linewidth=1.5, label="Unused infrastructure"),
     ]
-    ax.legend(handles=legend_handles, loc="lower right", fontsize=7)
+    ax.legend(handles=legend_handles, loc="upper right", fontsize=7)
 
-    ax.set_title(f"Service Projection — {config.svc_version} on {config.infra_version}\nBoundary: {boundary_name}", fontsize=10)
+    ax.set_title(f"Service Projection — {config.svc_version} on {config.infra_version}\nBoundary: {boundary_name}", fontsize=14, fontweight='bold')
 
     if extent is not None:
         ax.set_xlim(extent[0], extent[1])
         ax.set_ylim(extent[2], extent[3])
         
     _add_north_arrow(ax, location='upper left', scale=0.5)
-    _add_scale_bar(ax, location=(0.72, 0.04))
+    _add_scale_bar(ax, location=(0.755, 0.012))
+    plt.tight_layout()
 
-    ax.axis("off")
-
-    out_dir = main / paths.INFRASTRUCTURE_PLOTS_DIR
+    out_dir = main / paths.NETWORK_PLOTS_DIR / "Rail_Lines" / config.svc_version / config.infra_version
     out_dir.mkdir(parents=True, exist_ok=True)
     fname = f"{config.svc_version}_{config.infra_version}_{boundary_name.replace(' ', '_')}.pdf"
     out_path = out_dir / fname

@@ -21,15 +21,16 @@ Usage (interactive):
 import os
 import geopandas as gpd
 import pandas as pd
+import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.legend_handler import HandlerBase
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
-from collections import Counter
-from shapely.ops import linemerge
+from collections import Counter, deque
+from shapely.ops import linemerge, substring as shp_substring
 from shapely.geometry import MultiLineString, LineString
 import math
 import sys
@@ -95,6 +96,21 @@ def _classify_electrification(val) -> str:
         return 'ac_16_7hz'  # Swiss default AC is 15 kV / 16.7 Hz
     return 'unknown'
 
+# Speed colour bins (upper bound km/h → colour).  Ordered from slow to fast.
+# Segments with no speed data (NaN) use SPEED_NO_DATA_COLOR.
+SPEED_BINS: list = [
+    (30,  '#0000AA', '≤ 30 km/h'),
+    (60,  '#0066FF', '31–60 km/h'),
+    (80,  '#00AA44', '61–80 km/h'),
+    (100, '#AACC00', '81–100 km/h'),
+    (120, '#FFAA00', '101–120 km/h'),
+    (160, '#FF4400', '121–160 km/h'),
+    (999, '#CC0000', '161+ km/h'),
+]
+SPEED_NO_DATA_COLOR = '#888888'
+SPEED_NO_DATA_LABEL = 'No data'
+
+
 TRACK_COLORS = {
     1: '#FF0000',
     2: '#0000FF',
@@ -110,6 +126,45 @@ CONSTRUCT_COLORS = {
     'normal':  '#2E8B57',
 }
 CONSTRUCT_DEFAULT = '#808080'
+
+
+# =============================================================================
+# OSM Maxspeed Enrichment Constants
+# =============================================================================
+
+OSM_BUFFER_M         = 10     # buffer radius (m) around each BAV segment
+OSM_MAX_BEARING_DIFF = 45     # degrees — max angular divergence to accept
+OSM_NODE_SNAP_M      = 15     # BAV node snap radius for conflict resolution
+OSM_COVERAGE_MIN     = 0.10   # min coverage fraction to record speed
+
+# BAV gauge (mm) → compatible OSM railway types.
+# Segments with gauge not in this dict (or gauge = None) accept all types.
+GAUGE_TO_OSM_TYPES: Dict[int, set] = {
+    1435: {"rail", "light_rail", "subway"},
+    1000: {"tram", "narrow_gauge", "light_rail"},
+    900:  {"narrow_gauge", "funicular"},
+    800:  {"narrow_gauge", "funicular"},
+    750:  {"narrow_gauge", "funicular"},
+    600:  {"narrow_gauge", "funicular"},
+    1520: {"rail"},
+    1668: {"rail"},
+}
+_ALL_OSM_TYPES = {t for s in GAUGE_TO_OSM_TYPES.values() for t in s}
+
+# Mode-to-OSM-type mapping used after transport_mode propagation.
+# Tighter than GAUGE_TO_OSM_TYPES: distinguishes 1000 mm trains from trams.
+# Gauge is kept as fallback only for NaN-mode segments.
+MODE_TO_OSM_TYPES: Dict[str, set] = {
+    "train":       {"rail"},
+    "tram":        {"tram", "light_rail"},
+    "funicular":   {"funicular"},
+    "cog_railway": {"narrow_gauge"},
+}
+_OSM_COLS = [
+    "osm_id", "railway_type", "maxspeed",
+    "maxspeed_forward", "maxspeed_backward", "osm_name",
+]
+
 
 NODE_COLORS = {
     'station':           '#FF0000',
@@ -387,6 +442,440 @@ def filter_macroscopic_nodes(
     return macro_nodes, macro_segs.reset_index(drop=True), seg_id_remap
 
 
+# =============================================================================
+# OSM Maxspeed Enrichment
+# =============================================================================
+
+def _parse_speed(val) -> float:
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return np.nan
+    try:
+        return float(str(val).replace("km/h", "").replace("mph", "").strip())
+    except ValueError:
+        return np.nan
+
+
+def _best_speed(row) -> float:
+    for col in ("maxspeed", "maxspeed_forward", "maxspeed_backward"):
+        v = _parse_speed(row.get(col))
+        if not np.isnan(v):
+            return v
+    return np.nan
+
+
+def _compute_osm_bearing(geom) -> float:
+    """Overall orientation [0, 180) using start-to-end direction."""
+    if geom is None or geom.is_empty:
+        return np.nan
+    if geom.geom_type in ("MultiLineString", "GeometryCollection"):
+        lines = [g for g in geom.geoms if g.geom_type == "LineString" and not g.is_empty]
+        if not lines:
+            return np.nan
+        merged = linemerge(lines)
+        coords = (
+            [c for g in merged.geoms for c in g.coords]
+            if merged.geom_type == "MultiLineString"
+            else list(merged.coords)
+        )
+    elif geom.geom_type == "LineString":
+        coords = list(geom.coords)
+    else:
+        return np.nan
+    if len(coords) < 2:
+        return np.nan
+    dx = coords[-1][0] - coords[0][0]
+    dy = coords[-1][1] - coords[0][1]
+    if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+        return np.nan
+    return np.degrees(np.arctan2(dy, dx)) % 180
+
+
+def _angular_diff_osm(b1: float, b2: float) -> float:
+    if np.isnan(b1) or np.isnan(b2):
+        return np.nan
+    diff = abs(b1 - b2) % 180
+    return min(diff, 180 - diff)
+
+
+def _resolve_osm_conflicts_at_nodes(
+    pairs: gpd.GeoDataFrame,
+    bav_nodes: gpd.GeoDataFrame,
+    buf_lookup: dict,
+) -> gpd.GeoDataFrame:
+    """
+    Split OSM ways that appear in multiple BAV buffers at BAV node positions,
+    then reassign each piece to the buffer whose midpoint it falls in.
+    Unresolvable conflicts (no nearby nodes) are kept as-is.
+    """
+    conflict_ids = set(pairs[pairs.duplicated("osm_id", keep=False)]["osm_id"].unique())
+    if not conflict_ids:
+        return pairs
+
+    print(f"  Resolving {len(conflict_ids)} OSM ways spanning multiple buffers...")
+
+    non_conflict  = pairs[~pairs["osm_id"].isin(conflict_ids)].copy()
+    conflict_rows = pairs[pairs["osm_id"].isin(conflict_ids)].copy()
+
+    osm_unique = (
+        conflict_rows[["osm_id", "geometry"]]
+        .drop_duplicates("osm_id")
+        .set_index("osm_id")
+    )
+
+    resolved: List[dict] = []
+    kept_as_is: List[pd.DataFrame] = []
+
+    for osm_id, osm_row in osm_unique.iterrows():
+        osm_geom = osm_row["geometry"]
+        if osm_geom.geom_type != "LineString":
+            kept_as_is.append(conflict_rows[conflict_rows["osm_id"] == osm_id])
+            continue
+
+        nearby = bav_nodes[bav_nodes.distance(osm_geom) <= OSM_NODE_SNAP_M]
+        total_len = osm_geom.length
+        split_dists = sorted({
+            d for pt in nearby.geometry
+            if 1.0 < (d := osm_geom.project(pt)) < total_len - 1.0
+        })
+
+        if not split_dists:
+            kept_as_is.append(conflict_rows[conflict_rows["osm_id"] == osm_id])
+            continue
+
+        template = conflict_rows[conflict_rows["osm_id"] == osm_id].iloc[0]
+        osm_attrs = {col: template[col] for col in _OSM_COLS if col in template.index}
+        matched_segs = conflict_rows[conflict_rows["osm_id"] == osm_id]["segment_id"].tolist()
+
+        for start, end in zip([0.0] + split_dists, split_dists + [total_len]):
+            piece = shp_substring(osm_geom, start, end)
+            if piece.is_empty or piece.length < 0.5:
+                continue
+            midpoint = piece.interpolate(0.5, normalized=True)
+            assigned = next(
+                (sid for sid in matched_segs if buf_lookup[sid].contains(midpoint)),
+                None,
+            )
+            if assigned is None:
+                continue
+            resolved.append({**osm_attrs, "segment_id": assigned, "geometry": piece})
+
+    parts = [non_conflict]
+    if resolved:
+        parts.append(gpd.GeoDataFrame(resolved, crs=pairs.crs))
+    parts.extend(kept_as_is)
+
+    return gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=pairs.crs)
+
+
+def _empty_osm_result(bav: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    out = bav.copy()
+    out["average_speed"]                 = np.nan
+    out["predominant_speed"]             = np.nan
+    out["predominant_speed_coverage_pct"] = 0.0
+    return out
+
+
+def _join_osm_speeds(
+    bav: gpd.GeoDataFrame,
+    bav_nodes: gpd.GeoDataFrame,
+    osm: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """
+    Overlay OSM railway ways onto BAV segments and aggregate speed data.
+
+    Returns bav with three new columns:
+      average_speed                — length-weighted mean speed (km/h) or NaN
+      predominant_speed            — modal speed by length (km/h) or NaN
+      predominant_speed_coverage_pct — fraction of segment length covered by
+                                       the predominant speed value
+    """
+    buf_series  = bav.geometry.buffer(OSM_BUFFER_M)
+    bav_buf     = gpd.GeoDataFrame(bav[["segment_id"]].copy(), geometry=buf_series, crs=bav.crs)
+    buf_lookup  = bav_buf.set_index("segment_id")["geometry"]
+    bav_lengths = bav.set_index("segment_id")["length_m"]
+    bav_bearings = bav.set_index("segment_id")["geometry"].apply(_compute_osm_bearing)
+    seg_gauge   = bav.set_index("segment_id")["gauge"].to_dict()
+
+    osm_join = osm[_OSM_COLS + ["geometry"]].copy()
+    pairs = gpd.sjoin(osm_join, bav_buf, how="inner", predicate="intersects")
+    pairs = pairs.drop(columns=["index_right"], errors="ignore").reset_index(drop=True)
+    print(f"  {len(pairs)} candidate (buffer, OSM way) pairs")
+
+    if pairs.empty:
+        return _empty_osm_result(bav)
+
+    pairs = _resolve_osm_conflicts_at_nodes(pairs, bav_nodes, buf_lookup)
+
+    pairs["clipped_geom"] = pairs.apply(
+        lambda r: r.geometry.intersection(buf_lookup[r["segment_id"]]), axis=1
+    )
+    is_line = pairs["clipped_geom"].geom_type.isin(["LineString", "MultiLineString"])
+    pairs = pairs[is_line].copy()
+    pairs["clipped_length_m"] = pairs["clipped_geom"].length
+    pairs = pairs[pairs["clipped_length_m"] > 0].copy()
+
+    pairs["osm_bearing"] = pairs["clipped_geom"].apply(_compute_osm_bearing)
+    pairs["bav_bearing"] = pairs["segment_id"].map(bav_bearings)
+    pairs["bearing_diff"] = pairs.apply(
+        lambda r: _angular_diff_osm(r["osm_bearing"], r["bav_bearing"]), axis=1
+    )
+    n_before = len(pairs)
+    pairs = pairs[
+        pairs["bearing_diff"].isna() | (pairs["bearing_diff"] <= OSM_MAX_BEARING_DIFF)
+    ].copy()
+    print(f"  {n_before - len(pairs)} pairs removed by bearing filter")
+
+    seg_mode = (
+        bav.set_index("segment_id")["transport_mode"].to_dict()
+        if "transport_mode" in bav.columns else {}
+    )
+    pairs["bav_mode"]  = pairs["segment_id"].map(seg_mode)
+    pairs["bav_gauge"] = pairs["segment_id"].map(seg_gauge)
+
+    def _allowed_osm_types(mode, gauge) -> set:
+        """Return the set of OSM railway types compatible with this segment."""
+        if pd.notna(mode) and str(mode).strip():
+            types: set = set()
+            for m in str(mode).split('/'):
+                types |= MODE_TO_OSM_TYPES.get(m.strip(), set())
+            if types:
+                return types
+        return GAUGE_TO_OSM_TYPES.get(gauge, _ALL_OSM_TYPES)
+
+    compatible_mask = pairs.apply(
+        lambda r: r["railway_type"] in _allowed_osm_types(r["bav_mode"], r["bav_gauge"]),
+        axis=1,
+    )
+    n_before = len(pairs)
+    pairs = pairs[compatible_mask].drop(columns=["bav_mode", "bav_gauge"]).copy()
+    print(f"  {n_before - len(pairs)} pairs removed by railway-type filter ({len(pairs)} remain)")
+
+    pairs["speed_kmh"] = pairs.apply(_best_speed, axis=1)
+
+    def _aggregate(g):
+        seg_len = bav_lengths.get(g.name, np.nan)
+        valid   = g[g["speed_kmh"].notna()]
+        if valid.empty:
+            return pd.Series({
+                "average_speed":                  np.nan,
+                "predominant_speed":              np.nan,
+                "predominant_speed_coverage_pct": 0.0,
+            })
+
+        avg = (
+            (valid["speed_kmh"] * valid["clipped_length_m"]).sum()
+            / valid["clipped_length_m"].sum()
+        )
+        spd_lengths = valid.groupby("speed_kmh")["clipped_length_m"].sum()
+        predominant = spd_lengths.idxmax()
+        pct = (
+            float(spd_lengths[predominant] / seg_len)
+            if seg_len and seg_len > 0
+            else 0.0
+        )
+        return pd.Series({
+            "average_speed":                  round(avg, 1),
+            "predominant_speed":              predominant,
+            "predominant_speed_coverage_pct": round(min(pct, 1.0), 3),
+        })
+
+    if pairs.empty:
+        return _empty_osm_result(bav)
+
+    agg = pairs.groupby("segment_id").apply(_aggregate, include_groups=False)
+
+    _SPEED_COLS = ("average_speed", "predominant_speed", "predominant_speed_coverage_pct")
+    bav_base = bav.drop(columns=[c for c in _SPEED_COLS if c in bav.columns])
+    result = bav_base.merge(agg.reset_index(), on="segment_id", how="left")
+    result["predominant_speed_coverage_pct"] = (
+        result["predominant_speed_coverage_pct"].fillna(0.0)
+    )
+    return result
+
+
+def enrich_segments_with_osm_speed(
+    segments: gpd.GeoDataFrame,
+    nodes: gpd.GeoDataFrame,
+    raw_dir: Optional[str] = None,
+) -> gpd.GeoDataFrame:
+    """
+    Load OSM maxspeed data fetched by infrabuild_filter_network.py and attach
+    speed columns to segments.
+
+    Reads osm_maxspeed_segments.gpkg from data/Infrastructure/Raw/ (written by
+    infrabuild_filter_network.run_filter_network).  If the file is absent the
+    function returns segments unchanged with NaN speed columns and prints a
+    warning — re-run infrabuild_filter_network.py to populate it.
+
+    Adds three columns to the returned GeoDataFrame:
+      average_speed                — length-weighted mean OSM speed (km/h) or NaN
+      predominant_speed            — modal speed by segment length (km/h) or NaN
+      predominant_speed_coverage_pct — fraction of segment under predominant speed
+
+    Args:
+        segments: BAV segment GeoDataFrame (must have segment_id, length_m, gauge, geometry)
+        nodes:    BAV node GeoDataFrame (used for conflict resolution at junctions)
+        raw_dir:  Override for Raw/ directory path (defaults to paths.NETWORK_INFRASTRUCTURE_RAW)
+
+    Returns:
+        segments GeoDataFrame with speed columns added.
+    """
+    osm_path = (
+        Path(raw_dir) if raw_dir
+        else Path(paths.MAIN) / paths.NETWORK_INFRASTRUCTURE_RAW
+    ) / "osm_maxspeed_segments.gpkg"
+
+    if not osm_path.exists():
+        print(
+            f"  WARNING: {osm_path.name} not found in Raw/.\n"
+            "  Run infrabuild_filter_network.py to fetch OSM data.\n"
+            "  Speed columns will be NaN for this build."
+        )
+        return _empty_osm_result(segments)
+
+    osm = gpd.read_file(osm_path)
+    if osm.crs is None or osm.crs.to_epsg() != 2056:
+        osm = osm.to_crs("EPSG:2056")
+    print(f"  Loaded {len(osm)} OSM ways from {osm_path.name}")
+
+    if osm.empty:
+        print("  WARNING: OSM file is empty — speed columns will be NaN.")
+        return _empty_osm_result(segments)
+
+    joined = _join_osm_speeds(segments, nodes, osm)
+
+    # When 100% of the segment runs at the predominant speed, the weighted
+    # average is identical — use the exact value to avoid float rounding drift.
+    full_cov = joined["predominant_speed_coverage_pct"] == 1.0
+    joined.loc[full_cov, "average_speed"] = joined.loc[full_cov, "predominant_speed"]
+
+    total     = len(joined)
+    has_speed = joined["average_speed"].notna().sum()
+    no_speed  = (joined["average_speed"].isna() & (joined["predominant_speed_coverage_pct"] > 0)).sum()
+    no_osm    = (joined["predominant_speed_coverage_pct"] == 0).sum()
+    print(f"\n  OSM speed coverage:")
+    print(f"    Speed assigned     : {has_speed:>4}  ({100*has_speed/total:.1f}%)")
+    print(f"    OSM found, no speed: {no_speed:>4}  ({100*no_speed/total:.1f}%)")
+    print(f"    No OSM match       : {no_osm:>4}  ({100*no_osm/total:.1f}%)")
+
+    return joined
+
+
+def derive_segment_transport_mode(
+    nodes: gpd.GeoDataFrame,
+    segments: gpd.GeoDataFrame,
+) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """
+    Propagate transport_mode from station nodes to segments and junctions via BFS.
+
+    Single-mode stations seed the traversal.  Composite-mode stations
+    (e.g. "train / tram") are left unseeded so propagation fills them from
+    their neighbours.  Each segment and junction node receives the union of
+    all modes reaching it.  Segments or junctions unreachable from any seed
+    retain NaN; OSM matching falls back to gauge for those.
+
+    Args:
+        nodes:    macro-level nodes GeoDataFrame (must have NAME, transport_mode,
+                  node_class columns)
+        segments: macro-level segments GeoDataFrame (must have from_name, to_name)
+
+    Returns:
+        (nodes, segments) — nodes has derived transport_mode filled on previously-NaN
+        junctions; segments has a new transport_mode column.
+    """
+    # Only modes that correspond to tracked rail infrastructure are propagated.
+    # Bus, ship, etc. are excluded — they don't run on the BAV rail graph.
+    _RAIL_MODES = frozenset(MODE_TO_OSM_TYPES.keys())
+
+    def _parse_all(val) -> set:
+        if pd.isna(val) or not str(val).strip():
+            return set()
+        return {m.strip() for m in str(val).split('/') if m.strip()}
+
+    def _parse_rail(val) -> set:
+        return _parse_all(val) & _RAIL_MODES
+
+    def _fmt(modes: set):
+        return ' / '.join(sorted(modes)) if modes else pd.NA
+
+    nodes    = nodes.copy()
+    segments = segments.copy()
+
+    # Adjacency: node_name → [(seg_index, other_node_name), ...]
+    adj: Dict[str, list] = {}
+    for idx, row in segments.iterrows():
+        fn, tn = row.get('from_name'), row.get('to_name')
+        if fn and tn:
+            adj.setdefault(fn, []).append((idx, tn))
+            adj.setdefault(tn, []).append((idx, fn))
+
+    # Collect OeV-sourced rail modes (non-rail modes stripped at source)
+    node_modes: Dict[str, set] = {}
+    for _, row in nodes.iterrows():
+        name = row.get('NAME')
+        if not name:
+            continue
+        m = _parse_rail(row.get('transport_mode'))
+        if m:
+            node_modes[name] = m
+
+    # Nodes with OeV-sourced rail data act as hard propagation boundaries —
+    # the BFS never overwrites them, preventing modes bleeding across network types.
+    original_rail_seeds: frozenset = frozenset(node_modes)
+
+    seg_modes: Dict[int, set] = {}
+
+    # Seed: only single-mode stations (composite stations are unseeded)
+    queue: deque = deque(n for n, m in node_modes.items() if len(m) == 1)
+
+    while queue:
+        name = queue.popleft()
+        n_modes = node_modes.get(name, set())
+        if not n_modes:
+            continue
+        for seg_idx, other in adj.get(name, []):
+            old_s = seg_modes.get(seg_idx, set())
+            new_s = old_s | n_modes
+            if new_s != old_s:
+                seg_modes[seg_idx] = new_s
+                # Hard stop: never cross into a node that already has OeV rail data
+                if other not in original_rail_seeds:
+                    old_o = node_modes.get(other, set())
+                    new_o = old_o | new_s
+                    if new_o != old_o:
+                        node_modes[other] = new_o
+                        queue.append(other)
+
+    # Write segment modes (all segments start without transport_mode)
+    segments['transport_mode'] = [_fmt(seg_modes.get(i, set())) for i in segments.index]
+
+    # Update junctions: only fill nodes that had no OeV rail data
+    name_to_idx: Dict[str, int] = {
+        row.get('NAME'): idx
+        for idx, row in nodes.iterrows()
+        if row.get('NAME')
+    }
+    for name, modes in node_modes.items():
+        if name in original_rail_seeds:
+            continue  # station already has OeV data — do not overwrite
+        idx = name_to_idx.get(name)
+        if idx is None:
+            continue
+        existing = _parse_all(
+            nodes.at[idx, 'transport_mode'] if 'transport_mode' in nodes.columns else pd.NA
+        )
+        if not existing and modes:
+            nodes.at[idx, 'transport_mode'] = _fmt(modes)
+
+    n_segs = segments['transport_mode'].notna().sum()
+    n_junc = (
+        nodes[nodes.get('node_class', pd.Series(dtype=str)) == 'junction']['transport_mode'].notna().sum()
+        if 'node_class' in nodes.columns else 0
+    )
+    print(f"  Mode assigned: {n_segs}/{len(segments)} segments, {n_junc} junctions derived")
+    return nodes, segments
+
+
 def run_build_base(
     raw_dir: Optional[str] = None,
     output_dir: Optional[str] = None,
@@ -434,6 +923,12 @@ def run_build_base(
         _filter_composition_for_macro(composition_raw, seg_id_remap)
         if not composition_raw.empty else gpd.GeoDataFrame()
     )
+
+    print("\n--- Transport mode propagation ---")
+    macro_nodes, macro_segs = derive_segment_transport_mode(macro_nodes, macro_segs)
+
+    print("\n--- OSM speed enrichment ---")
+    macro_segs = enrich_segments_with_osm_speed(macro_segs, macro_nodes)
 
     out_path.mkdir(parents=True, exist_ok=True)
     print("\n--- Exporting ---")
@@ -497,6 +992,8 @@ def _filter_composition_for_version(
 # =============================================================================
 # QGIS Project Generation
 # =============================================================================
+
+_QGIS_VERSION = "3.44.9-Solothurn"
 
 _INFRA_SRS_BLOCK = """<spatialrefsys nativeFormat="wkt">
       <proj4>+proj=somerc +lat_0=46.9524055555556 +lon_0=7.43958333333333 +k_0=1 +x_0=2600000 +y_0=1200000 +ellps=bessel +towgs84=674.374,15.056,405.346,0,0,0,0 +units=m +no_defs</proj4>
@@ -785,7 +1282,7 @@ def _build_infra_qgz(qgz_path: str, version_dir: Path) -> None:
     )
 
     qgs = f"""<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
-<qgis projectname="{version} Infrastructure" version="3.44.3-Solothurn">
+<qgis projectname="{version} Infrastructure" version="{_QGIS_VERSION}">
   <homePath path=""/>
   <title>{version} Infrastructure</title>
   <autotransaction active="0"/>
@@ -925,7 +1422,7 @@ def _add_north_arrow(ax, location='upper left', scale=0.5):
     north_arrow(ax, location=location, scale=scale, rotation={"degrees": 0})
 
 
-def _add_scale_bar(ax, location=(0.72, 0.04)):
+def _add_scale_bar(ax, location=(0.755, 0.012)):
     """Adaptive scale bar with 2-3 alternating black/white cells.
 
     Automatically picks a round km value based on the current axes extent.
@@ -1615,7 +2112,7 @@ def plot_infrastructure_canonical(
                         alpha=0.40, zorder=4)
         if len(jn_all) > 0:
             jn_all.plot(ax=ax, color='#888888', markersize=_ms_jn, marker='o',
-                        alpha=0.40, zorder=3)
+                        alpha=0.40, zorder=4)
         # Solid pass — clipped network at full opacity
         ts_draw, tf_draw, jn_draw = ts_in, tf_in, jn_in
     else:
@@ -1704,9 +2201,10 @@ def plot_infrastructure_canonical(
 # Diff Plot
 # =============================================================================
 
-_DIFF_RED   = '#d62728'
-_DIFF_GREEN = '#2ca02c'
-_DIFF_GREY  = '#aaaaaa'
+_DIFF_RED    = '#d62728'
+_DIFF_GREEN  = '#2ca02c'
+_DIFF_GREY   = '#aaaaaa'
+_DIFF_YELLOW = '#B8860B'  # dark goldenrod — modified elements
 
 
 def plot_infrastructure_diff(
@@ -1770,24 +2268,45 @@ def plot_infrastructure_diff(
     common_a = segs_a[segs_a['segment_id'].isin(common_ids)].set_index('segment_id')
     common_b = segs_b[segs_b['segment_id'].isin(common_ids)].set_index('segment_id')
 
+    _SEG_MOD_ATTRS = (
+        'gauge', 'electrification', 'average_speed',
+        'km_start', 'km_end', 'route_number', 'route_name', 'route_owner',
+    )
+
+    def _norm(v):
+        try:
+            return '' if pd.isna(v) else str(v)
+        except (TypeError, ValueError):
+            return str(v)
+
     unchanged_ids   = []
+    modified_ids    = []
     track_gained    = []   # list of (geom, n_a, n_b)
     track_lost      = []   # list of (geom, n_a, n_b)
 
     for sid in common_ids:
         if sid not in common_a.index or sid not in common_b.index:
             continue
-        n_a = int(common_a.loc[sid].get('num_tracks', 1) or 1)
-        n_b = int(common_b.loc[sid].get('num_tracks', 1) or 1)
+        n_a  = int(common_a.loc[sid].get('num_tracks', 1) or 1)
+        n_b  = int(common_b.loc[sid].get('num_tracks', 1) or 1)
         geom = common_b.loc[sid].geometry
         if n_b > n_a:
             track_gained.append((geom, n_a, n_b))
         elif n_b < n_a:
             track_lost.append((geom, n_a, n_b))
         else:
-            unchanged_ids.append(sid)
+            geom_changed = not common_a.loc[sid].geometry.equals(geom)
+            attr_changed = any(
+                _norm(common_a.loc[sid].get(a)) != _norm(common_b.loc[sid].get(a))
+                for a in _SEG_MOD_ATTRS
+            )
+            if geom_changed or attr_changed:
+                modified_ids.append(sid)
+            else:
+                unchanged_ids.append(sid)
 
     unchanged_segs = segs_b[segs_b['segment_id'].isin(unchanged_ids)]
+    modified_segs  = segs_b[segs_b['segment_id'].isin(modified_ids)]
 
     # ── Draw segments ─────────────────────────────────────────────────────────
     # 1) Unchanged — black, faded
@@ -1797,14 +2316,21 @@ def plot_infrastructure_diff(
                               linewidth=1.05, alpha=0.20, zorder=2,
                               track_spacing_m=ts)
 
-    # 2) Removed — red, full opacity
+    # 2) Modified — dark yellow, above unchanged
+    for _, row in modified_segs.iterrows():
+        n = int(row.get('num_tracks', 1) or 1)
+        _draw_parallel_tracks(ax, row.geometry, n, color=_DIFF_YELLOW,
+                              linewidth=1.4, alpha=0.9, zorder=3,
+                              track_spacing_m=ts)
+
+    # 3) Removed — red, full opacity
     for _, row in removed_segs.iterrows():
         n = int(row.get('num_tracks', 1) or 1)
         _draw_parallel_tracks(ax, row.geometry, n, color=_DIFF_RED,
                               linewidth=1.4, alpha=0.9, zorder=4,
                               track_spacing_m=ts)
 
-    # 3) Added — green, full opacity
+    # 4) Added — green, full opacity
     for _, row in added_segs.iterrows():
         n = int(row.get('num_tracks', 1) or 1)
         _draw_parallel_tracks(ax, row.geometry, n, color=_DIFF_GREEN,
@@ -1829,9 +2355,34 @@ def plot_infrastructure_diff(
     names_a = set(nodes_a['NAME'].dropna()) if not nodes_a.empty else set()
     names_b = set(nodes_b['NAME'].dropna()) if not nodes_b.empty else set()
 
-    removed_nodes   = nodes_a[nodes_a['NAME'].isin(names_a - names_b)]
-    added_nodes     = nodes_b[nodes_b['NAME'].isin(names_b - names_a)]
-    unchanged_nodes = nodes_b[nodes_b['NAME'].isin(names_a & names_b)]
+    removed_nodes = nodes_a[nodes_a['NAME'].isin(names_a - names_b)]
+    added_nodes   = nodes_b[nodes_b['NAME'].isin(names_b - names_a)]
+
+    # Split common nodes into unchanged vs modified (geometry or node_class changed)
+    _NODE_MOD_ATTRS = ('node_class',)
+    modified_node_names  = []
+    unchanged_node_names = []
+    if not nodes_a.empty and not nodes_b.empty:
+        for _name in names_a & names_b:
+            _ra = nodes_a[nodes_a['NAME'] == _name]
+            _rb = nodes_b[nodes_b['NAME'] == _name]
+            if _ra.empty or _rb.empty:
+                unchanged_node_names.append(_name)
+                continue
+            _ra, _rb = _ra.iloc[0], _rb.iloc[0]
+            _geom_changed = not _ra.geometry.equals(_rb.geometry)
+            _attr_changed = any(
+                _norm(_ra.get(a)) != _norm(_rb.get(a)) for a in _NODE_MOD_ATTRS
+            )
+            if _geom_changed or _attr_changed:
+                modified_node_names.append(_name)
+            else:
+                unchanged_node_names.append(_name)
+    else:
+        unchanged_node_names = list(names_a & names_b)
+
+    modified_nodes  = nodes_b[nodes_b['NAME'].isin(modified_node_names)]
+    unchanged_nodes = nodes_b[nodes_b['NAME'].isin(unchanged_node_names)]
 
     ms_ts = 20 if is_catchment else 55
     ms_jn = 5  if is_catchment else 8
@@ -1849,14 +2400,16 @@ def plot_infrastructure_diff(
             jn_n.plot(ax=ax, color=facecolor, markersize=ms_jn, marker='o',
                       alpha=alpha, zorder=zorder - 1)
 
-    _plot_node_set(unchanged_nodes, _DIFF_GREY,  _DIFF_GREY,      0.25, 5)
-    _plot_node_set(removed_nodes,   _DIFF_RED,   '#7f0000',        0.9,  7)
-    _plot_node_set(added_nodes,     _DIFF_GREEN, '#005a00',        0.9,  7)
+    _plot_node_set(unchanged_nodes, _DIFF_GREY,   _DIFF_GREY,   0.25, 5)
+    _plot_node_set(modified_nodes,  _DIFF_YELLOW, '#7a6000',    0.9,  6)
+    _plot_node_set(removed_nodes,   _DIFF_RED,    '#7f0000',    0.9,  7)
+    _plot_node_set(added_nodes,     _DIFF_GREEN,  '#005a00',    0.9,  7)
 
-    # ── Labels (added/removed stations only) ─────────────────────────────────
+    # ── Labels (added/removed/modified stations only) ─────────────────────────
     if show_labels and not is_catchment:
-        for nodes_gdf, color in ((added_nodes, _DIFF_GREEN),
-                                 (removed_nodes, _DIFF_RED)):
+        for nodes_gdf, color in ((added_nodes,    _DIFF_GREEN),
+                                 (removed_nodes,  _DIFF_RED),
+                                 (modified_nodes, _DIFF_YELLOW)):
             ts_n, tf_n, _ = _classify_nodes(nodes_gdf)
             for _, row in pd.concat([ts_n, tf_n]).iterrows():
                 code = row.get('CODE', '')
@@ -1872,23 +2425,24 @@ def plot_infrastructure_diff(
                     )
 
     # ── Legend ────────────────────────────────────────────────────────────────
-    legend = [Line2D([0], [0], color='none', label='─ Segments ─')]
-    legend.append(Line2D([0], [0], color='black',     linewidth=1.0, alpha=0.4,
+    legend = [Line2D([0], [0], color='none', label=r'$\bf{Segments}$')]
+    legend.append(Line2D([0], [0], color='black',      linewidth=1.0, alpha=0.4,
                          label='Unchanged'))
-    legend.append(Line2D([0], [0], color=_DIFF_GREEN, linewidth=1.4,
+    legend.append(Line2D([0], [0], color=_DIFF_YELLOW, linewidth=1.4,
+                         label='Modified'))
+    legend.append(Line2D([0], [0], color=_DIFF_GREEN,  linewidth=1.4,
                          label='Added'))
-    legend.append(Line2D([0], [0], color=_DIFF_RED,   linewidth=1.4,
+    legend.append(Line2D([0], [0], color=_DIFF_RED,    linewidth=1.4,
                          label='Removed'))
-    legend.append(Line2D([0], [0], color='none', label=''))
-    legend.append(Line2D([0], [0], color=_DIFF_GREEN, linewidth=2.5,
-                         label='Track gained (outermost)'))
-    legend.append(Line2D([0], [0], color=_DIFF_RED,   linewidth=2.5,
-                         label='Track lost (outermost)'))
 
-    legend.append(Line2D([0], [0], color='none', label='─ Nodes ─'))
+    legend.append(Line2D([0], [0], color='none', label=r'$\bf{Nodes}$'))
     legend.append(Line2D([0], [0], marker='o', color='w',
                          markerfacecolor=_DIFF_GREY, markersize=6,
                          alpha=0.5, label='Unchanged'))
+    legend.append(Line2D([0], [0], marker='o', color='w',
+                         markerfacecolor=_DIFF_YELLOW,
+                         markeredgecolor='#7a6000', markersize=8,
+                         label='Modified'))
     legend.append(Line2D([0], [0], marker='o', color='w',
                          markerfacecolor=_DIFF_GREEN,
                          markeredgecolor='#005a00', markersize=8,
@@ -2248,6 +2802,92 @@ def plot_owner_map(
         print(f"  Saved -> {output_path}")
     return fig
 
+def plot_speed_map(
+    network: NetworkData,
+    extent=None,
+    output_path: Optional[Path] = None,
+    title: Optional[str] = None,
+    figsize: Tuple[int, int] = (16, 12),
+    show_outside: bool = False,
+    is_catchment: bool = False,
+) -> plt.Figure:
+    """Speed map coloured by predominant OSM maxspeed per segment."""
+    if title is None:
+        title = f"Speed Map — {network.version}"
+    fig, ax = _base_plot(network, title, figsize, extent=extent)
+    ax.set_facecolor('#f5f5f5')
+
+    if show_outside:
+        _plot_lakes(ax, extent=extent)
+    else:
+        _plot_lakes(ax, boundary=network.boundary)
+
+    segs_all = _clip_to_extent(network.segments, extent)
+    segs_in  = (
+        _clip_to_boundary(network.segments, network.boundary)
+        if (show_outside and network.boundary is not None and not network.boundary.empty)
+        else None
+    )
+    segs = _clip_to_boundary(network.segments, network.boundary)
+
+    if 'predominant_speed' not in network.segments.columns:
+        ax.text(0.5, 0.5, 'No speed data\n(run network builder with OSM enrichment)',
+                transform=ax.transAxes, ha='center', va='center', fontsize=12, color='grey')
+        _add_north_arrow(ax)
+        _add_scale_bar(ax)
+        plt.tight_layout()
+        if output_path:
+            fig.savefig(output_path, bbox_inches='tight')
+            print(f"  Saved → {output_path}  (no speed data)")
+        return fig
+
+    bins_present: set = set()
+
+    def _plot_segs(gdf, alpha):
+        if gdf is None or gdf.empty:
+            return
+        no_data = gdf['predominant_speed'].isna()
+        if no_data.any():
+            gdf[no_data].plot(ax=ax, color=SPEED_NO_DATA_COLOR, linewidth=2, alpha=alpha)
+            bins_present.add('no_data')
+        prev_upper = 0
+        for upper, color, _ in SPEED_BINS:
+            mask = (
+                ~gdf['predominant_speed'].isna()
+                & (gdf['predominant_speed'] > prev_upper)
+                & (gdf['predominant_speed'] <= upper)
+            )
+            if mask.any():
+                gdf[mask].plot(ax=ax, color=color, linewidth=2.5, alpha=alpha)
+                bins_present.add(upper)
+            prev_upper = upper
+
+    if show_outside and segs_in is not None:
+        _plot_segs(segs_all, alpha=0.35)
+        _plot_segs(segs_in,  alpha=1.0)
+    else:
+        _plot_segs(segs, alpha=0.85)
+
+    legend = []
+    if 'no_data' in bins_present:
+        legend.append(Line2D([0], [0], color=SPEED_NO_DATA_COLOR, linewidth=3,
+                             label=SPEED_NO_DATA_LABEL))
+    for upper, color, label in SPEED_BINS:
+        if upper in bins_present:
+            legend.append(Line2D([0], [0], color=color, linewidth=3, label=label))
+    ax.legend(handles=legend, loc='upper right', fontsize=10,
+              title='Predominant Speed', title_fontsize=11)
+
+    _add_north_arrow(ax)
+    _add_scale_bar(ax)
+    plt.tight_layout()
+
+    if output_path:
+        fig.savefig(output_path, bbox_inches='tight')
+        print(f"  Saved → {output_path}")
+    return fig
+
+
 # Entry Point
 # =============================================================================
 
@@ -2306,9 +2946,9 @@ if __name__ == "__main__":
     print("[Step 0 / Q2]  Which plots to generate?")
     print("─" * 60)
     print("\n  Catchment area (extent = catchment_area_boundary):")
-    print("    Infrastructure · Gauge · Electrification · Track Owner")
+    print("    Infrastructure · Gauge · Electrification · Speed · Track Owner")
     print("  Study area (extent = study_area_boundary):")
-    print("    Infrastructure · Gauge · Electrification · Track Owner · Construction components")
+    print("    Infrastructure · Gauge · Electrification · Speed · Track Owner · Construction components")
     print("\n  Options:")
     print("    1) All")
     print("    2) Catchment area only")
@@ -2326,10 +2966,12 @@ if __name__ == "__main__":
         ('ca_infra',     'Catchment — Infrastructure'),
         ('ca_gauge',     'Catchment — Gauge'),
         ('ca_elec',      'Catchment — Electrification'),
+        ('ca_speed',     'Catchment — Speed'),
         ('ca_owner',     'Catchment — Track Owner'),
         ('sa_infra',     'Study area — Infrastructure'),
         ('sa_gauge',     'Study area — Gauge'),
         ('sa_elec',      'Study area — Electrification'),
+        ('sa_speed',     'Study area — Speed'),
         ('sa_owner',     'Study area — Track Owner'),
         ('sa_construct', 'Study area — Construction components'),
     ]
@@ -2447,6 +3089,23 @@ if __name__ == "__main__":
         _nodes, _segments = load_version(_chosen)
         print(f"  {len(_nodes)} nodes, {len(_segments)} segments")
 
+        # Enrich any segments that were added via version manager and have no OSM speed
+        _speed_col_missing = 'average_speed' not in _segments.columns
+        if _speed_col_missing:
+            _unmatched_mask = pd.Series([True] * len(_segments), index=_segments.index)
+        else:
+            _unmatched_mask = _segments['average_speed'].isna()
+        if _unmatched_mask.any():
+            _n_new = int(_unmatched_mask.sum())
+            print(f"\n--- OSM speed enrichment for {_n_new} segment(s) missing speed ---")
+            _new_segs = _segments[_unmatched_mask].copy()
+            _enriched = enrich_segments_with_osm_speed(_new_segs, _nodes)
+            for _col in ('average_speed', 'predominant_speed', 'predominant_speed_coverage_pct'):
+                if _col in _enriched.columns:
+                    _segments.loc[_unmatched_mask, _col] = _enriched[_col].values
+            _segments.to_file(_version_dir / 'segments.gpkg', driver='GPKG')
+            print(f"  segments.gpkg updated → {_version_dir / 'segments.gpkg'}")
+
         # Derive and export composition for this version
         _base_comp_path = _base_path / "segments_composition.gpkg"
         if _base_comp_path.exists():
@@ -2507,22 +3166,26 @@ if __name__ == "__main__":
                               version=_chosen, boundary=_sa_boundary)
 
         _plot_dispatch = {
-            'ca_infra': (plot_infrastructure_canonical, _net_ca, _ca_ext,
-                         'ca_infrastructure.pdf'),
-            'ca_gauge': (plot_gauge_map,                _net_ca, _ca_ext,
-                         'ca_gauge.pdf'),
-            'ca_elec':  (plot_electrification_map,      _net_ca, _ca_ext,
-                         'ca_electrification.pdf'),
-            'ca_owner': (plot_owner_map,                _net_ca, _ca_ext,
-                         'ca_owner.pdf'),
-            'sa_infra': (plot_infrastructure_canonical, _net_sa, _sa_ext,
-                         'sa_infrastructure.pdf'),
-            'sa_gauge': (plot_gauge_map,                _net_sa, _sa_ext,
-                         'sa_gauge.pdf'),
-            'sa_elec':  (plot_electrification_map,      _net_sa, _sa_ext,
-                         'sa_electrification.pdf'),
-            'sa_owner': (plot_owner_map,                _net_sa, _sa_ext,
-                         'sa_owner.pdf'),
+            'ca_infra':  (plot_infrastructure_canonical, _net_ca, _ca_ext,
+                          'ca_infrastructure.pdf'),
+            'ca_gauge':  (plot_gauge_map,                _net_ca, _ca_ext,
+                          'ca_gauge.pdf'),
+            'ca_elec':   (plot_electrification_map,      _net_ca, _ca_ext,
+                          'ca_electrification.pdf'),
+            'ca_speed':  (plot_speed_map,                _net_ca, _ca_ext,
+                          'ca_speed.pdf'),
+            'ca_owner':  (plot_owner_map,                _net_ca, _ca_ext,
+                          'ca_owner.pdf'),
+            'sa_infra':  (plot_infrastructure_canonical, _net_sa, _sa_ext,
+                          'sa_infrastructure.pdf'),
+            'sa_gauge':  (plot_gauge_map,                _net_sa, _sa_ext,
+                          'sa_gauge.pdf'),
+            'sa_elec':   (plot_electrification_map,      _net_sa, _sa_ext,
+                          'sa_electrification.pdf'),
+            'sa_speed':  (plot_speed_map,                _net_sa, _sa_ext,
+                          'sa_speed.pdf'),
+            'sa_owner':  (plot_owner_map,                _net_sa, _sa_ext,
+                          'sa_owner.pdf'),
         }
 
         for _pk in _plot_set:

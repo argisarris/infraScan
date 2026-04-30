@@ -21,16 +21,114 @@ All data in EPSG:2056 (Swiss LV95).
 import geopandas as gpd
 import pandas as pd
 import numpy as np
+import requests
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 from collections import defaultdict
 import warnings
 import sys
 from shapely.ops import substring
-from shapely.geometry import Point
+from shapely.geometry import LineString, Point
 
 sys.path.insert(0, str(Path(__file__).parent))
 import paths
+
+
+# =============================================================================
+# OpenStreetMap (OSM) Fetch Constants
+# =============================================================================
+# Railway speed data is sourced from OpenStreetMap via the Overpass API.
+# OpenRailwayMap (ORM) is a rendering layer on top of OSM and has no
+# separate data API — the maxspeed tags live in the OSM database itself.
+# The bounding box passed to Overpass is a rectangle derived from the
+# catchment buffer extent.  Extra ways outside the buffer are harmless:
+# they are filtered out during spatial joining in the network builder.
+
+# Overpass API endpoints — tried in order until one responds.
+OVERPASS_INSTANCES = [
+    "https://overpass-api.de/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+]
+OVERPASS_TIMEOUT = 120
+RAILWAY_TYPES    = "rail|light_rail|tram|subway|narrow_gauge|funicular"
+
+
+def _osm_bbox_wgs84(gdf: gpd.GeoDataFrame) -> Tuple[float, float, float, float]:
+    """Return (south, west, north, east) bounding box in WGS84 for a GeoDataFrame."""
+    bounds = gdf.to_crs("EPSG:4326").total_bounds  # minx, miny, maxx, maxy
+    return bounds[1], bounds[0], bounds[3], bounds[2]
+
+
+def fetch_osm_ways(bbox: Tuple[float, float, float, float]) -> gpd.GeoDataFrame:
+    """
+    Fetch all railway ways from OpenStreetMap (OSM) via the Overpass API.
+
+    The query uses a rectangular bounding box derived from the filtered BAV
+    segments.  Ways outside the catchment area are discarded automatically
+    during spatial joining in the network builder.
+
+    Args:
+        bbox: (south, west, north, east) in WGS84 degrees.
+
+    Returns:
+        GeoDataFrame in EPSG:2056 with columns:
+        osm_id, railway_type, maxspeed, maxspeed_forward,
+        maxspeed_backward, osm_name, geometry.
+    """
+    south, west, north, east = bbox
+    query = (
+        f'[out:json][bbox:{south:.4f},{west:.4f},{north:.4f},{east:.4f}]'
+        f'[timeout:{OVERPASS_TIMEOUT}];'
+        f'way["railway"~"^({RAILWAY_TYPES})$"];'
+        f'out geom;'
+    )
+    headers = {"User-Agent": "infraScanRail/1.0", "Accept": "application/json"}
+
+    print(f"  Querying Overpass (S={south:.3f} W={west:.3f} N={north:.3f} E={east:.3f})...")
+    last_error = None
+    r = None
+    for url in OVERPASS_INSTANCES:
+        try:
+            print(f"    Trying {url} ...")
+            r = requests.post(url, data={"data": query}, headers=headers,
+                              timeout=OVERPASS_TIMEOUT + 30)
+            r.raise_for_status()
+            break
+        except requests.exceptions.RequestException as e:
+            print(f"    Failed ({e}), trying next instance...")
+            last_error = e
+
+    if r is None or not r.ok:
+        raise RuntimeError(f"All Overpass instances failed. Last error: {last_error}")
+
+    elements = r.json().get("elements", [])
+    print(f"  Received {len(elements)} railway ways")
+
+    rows = []
+    for el in elements:
+        if el.get("type") != "way":
+            continue
+        pts = el.get("geometry", [])
+        if len(pts) < 2:
+            continue
+        tags = el.get("tags", {})
+        rows.append({
+            "osm_id":            el["id"],
+            "railway_type":      tags.get("railway"),
+            "maxspeed":          tags.get("maxspeed"),
+            "maxspeed_forward":  tags.get("maxspeed:forward"),
+            "maxspeed_backward": tags.get("maxspeed:backward"),
+            "osm_name":          tags.get("name"),
+            "geometry":          LineString([(p["lon"], p["lat"]) for p in pts]),
+        })
+
+    if not rows:
+        return gpd.GeoDataFrame(
+            columns=["osm_id", "railway_type", "maxspeed", "geometry"],
+            crs="EPSG:4326",
+        )
+    return gpd.GeoDataFrame(rows, crs="EPSG:4326").to_crs("EPSG:2056")
 
 
 # =============================================================================
@@ -1052,6 +1150,18 @@ def run_filter_network(
     if not composition.empty:
         composition.to_file(composition_path, driver="GPKG")
         print(f"  segments_composition.gpkg → {composition_path}")
+
+    # --- Fetch OSM railway ways for speed enrichment --------------------------
+    print("\n--- Fetching OSM railway ways ---")
+    osm_path = output_dir / "osm_maxspeed_segments.gpkg"
+    try:
+        bbox     = _osm_bbox_wgs84(segments)
+        osm_ways = fetch_osm_ways(bbox)
+        osm_ways.to_file(osm_path, driver="GPKG")
+        print(f"  osm_maxspeed_segments.gpkg → {osm_path}  ({len(osm_ways)} ways)")
+    except Exception as e:
+        print(f"  WARNING: OSM fetch failed ({e})")
+        print(f"  osm_maxspeed_segments.gpkg not written — speed enrichment will be skipped in network builder.")
 
     print("\n" + "=" * 60)
     print(f"Done  |  {len(nodes)} nodes  |  {len(segments)} segments  |  "
