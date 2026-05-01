@@ -127,6 +127,17 @@ CONSTRUCT_COLORS = {
 }
 CONSTRUCT_DEFAULT = '#808080'
 
+# High-contrast palette for owner map — 30 perceptually distinct colours.
+# SBB always gets '#E3000F'; remaining owners cycle through this list.
+_OWNER_PALETTE = [
+    '#1f77b4', '#ff7f0e', '#2ca02c', '#9467bd', '#8c564b',
+    '#e377c2', '#17becf', '#bcbd22', '#393b79', '#637939',
+    '#8c6d31', '#843c39', '#7b4173', '#5254a3', '#6b6ecf',
+    '#b5cf6b', '#cedb9c', '#e7969c', '#de9ed6', '#3182bd',
+    '#31a354', '#756bb1', '#636363', '#fd8d3c', '#fdae6b',
+    '#c7e9c0', '#dadaeb', '#fee6ce', '#deebf7', '#d9d9d9',
+]
+
 
 # =============================================================================
 # OSM Maxspeed Enrichment Constants
@@ -876,6 +887,175 @@ def derive_segment_transport_mode(
     return nodes, segments
 
 
+# =============================================================================
+# ASP Station Import + Parent-Child Assignment
+# =============================================================================
+
+ASP_IMPORT_RADIUS_M    = 200  # max distance from prefix-matching parent station
+PARENT_CHILD_RADIUS_M  = 200  # max distance for prefix-based parent detection
+
+
+def _import_asp_stations(
+    macro_nodes: gpd.GeoDataFrame,
+    macro_segs:  gpd.GeoDataFrame,
+    raw_nodes:   gpd.GeoDataFrame,
+    raw_segs:    gpd.GeoDataFrame,
+) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """
+    Import assigned_service_point nodes from raw_nodes into the macroscopic network.
+
+    A node qualifies if:
+      - its node_class is 'assigned_service_point'
+      - it lies within ASP_IMPORT_RADIUS_M of a station node in macro_nodes
+      - the station's NAME is a word-for-word prefix of the ASP's NAME
+
+    Qualifying nodes are reclassified as 'station'. Their raw connecting segments
+    are added where the other endpoint is already in the (updated) macro_nodes.
+    """
+    asp_raw = raw_nodes[raw_nodes['node_class'] == 'assigned_service_point'].copy()
+    if asp_raw.empty:
+        return macro_nodes, macro_segs
+
+    macro_station_mask = macro_nodes['node_class'].isin({'station', 'abandoned_station'})
+    macro_stations = macro_nodes[macro_station_mask].copy()
+    macro_names = set(macro_nodes['NAME'].dropna())
+
+    # ── Pass 1: identify which ASP nodes to import ────────────────────────────
+    to_import = []
+    for _, asp in asp_raw.iterrows():
+        asp_name = str(asp['NAME'])
+        if asp_name in macro_names:
+            continue  # already present
+        asp_words = asp_name.lower().split()
+        aE = float(asp['E'])
+        aN = float(asp['N'])
+
+        best_parent_name = None
+        best_len = 0
+        for _, stn in macro_stations.iterrows():
+            stn_name = str(stn['NAME'])
+            stn_words = stn_name.lower().split()
+            if len(stn_words) >= len(asp_words):
+                continue  # parent must have fewer words
+            if asp_words[:len(stn_words)] != stn_words:
+                continue
+            dist = np.hypot(float(stn['E']) - aE, float(stn['N']) - aN)
+            if dist <= ASP_IMPORT_RADIUS_M and len(stn_words) > best_len:
+                best_parent_name = stn_name
+                best_len = len(stn_words)
+
+        if best_parent_name is not None:
+            new_node = asp.copy()
+            new_node['node_class'] = 'station'
+            to_import.append((new_node, best_parent_name))
+
+    if not to_import:
+        return macro_nodes, macro_segs
+
+    # ── Pass 2: add all qualifying nodes then add their segments ─────────────
+    new_node_rows = [n for n, _ in to_import]
+    new_nodes_gdf = gpd.GeoDataFrame(new_node_rows, crs=macro_nodes.crs)
+    macro_nodes = pd.concat([macro_nodes, new_nodes_gdf], ignore_index=True)
+    macro_names = set(macro_nodes['NAME'].dropna())
+
+    new_segs = []
+    seen_seg_ids = set(macro_segs['segment_id'].dropna())
+    for new_node, parent_name in to_import:
+        asp_name = str(new_node['NAME'])
+        mask = (raw_segs['from_name'] == asp_name) | (raw_segs['to_name'] == asp_name)
+        for _, seg in raw_segs[mask].iterrows():
+            other = seg['to_name'] if seg['from_name'] == asp_name else seg['from_name']
+            if other in macro_names and seg['segment_id'] not in seen_seg_ids:
+                new_segs.append(seg)
+                seen_seg_ids.add(seg['segment_id'])
+        print(
+            f"  [ASP] imported '{asp_name}' → station"
+            f"  (prefix-parent: '{parent_name}',"
+            f" dist: {np.hypot(float(new_node['E']) - float(macro_nodes[macro_nodes['NAME'] == parent_name]['E'].iloc[0]), float(new_node['N']) - float(macro_nodes[macro_nodes['NAME'] == parent_name]['N'].iloc[0])):.0f}m)"
+        )
+
+    if new_segs:
+        new_segs_gdf = gpd.GeoDataFrame(new_segs, crs=macro_segs.crs)
+        macro_segs = pd.concat([macro_segs, new_segs_gdf], ignore_index=True)
+
+    # Remove merged bypass segments whose constituent IDs were just rescued.
+    # filter_macroscopic_nodes() merges degree-2 non-KEEP nodes by joining their
+    # segment IDs with '+'. When an ASP node is rescued, those original segments
+    # are restored, making the bypass a duplicate. Drop it.
+    rescued_ids = {str(s['segment_id']) for s in new_segs}
+    if rescued_ids:
+        def _is_bypass(sid):
+            sid_str = str(sid)
+            if '+' not in sid_str:
+                return False
+            return bool(rescued_ids.intersection(sid_str.split('+')))
+
+        bypass_mask = macro_segs['segment_id'].apply(_is_bypass)
+        n_bypass = int(bypass_mask.sum())
+        if n_bypass:
+            macro_segs = macro_segs[~bypass_mask].reset_index(drop=True)
+            print(f"  [ASP] removed {n_bypass} merged bypass segment(s) superseded by rescued originals")
+
+    print(f"  [ASP] {len(to_import)} node(s) imported, {len(new_segs)} segment(s) added")
+    return macro_nodes.reset_index(drop=True), macro_segs.reset_index(drop=True)
+
+
+def _assign_parent_child(macro_nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Detect parent-child station relationships via word-prefix name matching.
+
+    For each station with a NULL parent_node: if another station's NAME is a
+    strict word-for-word prefix of this station's NAME and lies within
+    PARENT_CHILD_RADIUS_M, the longer-named station becomes the child and the
+    shorter-named station's Betriebspunkt_Nummer is written into parent_node.
+
+    Only fills NULL parent_node values; never overwrites existing relationships.
+    """
+    station_mask = macro_nodes['node_class'].isin({'station', 'abandoned_station'})
+    stations = macro_nodes[station_mask].reset_index()  # keep original index
+
+    updated = 0
+    for idx, row in macro_nodes.iterrows():
+        if not station_mask.get(idx, False):
+            continue
+        existing_parent = row.get('parent_node')
+        if pd.notna(existing_parent) and str(existing_parent).strip().lower() not in ('', 'none', 'nan'):
+            continue  # already has a parent
+
+        child_name = str(row.get('NAME', ''))
+        if not child_name:
+            continue
+        child_words = child_name.lower().split()
+        cE = float(row['E'])
+        cN = float(row['N'])
+
+        best_bpnr = None
+        best_len = 0
+        for _, stn in stations.iterrows():
+            stn_name = str(stn['NAME'])
+            if stn_name == child_name:
+                continue
+            stn_words = stn_name.lower().split()
+            if len(stn_words) >= len(child_words):
+                continue
+            if child_words[:len(stn_words)] != stn_words:
+                continue
+            dist = np.hypot(float(stn['E']) - cE, float(stn['N']) - cN)
+            if dist > PARENT_CHILD_RADIUS_M:
+                continue
+            bpnr = stn.get('Betriebspunkt_Nummer')
+            if pd.notna(bpnr) and len(stn_words) > best_len:
+                best_bpnr = int(float(bpnr))
+                best_len = len(stn_words)
+
+        if best_bpnr is not None:
+            macro_nodes.at[idx, 'parent_node'] = best_bpnr
+            updated += 1
+
+    print(f"  [parent-child] {updated} relationship(s) assigned")
+    return macro_nodes
+
+
 def run_build_base(
     raw_dir: Optional[str] = None,
     output_dir: Optional[str] = None,
@@ -923,6 +1103,12 @@ def run_build_base(
         _filter_composition_for_macro(composition_raw, seg_id_remap)
         if not composition_raw.empty else gpd.GeoDataFrame()
     )
+
+    print("\n--- ASP station import ---")
+    macro_nodes, macro_segs = _import_asp_stations(macro_nodes, macro_segs, nodes, segments)
+
+    print("\n--- Parent-child assignment ---")
+    macro_nodes = _assign_parent_child(macro_nodes)
 
     print("\n--- Transport mode propagation ---")
     macro_nodes, macro_segs = derive_segment_transport_mode(macro_nodes, macro_segs)
@@ -1666,9 +1852,11 @@ def plot_infrastructure(
                                      markerfacecolor=color, markersize=size,
                                      markeredgecolor='black' if cls == 'station' else None,
                                      label=cls.replace('_', ' ').title()))
-    
+
     if legend:
-        ax.legend(handles=legend, handler_map=handler_map, loc='upper right', fontsize=8)
+        _lgnd = ax.legend(handles=legend, handler_map=handler_map,
+                          loc='upper right', fontsize=8, title='Infrastructure')
+        _lgnd.get_title().set_fontweight('bold')
 
     _add_north_arrow(ax)
     _add_scale_bar(ax)
@@ -1758,8 +1946,9 @@ def plot_gauge_map(
                                  label=GAUGE_LABELS.get(gauge, f'{gauge} mm')))
     if 'unknown' in gauges_present:
         legend.append(Line2D([0], [0], color=GAUGE_DEFAULT, linewidth=2, label='Unknown'))
-    ax.legend(handles=legend, loc='upper right', fontsize=10,
-              title='Track Gauge', title_fontsize=11)
+    _lgnd = ax.legend(handles=legend, loc='upper right', fontsize=10,
+                      title='Track Gauge', title_fontsize=11)
+    _lgnd.get_title().set_fontweight('bold')
 
     _add_north_arrow(ax)
     _add_scale_bar(ax)
@@ -1834,8 +2023,9 @@ def plot_electrification_map(
         for cat in ELECTRIFICATION_COLORS
         if cat in cats_present
     ]
-    ax.legend(handles=legend, loc='upper right', fontsize=9,
-              title='Electrification', title_fontsize=10)
+    _lgnd = ax.legend(handles=legend, loc='upper right', fontsize=9,
+                      title='Electrification', title_fontsize=10)
+    _lgnd.get_title().set_fontweight('bold')
 
     _add_north_arrow(ax)
     _add_scale_bar(ax)
@@ -1893,8 +2083,9 @@ def plot_construct_type_map(
         if 'unknown' in construct_present:
             legend.append(Line2D([0], [0], color=CONSTRUCT_DEFAULT, linewidth=2,
                                  label='Unknown'))
-        ax.legend(handles=legend, loc='upper right', fontsize=10,
-                  title='Construct Type', title_fontsize=11)
+        _lgnd = ax.legend(handles=legend, loc='upper right', fontsize=10,
+                          title='Construct Type', title_fontsize=11)
+        _lgnd.get_title().set_fontweight('bold')
 
     _add_north_arrow(ax)
     _add_scale_bar(ax)
@@ -2710,7 +2901,9 @@ def plot_construction_components(
             Line2D([0], [0], marker='o', color='w', markerfacecolor='#888888',
                    markersize=5, label='Junction / turning loop')
         )
-    ax.legend(handles=legend_handles, loc='upper right', fontsize=8)
+    _lgnd = ax.legend(handles=legend_handles, loc='upper right', fontsize=8,
+                      title='Construction Components')
+    _lgnd.get_title().set_fontweight('bold')
     _add_north_arrow(ax)
     _add_scale_bar(ax)
     plt.tight_layout()
@@ -2753,28 +2946,31 @@ def plot_owner_map(
                 else None)
     segs = _clip_to_boundary(network.segments, network.boundary)
 
-    if len(segs_all) > 0 and 'route_owner' in segs_all.columns:
-        unique_owners = segs_all['route_owner'].dropna().unique()
+    # Owners are drawn from catchment-clipped `segs`; `segs_all` used only for
+    # background rendering when show_outside=True.
+    catchment_segs = segs if len(segs) > 0 else segs_all
+    if len(catchment_segs) > 0 and 'route_owner' in catchment_segs.columns:
+        # Determine owner set from catchment boundary only
+        unique_owners = catchment_segs['route_owner'].dropna().unique()
 
-        cmap = plt.get_cmap('tab20')
         colors = {}
-        idx = 0
-        for o in unique_owners:
+        palette_idx = 0
+        for o in sorted(unique_owners, key=str):
             if 'SBB' in str(o).upper():
                 colors[o] = '#E3000F'
             else:
-                colors[o] = cmap(idx % 20)
-                idx += 1
+                colors[o] = _OWNER_PALETTE[palette_idx % len(_OWNER_PALETTE)]
+                palette_idx += 1
 
         plotted_owners = set()
-        
+
         if show_outside and segs_in is not None:
             for owner, color in colors.items():
                 mask_all = segs_all['route_owner'] == owner
                 if mask_all.any():
                     plotted_owners.add(owner)
                     segs_all[mask_all].plot(ax=ax, color=color, linewidth=2, alpha=0.40, zorder=2)
-                    
+
             if len(segs_in) > 0:
                 for owner, color in colors.items():
                     mask_in = segs_in['route_owner'] == owner
@@ -2789,9 +2985,14 @@ def plot_owner_map(
                         plotted_owners.add(owner)
                         segs[mask].plot(ax=ax, color=color, linewidth=2, alpha=0.8, zorder=2)
 
-        legend = [Line2D([0], [0], color=colors[own], linewidth=2, label=str(own)) for own in sorted(plotted_owners, key=lambda x: str(x))]
+        legend = [
+            Line2D([0], [0], color=colors[own], linewidth=2, label=str(own))
+            for own in sorted(plotted_owners, key=str)
+        ]
         if len(legend) <= 40:
-            ax.legend(handles=legend, loc='upper right', fontsize=8, ncol=2)
+            _lgnd = ax.legend(handles=legend, loc='upper right', fontsize=8,
+                              ncol=2, title='Route Owner')
+            _lgnd.get_title().set_fontweight('bold')
             
     _add_north_arrow(ax)
     _add_scale_bar(ax)
@@ -2875,8 +3076,9 @@ def plot_speed_map(
     for upper, color, label in SPEED_BINS:
         if upper in bins_present:
             legend.append(Line2D([0], [0], color=color, linewidth=3, label=label))
-    ax.legend(handles=legend, loc='upper right', fontsize=10,
-              title='Predominant Speed', title_fontsize=11)
+    _lgnd = ax.legend(handles=legend, loc='upper right', fontsize=10,
+                      title='Predominant Speed', title_fontsize=11)
+    _lgnd.get_title().set_fontweight('bold')
 
     _add_north_arrow(ax)
     _add_scale_bar(ax)

@@ -63,6 +63,11 @@ GTFS_TRANSIT_DIR = r"data/Network/GTFS_Timetable"
 BUS_LINES_DIR = r"data/Network/Buslines"
 FEEDER_LINES_DIR = r"data/Network/Feeder_Lines"
 RAIL_LINES_DIR = r"data/Network/Rail_Lines"
+
+# Services subfolder hierarchy (used by services_* scripts)
+SERVICES_UNPROJECTED_SUBDIR = "Unprojected"
+SERVICES_PROJECTED_SUBDIR   = "Projected"
+SERVICES_VERSIONS_SUBDIR    = "Versions"
 RAIL_PROCESSED_DIR = r"data/Network/processed"
 EDGES_IN_CORRIDOR_GPKG = r"data/Network/processed/edges_in_corridor.gpkg"
 

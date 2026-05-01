@@ -674,8 +674,10 @@ def enrich_nodes_oev(
 
     nodes['platform_count'] = node_ids.map(nummer_to_platforms)
 
-    # Enforce: only stations get a platform_count value
-    nodes.loc[nodes['node_class'] != 'station', 'platform_count'] = pd.NA
+    # Enforce: only stations (and assigned_service_points promoted to station in
+    # network_builder) get a platform_count value
+    nodes.loc[~nodes['node_class'].isin({'station', 'assigned_service_point'}),
+              'platform_count'] = pd.NA
 
     matched_plats = nodes['platform_count'].notna().sum()
     print(f"  Platform counts: {matched_plats} station nodes have platform data")
@@ -755,7 +757,7 @@ def add_track_count(
             node_max_tracks[nid] = max(node_max_tracks.get(nid, 0), int(row.num_tracks))
 
     def _track_count(row):
-        if row.get('node_class') != 'station':
+        if row.get('node_class') not in ('station', 'assigned_service_point'):
             return pd.NA
         seg_tracks  = node_max_tracks.get(row['node_id'], 0)
         plat_tracks = int(row['platform_count']) if pd.notna(row.get('platform_count')) else 0
