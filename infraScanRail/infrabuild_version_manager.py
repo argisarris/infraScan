@@ -34,7 +34,7 @@ import paths
 # =============================================================================
 
 SWISS_CRS = "EPSG:2056"
-MERGE_ATTRS = ('num_tracks', 'gauge', 'electrification')
+MERGE_ATTRS = ('Num_Tracks', 'Gauge', 'Electrification_Class')
 
 GAUGE_OPTIONS = {
     '1': 1435, '2': 1000, '3': 900, '4': 800, '5': 750, '6': 600,
@@ -107,16 +107,14 @@ def _prompt_composition_pieces(
         rt_raw = input("  Railway type  (Enter for none): ").strip()
 
         pieces.append({
-            'segment_id':         seg_id,
-            'from_name':          from_name,
-            'to_name':            to_name,
-            'construct_type':     ct,
-            'edge_level':         el,
-            'under_construction': uc,
-            'track_config':       tc_raw if tc_raw else pd.NA,
-            'railway_type':       rt_raw if rt_raw else pd.NA,
-            'piece_length_m':     pl,
-            'geometry':           seg_geom,
+            'Segment_ID':                   seg_id,
+            'From_Name':            from_name,
+            'To_Name':              to_name,
+            'Engineering_Structure': ct,
+            'Edge_Level':           el,
+            'Under_Construction':   uc,
+            'Piece_Length':         pl,
+            'geometry':             seg_geom,
         })
         remaining -= pl
         print(f"  Piece added: {ct}  {pl:.0f} m.")
@@ -160,22 +158,22 @@ def list_versions(infra_dir: Optional[str] = None) -> List[str]:
 # =============================================================================
 
 def _search_nodes(nodes: gpd.GeoDataFrame, term: str) -> gpd.GeoDataFrame:
-    """Return rows whose NAME or CODE contain term (case-insensitive)."""
+    """Return rows whose Name or Code contain term (case-insensitive)."""
     term_l = term.lower()
     mask = (
-        nodes['NAME'].fillna('').str.lower().str.contains(term_l, regex=False) |
-        nodes['CODE'].fillna('').str.lower().str.contains(term_l, regex=False)
+        nodes['Name'].fillna('').str.lower().str.contains(term_l, regex=False) |
+        nodes['Code'].fillna('').str.lower().str.contains(term_l, regex=False)
     )
     return nodes[mask]
 
 
 def _search_segments(segments: gpd.GeoDataFrame, term: str) -> gpd.GeoDataFrame:
-    """Return rows whose from_name, to_name, or segment_name contain term (case-insensitive)."""
+    """Return rows whose From_Name, To_Name, or Segment_ID contain term (case-insensitive)."""
     term_l = term.lower()
     mask = (
-        segments['from_name'].fillna('').str.lower().str.contains(term_l, regex=False) |
-        segments['to_name'].fillna('').str.lower().str.contains(term_l, regex=False) |
-        segments['segment_name'].fillna('').str.lower().str.contains(term_l, regex=False)
+        segments['From_Name'].fillna('').str.lower().str.contains(term_l, regex=False) |
+        segments['To_Name'].fillna('').str.lower().str.contains(term_l, regex=False) |
+        segments['Segment_ID'].fillna('').astype(str).str.lower().str.contains(term_l, regex=False)
     )
     return segments[mask]
 
@@ -246,8 +244,7 @@ def _run_phase0() -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame,
 
         # Q2 — choose base version
         print("\n  Choose base version:")
-        base_labels = [f"{v}  [base]" if v == 'Base' else v for v in versions]
-        idx = _pick_one(base_labels, "Base version")
+        idx = _pick_one(versions, "Base version")
         if idx is None:
             raise SystemExit(0)
         source_version = versions[idx]
@@ -312,7 +309,7 @@ def _adjust_node(nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         print(f"  No nodes matching '{term}'.")
         return nodes
 
-    labels = [f"{r['NAME']}  [{r['CODE']}]" for _, r in hits.iterrows()]
+    labels = [f"{r['Name']}  [{r['Code']}]" for _, r in hits.iterrows()]
     idx = _pick_one(labels, "Node to adjust")
     if idx is None:
         return nodes
@@ -320,7 +317,7 @@ def _adjust_node(nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     row_idx = hits.index[idx]
     row = nodes.loc[row_idx]
 
-    COLS = ['NAME', 'CODE', 'E', 'N', 'node_class', 'transport_mode', 'platform_count']
+    COLS = ['Name', 'Code', 'E', 'N', 'Node_Class', 'Transport_Mode', 'Platform_Count']
     header  = ", ".join(COLS)
     current = ", ".join(str(row.get(c, '')) for c in COLS)
     print(f"\n  {header}")
@@ -342,7 +339,7 @@ def _adjust_node(nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
                 nodes.at[row_idx, col] = float(val)
             except ValueError:
                 print(f"  Could not parse '{val}' as float for {col}. Skipping.")
-        elif col == 'platform_count':
+        elif col == 'Platform_Count':
             try:
                 nodes.at[row_idx, col] = int(val)
             except ValueError:
@@ -354,7 +351,7 @@ def _adjust_node(nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     E = nodes.at[row_idx, 'E']
     N = nodes.at[row_idx, 'N']
     nodes.at[row_idx, 'geometry'] = Point(float(E), float(N))
-    print(f"  Node '{nodes.at[row_idx, 'NAME']}' updated.")
+    print(f"  Node '{nodes.at[row_idx, 'Name']}' updated.")
     return nodes
 
 
@@ -364,7 +361,7 @@ def _remove_node(
     composition: gpd.GeoDataFrame,
 ) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """Remove a node with optional segment merge."""
-    term = input("  Search node (CODE or partial NAME): ").strip()
+    term = input("  Search node (Code or partial Name): ").strip()
     if not term:
         return nodes, segments, composition
     hits = _search_nodes(nodes, term)
@@ -372,26 +369,26 @@ def _remove_node(
         print(f"  No nodes matching '{term}'.")
         return nodes, segments, composition
 
-    labels = [f"{r['NAME']}  [{r['CODE']}]" for _, r in hits.iterrows()]
+    labels = [f"{r['Name']}  [{r['Code']}]" for _, r in hits.iterrows()]
     idx = _pick_one(labels, "Node to remove")
     if idx is None:
         return nodes, segments, composition
 
     row_idx   = hits.index[idx]
     node_row  = nodes.loc[row_idx]
-    node_name = node_row['NAME']
+    node_name = node_row['Name']
 
     # Print node attributes
     print(f"\n  Node: {node_name}")
-    for col in ['CODE', 'E', 'N', 'node_class', 'transport_mode', 'platform_count']:
+    for col in ['Code', 'E', 'N', 'Node_Class', 'Transport_Mode', 'Platform_Count']:
         print(f"    {col}: {node_row.get(col, '')}")
 
     # Connected segments
-    conn_mask = (segments['from_name'] == node_name) | (segments['to_name'] == node_name)
+    conn_mask = (segments['From_Name'] == node_name) | (segments['To_Name'] == node_name)
     conn_segs = segments[conn_mask]
     print(f"\n  Connected segments ({len(conn_segs)}):")
     for _, s in conn_segs.iterrows():
-        print(f"    {s['from_name']} → {s['to_name']}  [{s['segment_id']}]")
+        print(f"    {s['From_Name']} → {s['To_Name']}  [{s['Segment_ID']}]")
 
     # Merge check: exactly 2 connected segs with identical MERGE_ATTRS
     merged = False
@@ -403,49 +400,54 @@ def _remove_node(
             ).strip().lower() or 'n'
             if ans == 'y':
                 # Surviving outer endpoints
-                all_ends = {s0['from_name'], s0['to_name'],
-                            s1['from_name'], s1['to_name']}
+                all_ends = {s0['From_Name'], s0['To_Name'],
+                            s1['From_Name'], s1['To_Name']}
                 surviving = [e for e in all_ends if e != node_name]
                 from_end, to_end = surviving[0], surviving[1]
 
-                fe_code_rows = nodes[nodes['NAME'] == from_end]
-                te_code_rows = nodes[nodes['NAME'] == to_end]
-                fe_code = fe_code_rows.iloc[0]['CODE'] if not fe_code_rows.empty else from_end
-                te_code = te_code_rows.iloc[0]['CODE'] if not te_code_rows.empty else to_end
+                fe_code_rows = nodes[nodes['Name'] == from_end]
+                te_code_rows = nodes[nodes['Name'] == to_end]
+                fe_code = fe_code_rows.iloc[0]['Code'] if not fe_code_rows.empty else from_end
+                te_code = te_code_rows.iloc[0]['Code'] if not te_code_rows.empty else to_end
                 new_seg_id  = f"c{fe_code}_{te_code}"
                 new_geom    = linemerge([s0.geometry, s1.geometry])
                 new_length  = new_geom.length
-                new_km_start = min(s0['km_start'], s1['km_start'])
-                new_km_end   = max(s0['km_end'],   s1['km_end'])
+                new_km_start = min(s0['Km_Start'], s1['Km_Start'])
+                new_km_end   = max(s0['Km_End'],   s1['Km_End'])
 
-                fn_row = nodes[nodes['NAME'] == from_end]
-                tn_row = nodes[nodes['NAME'] == to_end]
+                fn_row = nodes[nodes['Name'] == from_end]
+                tn_row = nodes[nodes['Name'] == to_end]
+
+                fe_num = fn_row.iloc[0]['Number'] if not fn_row.empty else pd.NA
+                te_num = tn_row.iloc[0]['Number'] if not tn_row.empty else pd.NA
+                new_number = f"{int(fe_num)}_{int(te_num)}" if pd.notna(fe_num) and pd.notna(te_num) else pd.NA
 
                 new_row = {
-                    'segment_id':      new_seg_id,
-                    'segment_name':    new_seg_id,
-                    'from_name':       from_end,
-                    'to_name':         to_end,
-                    'from_N': fn_row.iloc[0]['N'] if not fn_row.empty else pd.NA,
-                    'from_E': fn_row.iloc[0]['E'] if not fn_row.empty else pd.NA,
-                    'to_N':   tn_row.iloc[0]['N'] if not tn_row.empty else pd.NA,
-                    'to_E':   tn_row.iloc[0]['E'] if not tn_row.empty else pd.NA,
-                    'length_m':        new_length,
-                    'num_tracks':      s0['num_tracks'],
-                    'gauge':           s0['gauge'],
-                    'electrification': s0['electrification'],
-                    'km_start':        new_km_start,
-                    'km_end':          new_km_end,
-                    'route_number':    s0['route_number'],
-                    'route_name':      s0['route_name'],
-                    'route_owner':     s0['route_owner'],
-                    'geometry':        new_geom,
+                    'Segment_ID':                  new_seg_id,
+                    'Number':              new_number,
+                    'Code':                f"{fe_code}_{te_code}",
+                    'From_Name':           from_end,
+                    'To_Name':             to_end,
+                    'From_N': fn_row.iloc[0]['N'] if not fn_row.empty else pd.NA,
+                    'From_E': fn_row.iloc[0]['E'] if not fn_row.empty else pd.NA,
+                    'To_N':   tn_row.iloc[0]['N'] if not tn_row.empty else pd.NA,
+                    'To_E':   tn_row.iloc[0]['E'] if not tn_row.empty else pd.NA,
+                    'Length':              new_length,
+                    'Num_Tracks':          s0['Num_Tracks'],
+                    'Gauge':               s0['Gauge'],
+                    'Electrification_Class': s0['Electrification_Class'],
+                    'Km_Start':            new_km_start,
+                    'Km_End':              new_km_end,
+                    'Route_Number':        s0['Route_Number'],
+                    'Route_Name':          s0['Route_Name'],
+                    'Route_Owner':         s0['Route_Owner'],
+                    'geometry':            new_geom,
                 }
 
                 # Remove the two old segments
-                old_ids = conn_segs['segment_id'].tolist()
+                old_ids = conn_segs['Segment_ID'].tolist()
                 segments = segments[
-                    ~segments['segment_id'].isin(old_ids)
+                    ~segments['Segment_ID'].isin(old_ids)
                 ].reset_index(drop=True)
                 segments = pd.concat(
                     [segments, gpd.GeoDataFrame([new_row], crs=SWISS_CRS)],
@@ -454,19 +456,17 @@ def _remove_node(
 
                 # Replace composition: remove 2 old rows, add 1 normal row
                 composition = composition[
-                    ~composition['segment_id'].isin(old_ids)
+                    ~composition['Segment_ID'].isin(old_ids)
                 ].reset_index(drop=True)
                 comp_row = gpd.GeoDataFrame([{
-                    'segment_id':         new_seg_id,
-                    'from_name':          from_end,
-                    'to_name':            to_end,
-                    'construct_type':     'normal',
-                    'edge_level':         1,
-                    'under_construction': 0,
-                    'track_config':       pd.NA,
-                    'railway_type':       pd.NA,
-                    'piece_length_m':     new_length,
-                    'geometry':           new_geom,
+                    'Segment_ID':                   new_seg_id,
+                    'From_Name':            from_end,
+                    'To_Name':              to_end,
+                    'Engineering_Structure': 'normal',
+                    'Edge_Level':           1,
+                    'Under_Construction':   0,
+                    'Piece_Length':         new_length,
+                    'geometry':             new_geom,
                 }], crs=SWISS_CRS)
                 composition = pd.concat([composition, comp_row], ignore_index=True)
 
@@ -490,12 +490,12 @@ def _remove_node(
         nodes = nodes[nodes.index != row_idx].reset_index(drop=True)
 
         if c == '2':
-            remove_ids = conn_segs['segment_id'].tolist()
+            remove_ids = conn_segs['Segment_ID'].tolist()
             segments = segments[
-                ~segments['segment_id'].isin(remove_ids)
+                ~segments['Segment_ID'].isin(remove_ids)
             ].reset_index(drop=True)
             composition = composition[
-                ~composition['segment_id'].isin(remove_ids)
+                ~composition['Segment_ID'].isin(remove_ids)
             ].reset_index(drop=True)
             print(f"  Removed node '{node_name}' and {len(remove_ids)} segment(s).")
         else:
@@ -536,63 +536,61 @@ def _split_segment_at(
     geom_B = substring(geom, split_dist, seg_len)
 
     t      = split_dist / seg_len if seg_len > 0 else 0.0
-    km_mid = S['km_start'] + t * (S['km_end'] - S['km_start'])
+    km_mid = S['Km_Start'] + t * (S['Km_End'] - S['Km_Start'])
 
     split_pt = geom.interpolate(split_dist)
 
-    from_code_rows = nodes[nodes['NAME'] == S['from_name']]
-    to_code_rows   = nodes[nodes['NAME'] == S['to_name']]
-    from_code = from_code_rows.iloc[0]['CODE'] if not from_code_rows.empty else S['from_name']
-    to_code   = to_code_rows.iloc[0]['CODE']   if not to_code_rows.empty   else S['to_name']
+    from_code_rows = nodes[nodes['Name'] == S['From_Name']]
+    to_code_rows   = nodes[nodes['Name'] == S['To_Name']]
+    from_code = from_code_rows.iloc[0]['Code'] if not from_code_rows.empty else S['From_Name']
+    to_code   = to_code_rows.iloc[0]['Code']   if not to_code_rows.empty   else S['To_Name']
 
     id_A = f"c{from_code}_{new_node_code}"
     id_B = f"c{new_node_code}_{to_code}"
 
     row_A = {
-        'segment_id':                    id_A,
-        'segment_name':                  id_A,
-        'from_name':                     S['from_name'],
-        'to_name':                       new_node_name,
-        'from_N':                        S.get('from_N', pd.NA),
-        'from_E':                        S.get('from_E', pd.NA),
-        'to_N':                          split_pt.y,
-        'to_E':                          split_pt.x,
-        'length_m':                      geom_A.length,
-        'num_tracks':                    S['num_tracks'],
-        'gauge':                         S['gauge'],
-        'electrification':               S['electrification'],
-        'km_start':                      S['km_start'],
-        'km_end':                        km_mid,
-        'route_number':                  S['route_number'],
-        'route_name':                    S['route_name'],
-        'route_owner':                   S['route_owner'],
-        'average_speed':                 S.get('average_speed', pd.NA),
-        'predominant_speed':             S.get('predominant_speed', pd.NA),
-        'predominant_speed_coverage_pct': S.get('predominant_speed_coverage_pct', 0.0),
-        'geometry':                      geom_A,
+        'Segment_ID':                    id_A,
+        'From_Name':             S['From_Name'],
+        'To_Name':               new_node_name,
+        'From_N':                S.get('From_N', pd.NA),
+        'From_E':                S.get('From_E', pd.NA),
+        'To_N':                  split_pt.y,
+        'To_E':                  split_pt.x,
+        'Length':                geom_A.length,
+        'Num_Tracks':            S['Num_Tracks'],
+        'Gauge':                 S['Gauge'],
+        'Electrification_Class': S['Electrification_Class'],
+        'Km_Start':              S['Km_Start'],
+        'Km_End':                km_mid,
+        'Route_Number':          S['Route_Number'],
+        'Route_Name':            S['Route_Name'],
+        'Route_Owner':           S['Route_Owner'],
+        'Average_Speed':         S.get('Average_Speed', pd.NA),
+        'Predominant_Speed':     S.get('Predominant_Speed', pd.NA),
+        'Speed_Coverage_Pct':    S.get('Speed_Coverage_Pct', 0.0),
+        'geometry':              geom_A,
     }
     row_B = {
-        'segment_id':                    id_B,
-        'segment_name':                  id_B,
-        'from_name':                     new_node_name,
-        'to_name':                       S['to_name'],
-        'from_N':                        split_pt.y,
-        'from_E':                        split_pt.x,
-        'to_N':                          S.get('to_N', pd.NA),
-        'to_E':                          S.get('to_E', pd.NA),
-        'length_m':                      geom_B.length,
-        'num_tracks':                    S['num_tracks'],
-        'gauge':                         S['gauge'],
-        'electrification':               S['electrification'],
-        'km_start':                      km_mid,
-        'km_end':                        S['km_end'],
-        'route_number':                  S['route_number'],
-        'route_name':                    S['route_name'],
-        'route_owner':                   S['route_owner'],
-        'average_speed':                 S.get('average_speed', pd.NA),
-        'predominant_speed':             S.get('predominant_speed', pd.NA),
-        'predominant_speed_coverage_pct': S.get('predominant_speed_coverage_pct', 0.0),
-        'geometry':                      geom_B,
+        'Segment_ID':                    id_B,
+        'From_Name':             new_node_name,
+        'To_Name':               S['To_Name'],
+        'From_N':                split_pt.y,
+        'From_E':                split_pt.x,
+        'To_N':                  S.get('To_N', pd.NA),
+        'To_E':                  S.get('To_E', pd.NA),
+        'Length':                geom_B.length,
+        'Num_Tracks':            S['Num_Tracks'],
+        'Gauge':                 S['Gauge'],
+        'Electrification_Class': S['Electrification_Class'],
+        'Km_Start':              km_mid,
+        'Km_End':                S['Km_End'],
+        'Route_Number':          S['Route_Number'],
+        'Route_Name':            S['Route_Name'],
+        'Route_Owner':           S['Route_Owner'],
+        'Average_Speed':         S.get('Average_Speed', pd.NA),
+        'Predominant_Speed':     S.get('Predominant_Speed', pd.NA),
+        'Speed_Coverage_Pct':    S.get('Speed_Coverage_Pct', 0.0),
+        'geometry':              geom_B,
     }
 
     # Remove original segment, add A and B
@@ -603,15 +601,15 @@ def _split_segment_at(
     )
 
     # --- Redistribute composition pieces ---
-    old_comp    = composition[composition['segment_id'] == S['segment_id']].copy()
+    old_comp    = composition[composition['Segment_ID'] == S['Segment_ID']].copy()
     composition = composition[
-        composition['segment_id'] != S['segment_id']
+        composition['Segment_ID'] != S['Segment_ID']
     ].reset_index(drop=True)
 
     new_comp_rows = []
     cumulative = 0.0
     for _, piece in old_comp.iterrows():
-        piece_len   = float(piece['piece_length_m'])
+        piece_len   = float(piece['Piece_Length'])
         piece_start = cumulative
         piece_end   = cumulative + piece_len
 
@@ -622,19 +620,19 @@ def _split_segment_at(
             # Entirely in A
             new_comp_rows.append({
                 **base,
-                'segment_id': id_A,
-                'from_name':  S['from_name'],
-                'to_name':    new_node_name,
-                '_geom':      geom_A,
+                'Segment_ID':        id_A,
+                'From_Name': S['From_Name'],
+                'To_Name':   new_node_name,
+                '_geom':     geom_A,
             })
         elif piece_start >= split_dist:
             # Entirely in B
             new_comp_rows.append({
                 **base,
-                'segment_id': id_B,
-                'from_name':  new_node_name,
-                'to_name':    S['to_name'],
-                '_geom':      geom_B,
+                'Segment_ID':        id_B,
+                'From_Name': new_node_name,
+                'To_Name':   S['To_Name'],
+                '_geom':     geom_B,
             })
         else:
             # Straddles split — divide into two rows
@@ -642,19 +640,19 @@ def _split_segment_at(
             len_in_B = piece_end  - split_dist
             new_comp_rows.append({
                 **base,
-                'segment_id':    id_A,
-                'from_name':     S['from_name'],
-                'to_name':       new_node_name,
-                'piece_length_m': len_in_A,
-                '_geom':         geom_A,
+                'Segment_ID':           id_A,
+                'From_Name':    S['From_Name'],
+                'To_Name':      new_node_name,
+                'Piece_Length': len_in_A,
+                '_geom':        geom_A,
             })
             new_comp_rows.append({
                 **base,
-                'segment_id':    id_B,
-                'from_name':     new_node_name,
-                'to_name':       S['to_name'],
-                'piece_length_m': len_in_B,
-                '_geom':         geom_B,
+                'Segment_ID':           id_B,
+                'From_Name':    new_node_name,
+                'To_Name':      S['To_Name'],
+                'Piece_Length': len_in_B,
+                '_geom':        geom_B,
             })
 
         cumulative += piece_len
@@ -689,7 +687,7 @@ def _add_node(
     if c == '1':
         route = input("  Route number: ").strip()
         route_segs = segments[
-            segments['route_number'].fillna('').astype(str) == route
+            segments['Route_Number'].fillna('').astype(str) == route
         ]
         if route_segs.empty:
             print(f"  No segments found for route '{route}'.")
@@ -702,15 +700,15 @@ def _add_node(
                 print("  Enter a numeric km value.")
                 continue
             match = route_segs[
-                (route_segs['km_start'].fillna(-1) <= km) &
-                (route_segs['km_end'].fillna(-1)   >= km)
+                (route_segs['Km_Start'].fillna(-1) <= km) &
+                (route_segs['Km_End'].fillna(-1)   >= km)
             ]
             if match.empty:
                 print(f"  No segment covers km {km} on route '{route}'. Try again.")
                 continue
             seg_idx = match.index[0]
             S = segments.loc[seg_idx]
-            t          = (km - S['km_start']) / (S['km_end'] - S['km_start'])
+            t          = (km - S['Km_Start']) / (S['Km_End'] - S['Km_Start'])
             split_dist = t * S.geometry.length
             split_pt   = S.geometry.interpolate(split_dist)
             node_E, node_N = split_pt.x, split_pt.y
@@ -732,15 +730,15 @@ def _add_node(
 
     # Prompt node attributes
     print(f"\n  New node will be at E={node_E:.1f}, N={node_N:.1f}")
-    name = input("  NAME: ").strip()
+    name = input("  Name: ").strip()
     if not name:
         print("  Name cannot be empty. Cancelled.")
         return nodes, segments, composition
-    if name in nodes['NAME'].values:
+    if name in nodes['Name'].values:
         print(f"  A node named '{name}' already exists. Cancelled.")
         return nodes, segments, composition
 
-    code = input(f"  CODE [{name[:4].upper()}]: ").strip() or name[:4].upper()
+    code = input(f"  Code [{name[:4].upper()}]: ").strip() or name[:4].upper()
 
     print("  Node class:")
     for k, v in NODE_CLASS_OPTIONS.items():
@@ -752,9 +750,9 @@ def _add_node(
             break
         print("  Invalid — enter 1–6.")
 
-    # Generate a synthetic Betriebspunkt_Nummer above the BAV range (max + 1,
+    # Generate a synthetic Number above the BAV range (max + 1,
     # floored at 9_000_000 so synthetic nodes are clearly distinguishable).
-    existing_ids = nodes['Betriebspunkt_Nummer'].dropna()
+    existing_ids = nodes['Number'].dropna()
     try:
         max_existing = int(existing_ids.astype(float).max())
     except (ValueError, TypeError):
@@ -767,20 +765,20 @@ def _add_node(
     synthetic_node_id = f"synth_{synthetic_bpnr}"
 
     new_node = {
-        'node_id':              synthetic_node_id,
-        'Betriebspunkt_Nummer': synthetic_bpnr,
-        'NAME':                 name,
-        'CODE':                 code,
-        'E':                    node_E,
-        'N':                    node_N,
-        'node_class':           node_class,
-        'transport_mode':       None,
-        'platform_count':       None,
-        'track_count':          None,
-        'parent_node':          None,
-        'geometry':             Point(node_E, node_N),
+        'Segment_ID':               synthetic_node_id,
+        'Number':           synthetic_bpnr,
+        'Name':             name,
+        'Code':             code,
+        'E':                node_E,
+        'N':                node_N,
+        'Node_Class':       node_class,
+        'Transport_Mode':   None,
+        'Platform_Count':   None,
+        'Track_Count':      None,
+        'Parent_Node':      None,
+        'geometry':         Point(node_E, node_N),
     }
-    print(f"  Assigned synthetic Betriebspunkt_Nummer: {synthetic_bpnr}")
+    print(f"  Assigned synthetic Number: {synthetic_bpnr}")
 
     # Apply segment split
     segments, composition = _split_segment_at(
@@ -813,8 +811,7 @@ def _remove_segment(
         return segments, composition
 
     labels = [
-        f"{r['from_name']} → {r['to_name']}  [{r['segment_id']}]"
-        + (f"  ({r['segment_name']})" if pd.notna(r.get('segment_name')) and r.get('segment_name') else "")
+        f"{r['From_Name']} → {r['To_Name']}  [{r['Segment_ID']}]"
         for _, r in hits.iterrows()
     ]
     idx = _pick_one(labels, "Segment to remove")
@@ -823,12 +820,12 @@ def _remove_segment(
 
     row_idx = hits.index[idx]
     S = segments.loc[row_idx]
-    
-    ans = input(f"  Remove segment '{S['from_name']} → {S['to_name']}'? (y/n) [n]: ").strip().lower() or 'n'
+
+    ans = input(f"  Remove segment '{S['From_Name']} → {S['To_Name']}'? (y/n) [n]: ").strip().lower() or 'n'
     if ans == 'y':
         segments = segments[segments.index != row_idx].reset_index(drop=True)
-        composition = composition[composition['segment_id'] != S['segment_id']].reset_index(drop=True)
-        print(f"  Removed segment '{S['segment_id']}'.")
+        composition = composition[composition['Segment_ID'] != S['Segment_ID']].reset_index(drop=True)
+        print(f"  Removed segment '{S['Segment_ID']}'.")
     return segments, composition
 
 
@@ -846,8 +843,7 @@ def _adjust_segment(
         return segments, composition
 
     labels = [
-        f"{r['from_name']} → {r['to_name']}  [{r['segment_id']}]"
-        + (f"  ({r['segment_name']})" if pd.notna(r.get('segment_name')) and r.get('segment_name') else "")
+        f"{r['From_Name']} → {r['To_Name']}  [{r['Segment_ID']}]"
         for _, r in hits.iterrows()
     ]
     idx = _pick_one(labels, "Segment to adjust")
@@ -858,20 +854,20 @@ def _adjust_segment(
     row = segments.loc[row_idx]
 
     COLS = [
-        'from_name', 'to_name', 'length_m', 'num_tracks', 'gauge', 'electrification',
-        'km_start', 'km_end', 'route_number', 'route_name', 'route_owner', 'average_speed',
+        'From_Name', 'To_Name', 'Length', 'Num_Tracks', 'Gauge', 'Electrification_Class',
+        'Km_Start', 'Km_End', 'Route_Number', 'Route_Name', 'Route_Owner', 'Average_Speed',
     ]
     header  = ", ".join(COLS)
     current = ", ".join(str(row.get(c, '')) for c in COLS)
     print(f"\n  {header}")
     print(f"  {current}")
     print(
-        f"  OSM-derived (read-only): predominant_speed={row.get('predominant_speed', 'N/A')}  "
-        f"coverage_pct={row.get('predominant_speed_coverage_pct', 'N/A')}"
+        f"  OSM-derived (read-only): Predominant_Speed={row.get('Predominant_Speed', 'N/A')}  "
+        f"Speed_Coverage_Pct={row.get('Speed_Coverage_Pct', 'N/A')}"
     )
 
-    pieces = composition[composition['segment_id'] == row['segment_id']]
-    comp_strs = [f"{p['construct_type']} {float(p['piece_length_m']):.0f}m" for _, p in pieces.iterrows()]
+    pieces = composition[composition['Segment_ID'] == row['Segment_ID']]
+    comp_strs = [f"{p['Engineering_Structure']} {float(p['Piece_Length']):.0f}m" for _, p in pieces.iterrows()]
     print(f"  Composition: {len(pieces)} pieces — {' / '.join(comp_strs)}")
 
     updated = input("  Enter updated values (same order; press Enter to keep): ").strip()
@@ -882,18 +878,18 @@ def _adjust_segment(
             return segments, composition
 
         EDITABLE = [
-            'num_tracks', 'gauge', 'electrification',
-            'km_start', 'km_end', 'route_number', 'route_name', 'route_owner', 'average_speed',
+            'Num_Tracks', 'Gauge', 'Electrification_Class',
+            'Km_Start', 'Km_End', 'Route_Number', 'Route_Name', 'Route_Owner', 'Average_Speed',
         ]
         for col, val in zip(COLS, parts):
             if val == '' or col not in EDITABLE:
                 continue
-            if col in ('km_start', 'km_end', 'average_speed'):
+            if col in ('Km_Start', 'Km_End', 'Average_Speed'):
                 try:
                     segments.at[row_idx, col] = float(val)
                 except ValueError:
                     pass
-            elif col in ('num_tracks', 'gauge'):
+            elif col in ('Num_Tracks', 'Gauge'):
                 try:
                     segments.at[row_idx, col] = int(val)
                 except ValueError:
@@ -901,21 +897,21 @@ def _adjust_segment(
             else:
                 segments.at[row_idx, col] = val
 
-        print(f"  Segment '{row['segment_id']}' attributes updated.")
+        print(f"  Segment '{row['Segment_ID']}' attributes updated.")
 
     # Composition update
     recomp = input("\n  Redefine composition for this segment? (y/n) [n]: ").strip().lower() or 'n'
     if recomp == 'y':
         seg_geom = segments.loc[row_idx].geometry
-        seg_len  = float(segments.loc[row_idx].get('length_m', seg_geom.length))
+        seg_len  = float(segments.loc[row_idx].get('Length', seg_geom.length))
         # Drop existing composition pieces for this segment
         composition = composition[
-            composition['segment_id'] != row['segment_id']
+            composition['Segment_ID'] != row['Segment_ID']
         ].reset_index(drop=True)
         new_comp_gdf = _prompt_composition_pieces(
-            row['segment_id'],
-            segments.loc[row_idx, 'from_name'],
-            segments.loc[row_idx, 'to_name'],
+            row['Segment_ID'],
+            segments.loc[row_idx, 'From_Name'],
+            segments.loc[row_idx, 'To_Name'],
             seg_geom, seg_len,
         )
         composition = pd.concat([composition, new_comp_gdf], ignore_index=True)
@@ -930,35 +926,35 @@ def _add_segment(
     composition: gpd.GeoDataFrame,
 ) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """Phase 2 — Add a segment."""
-    term_from = input("  FROM node (CODE or partial NAME): ").strip()
+    term_from = input("  FROM node (Code or partial Name): ").strip()
     hits_f = _search_nodes(nodes, term_from) if term_from else gpd.GeoDataFrame()
     if hits_f.empty:
         print("  Cancel.")
         return segments, composition
-    from_labels = [f"{r['NAME']}  [{r['CODE']}]" for _, r in hits_f.iterrows()]
+    from_labels = [f"{r['Name']}  [{r['Code']}]" for _, r in hits_f.iterrows()]
     idx_f = _pick_one(from_labels, "FROM node")
     if idx_f is None: return segments, composition
     f_node = hits_f.iloc[idx_f]
 
-    term_to = input("  TO node (CODE or partial NAME): ").strip()
+    term_to = input("  TO node (Code or partial Name): ").strip()
     hits_t = _search_nodes(nodes, term_to) if term_to else gpd.GeoDataFrame()
     if hits_t.empty:
         print("  Cancel.")
         return segments, composition
-    to_labels = [f"{r['NAME']}  [{r['CODE']}]" for _, r in hits_t.iterrows()]
+    to_labels = [f"{r['Name']}  [{r['Code']}]" for _, r in hits_t.iterrows()]
     idx_t = _pick_one(to_labels, "TO node")
     if idx_t is None: return segments, composition
     t_node = hits_t.iloc[idx_t]
 
-    if f_node['NAME'] == t_node['NAME']:
+    if f_node['Name'] == t_node['Name']:
         print("  FROM and TO node must be different.")
         return segments, composition
 
     geom = LineString([(f_node['E'], f_node['N']), (t_node['E'], t_node['N'])])
     
     COLS = [
-        'num_tracks', 'gauge', 'electrification', 'route_number',
-        'route_name', 'route_owner', 'km_start', 'km_end'
+        'Num_Tracks', 'Gauge', 'Electrification_Class', 'Route_Number',
+        'Route_Name', 'Route_Owner', 'Km_Start', 'Km_End'
     ]
     print(f"\n  Attributes: {', '.join(COLS)}")
     val_str = input("  Values (comma-separated): ").strip()
@@ -969,9 +965,9 @@ def _add_segment(
 
     vals = {}
     for col, v in zip(COLS, parts):
-        if col in ('num_tracks', 'gauge'):
+        if col in ('Num_Tracks', 'Gauge'):
             vals[col] = int(v) if v.isdigit() else pd.NA
-        elif col in ('km_start', 'km_end'):
+        elif col in ('Km_Start', 'Km_End'):
             try: vals[col] = float(v)
             except ValueError: vals[col] = pd.NA
         else:
@@ -983,36 +979,41 @@ def _add_segment(
     except ValueError:
         avg_speed = pd.NA
 
-    seg_id  = f"c{f_node['CODE']}_{t_node['CODE']}"
+    seg_id  = f"c{f_node['Code']}_{t_node['Code']}"
     seg_len = geom.length
 
+    fn_num = f_node.get('Number')
+    tn_num = t_node.get('Number')
+    seg_number = f"{int(fn_num)}_{int(tn_num)}" if pd.notna(fn_num) and pd.notna(tn_num) else pd.NA
+
     new_seg = {
-        'segment_id':                    seg_id,
-        'segment_name':                  seg_id,
-        'from_name':                     f_node['NAME'],
-        'to_name':                       t_node['NAME'],
-        'from_N':                        f_node['N'],
-        'from_E':                        f_node['E'],
-        'to_N':                          t_node['N'],
-        'to_E':                          t_node['E'],
-        'length_m':                      seg_len,
-        'num_tracks':                    vals.get('num_tracks', pd.NA),
-        'gauge':                         vals.get('gauge', pd.NA),
-        'electrification':               vals.get('electrification', pd.NA),
-        'km_start':                      vals.get('km_start', pd.NA),
-        'km_end':                        vals.get('km_end', pd.NA),
-        'route_number':                  vals.get('route_number', pd.NA),
-        'route_name':                    vals.get('route_name', pd.NA),
-        'route_owner':                   vals.get('route_owner', pd.NA),
-        'average_speed':                 avg_speed,
-        'predominant_speed':             avg_speed,
-        'predominant_speed_coverage_pct': 1.0 if pd.notna(avg_speed) else 0.0,
-        'geometry':                      geom,
+        'Segment_ID':                    seg_id,
+        'Number':                seg_number,
+        'Code':                  f"{f_node['Code']}_{t_node['Code']}",
+        'From_Name':             f_node['Name'],
+        'To_Name':               t_node['Name'],
+        'From_N':                f_node['N'],
+        'From_E':                f_node['E'],
+        'To_N':                  t_node['N'],
+        'To_E':                  t_node['E'],
+        'Length':                seg_len,
+        'Num_Tracks':            vals.get('Num_Tracks', pd.NA),
+        'Gauge':                 vals.get('Gauge', pd.NA),
+        'Electrification_Class': vals.get('Electrification_Class', pd.NA),
+        'Km_Start':              vals.get('Km_Start', pd.NA),
+        'Km_End':                vals.get('Km_End', pd.NA),
+        'Route_Number':          vals.get('Route_Number', pd.NA),
+        'Route_Name':            vals.get('Route_Name', pd.NA),
+        'Route_Owner':           vals.get('Route_Owner', pd.NA),
+        'Average_Speed':         avg_speed,
+        'Predominant_Speed':     avg_speed,
+        'Speed_Coverage_Pct':    1.0 if pd.notna(avg_speed) else 0.0,
+        'geometry':              geom,
     }
 
     print("\n  Now define the segment composition:")
     new_comp_gdf = _prompt_composition_pieces(
-        seg_id, f_node['NAME'], t_node['NAME'], geom, seg_len,
+        seg_id, f_node['Name'], t_node['Name'], geom, seg_len,
     )
 
     segments    = pd.concat([segments,    gpd.GeoDataFrame([new_seg], crs=SWISS_CRS)], ignore_index=True)
@@ -1031,7 +1032,7 @@ def _edit_composition(
     composition: gpd.GeoDataFrame,
 ) -> gpd.GeoDataFrame:
     """Phase 3 — Interactively add, remove, or edit composition pieces for a segment."""
-    term = input("  Search segment (partial from-name, to-name, or segment_name): ").strip()
+    term = input("  Search segment (partial From_Name, To_Name, or ID): ").strip()
     if not term:
         return composition
     hits = _search_segments(segments, term)
@@ -1040,8 +1041,7 @@ def _edit_composition(
         return composition
 
     labels = [
-        f"{r['from_name']} → {r['to_name']}  [{r['segment_id']}]"
-        + (f"  ({r['segment_name']})" if pd.notna(r.get('segment_name')) and r.get('segment_name') else "")
+        f"{r['From_Name']} → {r['To_Name']}  [{r['Segment_ID']}]"
         for _, r in hits.iterrows()
     ]
     idx = _pick_one(labels, "Segment to edit composition")
@@ -1049,19 +1049,18 @@ def _edit_composition(
         return composition
 
     seg_row = hits.iloc[idx]
-    seg_id  = seg_row['segment_id']
+    seg_id  = seg_row['Segment_ID']
     seg_geom = seg_row.geometry
-    seg_len  = float(seg_row.get('length_m', seg_geom.length if seg_geom else 0))
+    seg_len  = float(seg_row.get('Length', seg_geom.length if seg_geom else 0))
 
-    COMP_COLS = ['construct_type', 'piece_length_m', 'edge_level',
-                 'under_construction', 'track_config', 'railway_type']
+    COMP_COLS = ['Engineering_Structure', 'Piece_Length', 'Edge_Level', 'Under_Construction']
 
     while True:
         ct_options = CONSTRUCT_TYPE_OPTIONS
-        pieces = composition[composition['segment_id'] == seg_id].copy()
-        total_comp = float(pieces['piece_length_m'].sum()) if not pieces.empty else 0.0
+        pieces = composition[composition['Segment_ID'] == seg_id].copy()
+        total_comp = float(pieces['Piece_Length'].sum()) if not pieces.empty else 0.0
 
-        print(f"\n  Segment: {seg_row['from_name']} → {seg_row['to_name']}  "
+        print(f"\n  Segment: {seg_row['From_Name']} → {seg_row['To_Name']}  "
               f"(segment length: {seg_len:.0f} m)")
         if pieces.empty:
             print("  Composition: (no pieces)")
@@ -1102,20 +1101,15 @@ def _edit_composition(
             uc_raw = input("  Under construction (0/1) [0]: ").strip() or '0'
             uc = 1 if uc_raw == '1' else 0
 
-            tc_raw = input("  Track config (Enter for none): ").strip()
-            rt_raw = input("  Railway type  (Enter for none): ").strip()
-
             new_piece = gpd.GeoDataFrame([{
-                'segment_id':         seg_id,
-                'from_name':          seg_row['from_name'],
-                'to_name':            seg_row['to_name'],
-                'construct_type':     ct,
-                'edge_level':         el,
-                'under_construction': uc,
-                'track_config':       tc_raw if tc_raw else pd.NA,
-                'railway_type':       rt_raw if rt_raw else pd.NA,
-                'piece_length_m':     pl,
-                'geometry':           seg_geom,
+                'Segment_ID':                   seg_id,
+                'From_Name':            seg_row['From_Name'],
+                'To_Name':              seg_row['To_Name'],
+                'Engineering_Structure': ct,
+                'Edge_Level':           el,
+                'Under_Construction':   uc,
+                'Piece_Length':         pl,
+                'geometry':             seg_geom,
             }], crs=SWISS_CRS)
             composition = pd.concat([composition, new_piece], ignore_index=True)
             print(f"  Added piece: {ct}  {pl:.0f} m.")
@@ -1125,7 +1119,7 @@ def _edit_composition(
                 print("  No pieces to edit.")
                 continue
             piece_labels = [
-                f"{p['construct_type']}  {float(p['piece_length_m']):.0f} m"
+                f"{p['Engineering_Structure']}  {float(p['Piece_Length']):.0f} m"
                 for _, p in pieces.iterrows()
             ]
             pidx = _pick_one(piece_labels, "Piece to edit")
@@ -1150,12 +1144,12 @@ def _edit_composition(
             for col, val in zip(COMP_COLS, parts):
                 if val == '':
                     continue
-                if col == 'piece_length_m':
+                if col == 'Piece_Length':
                     try:
                         composition.at[edit_loc, col] = float(val)
                     except ValueError:
                         print(f"  Could not parse '{val}' as float for {col}. Skipping.")
-                elif col in ('edge_level', 'under_construction'):
+                elif col in ('Edge_Level', 'Under_Construction'):
                     try:
                         composition.at[edit_loc, col] = int(val)
                     except ValueError:
@@ -1166,10 +1160,10 @@ def _edit_composition(
 
         elif c == 'r':
             composition = composition[
-                composition['segment_id'] != seg_id
+                composition['Segment_ID'] != seg_id
             ].reset_index(drop=True)
             new_comp_gdf = _prompt_composition_pieces(
-                seg_id, seg_row['from_name'], seg_row['to_name'],
+                seg_id, seg_row['From_Name'], seg_row['To_Name'],
                 seg_geom, seg_len,
             )
             composition = pd.concat([composition, new_comp_gdf], ignore_index=True)
@@ -1203,38 +1197,38 @@ def _import_nodes(
     
     # Helper to generate a match key
     def get_node_key(row):
-        nid = str(row.get('node_id', ''))
-        bpn = str(row.get('Betriebspunkt_Nummer', ''))
-        name = str(row.get('NAME', ''))
+        nid = str(row.get('ID', ''))
+        bpn = str(row.get('Number', ''))
+        name = str(row.get('Name', ''))
         if nid != 'None' and nid != 'nan' and nid != '' and bpn != 'None' and bpn != 'nan' and bpn != '':
             return f"{nid}_{bpn}"
-        return f"NAME_{name}"
-        
+        return f"Name_{name}"
+
     curr_keys = current_nodes.apply(get_node_key, axis=1)
-    
+
     for i, s_row in source_nodes.iterrows():
         s_key = get_node_key(s_row)
         match_idx = current_nodes.index[curr_keys == s_key].tolist()
-        
+
         if not match_idx:
-            diff_items.append((i, "New", None, f"New node '{s_row.get('NAME', 'Unknown')}'"))
+            diff_items.append((i, "New", None, f"New node '{s_row.get('Name', 'Unknown')}'"))
         else:
             c_idx = match_idx[0]
             c_row = current_nodes.loc[c_idx]
-            
+
             changes = []
-            for col in ['E', 'N', 'node_class', 'transport_mode', 'platform_count', 'NAME']:
+            for col in ['E', 'N', 'Node_Class', 'Transport_Mode', 'Platform_Count', 'Name']:
                 s_val = s_row.get(col)
                 c_val = c_row.get(col)
                 if pd.isna(s_val) and pd.isna(c_val): continue
                 if str(s_val) != str(c_val):
                     changes.append(f"{col}: {c_val} -> {s_val}")
-            
+
             if not s_row.geometry.equals(c_row.geometry):
                 changes.append("geometry changed")
-                
+
             if changes:
-                desc = f"Update node '{s_row.get('NAME', 'Unknown')}' ({', '.join(changes)})"
+                desc = f"Update node '{s_row.get('Name', 'Unknown')}' ({', '.join(changes)})"
                 diff_items.append((i, "Changed", c_idx, desc))
 
     if not diff_items:
@@ -1306,9 +1300,8 @@ def _import_segments(
     diff_items = []
     
     def get_seg_key(row):
-        sid = str(row.get('segment_id', ''))
-        sname = str(row.get('segment_name', ''))
-        return f"{sid}_{sname}"
+        sid = str(row.get('ID', ''))
+        return sid
         
     curr_keys = current_segs.apply(get_seg_key, axis=1)
     
@@ -1317,14 +1310,14 @@ def _import_segments(
         match_idx = current_segs.index[curr_keys == s_key].tolist()
         
         if not match_idx:
-            desc = f"New segment '{s_row.get('segment_id', '')}' ({s_row.get('from_name', '')} -> {s_row.get('to_name', '')})"
+            desc = f"New segment '{s_row.get('ID', '')}' ({s_row.get('From_Name', '')} -> {s_row.get('To_Name', '')})"
             diff_items.append((i, "New", None, desc))
         else:
             c_idx = match_idx[0]
             c_row = current_segs.loc[c_idx]
-            
+
             changes = []
-            for col in ['num_tracks', 'gauge', 'electrification', 'length_m', 'km_start', 'km_end', 'from_name', 'to_name']:
+            for col in ['Num_Tracks', 'Gauge', 'Electrification_Class', 'Length', 'Km_Start', 'Km_End', 'From_Name', 'To_Name']:
                 s_val = s_row.get(col)
                 c_val = c_row.get(col)
                 if pd.isna(s_val) and pd.isna(c_val): continue
@@ -1334,14 +1327,14 @@ def _import_segments(
             if not s_row.geometry.equals(c_row.geometry):
                 changes.append("geometry")
                 
-            # Check composition difference by row count and total length
-            s_c = source_comp[source_comp['segment_id'] == s_row.get('segment_id', '')]
-            c_c = current_comp[current_comp['segment_id'] == c_row.get('segment_id', '')]
+            # Check composition difference by row count
+            s_c = source_comp[source_comp['Segment_ID'] == s_row.get('ID', '')]
+            c_c = current_comp[current_comp['Segment_ID'] == c_row.get('ID', '')]
             if len(s_c) != len(c_c):
                 changes.append("composition count")
                 
             if changes:
-                desc = f"Update segment '{s_row.get('segment_id', '')}' ({', '.join(changes)})"
+                desc = f"Update segment '{s_row.get('ID', '')}' ({', '.join(changes)})"
                 diff_items.append((i, "Changed", c_idx, desc))
                 
     if not diff_items:
@@ -1379,22 +1372,22 @@ def _import_segments(
     for idx_in_diff in selected_indices:
         s_idx, status, c_idx, desc = diff_items[idx_in_diff]
         s_row = source_segs.loc[s_idx]
-        s_id = s_row.get('segment_id')
+        s_id = s_row.get('Segment_ID')
         
         new_seg_rows.append(s_row)
         if s_id:
-            s_comp_pieces = source_comp[source_comp['segment_id'] == s_id]
+            s_comp_pieces = source_comp[source_comp['Segment_ID'] == s_id]
             if not s_comp_pieces.empty:
                 new_comp_rows.extend(s_comp_pieces.to_dict('records'))
-            
+
         if status == "Changed" and c_idx is not None:
             drop_seg_indices.append(c_idx)
-            drop_comp_seg_ids.append(current_segs.at[c_idx, 'segment_id'])
+            drop_comp_seg_ids.append(current_segs.at[c_idx, 'ID'])
             
     if drop_seg_indices:
         current_segs = current_segs.drop(index=drop_seg_indices)
     if drop_comp_seg_ids:
-        current_comp = current_comp[~current_comp['segment_id'].isin(drop_comp_seg_ids)]
+        current_comp = current_comp[~current_comp['Segment_ID'].isin(drop_comp_seg_ids)]
         
     if new_seg_rows:
         current_segs = pd.concat([current_segs, gpd.GeoDataFrame(new_seg_rows, crs=SWISS_CRS)], ignore_index=True)

@@ -1,5 +1,6 @@
 """
 Filter Infrastructure Network Module
+Last modified: 2026-05-02
 
 Loads Swiss BAV railway geopackages, cleans the data, joins route attributes
 onto segments, filters everything to the catchment area buffer, and produces
@@ -199,13 +200,28 @@ TRANSPORT_MODE_MAPPING = {
     'Standseilbahn': 'funicular',
 }
 
-# TLMRegio CONSTRUCT field → English label
+# TLMRegio CONSTRUCT field → Engineering_Structure label (gallery folded into tunnel)
 CONSTRUCT_MAPPING = {
     'Keine Kunstbaute': 'normal',
     'Brücke':           'bridge',
     'Tunnel':           'tunnel',
-    'Galerie':          'gallery',
+    'Galerie':          'tunnel',
 }
+
+# BAV Elektrifizierung string → canonical Electrification_Class
+_ELEC_MAP = {
+    'Wechselstrom_16_7Hz':             'AC_16.7Hz',
+    'Gleichstrom':                     'DC',
+    'Wechselstrom_16_7Hz_Gleichstrom': 'AC_16.7Hz_DC',
+    'nicht_elektrifiziert':            'non_electrified',
+}
+
+
+def _harmonise_electrification(val) -> str:
+    if pd.isna(val):
+        return 'unknown'
+    return _ELEC_MAP.get(str(val).strip(), 'unknown')
+
 
 # TLMRegio OBJVAL field → English label
 OBJVAL_MAPPING = {
@@ -486,29 +502,29 @@ def clean_nodes(raw_nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     Standardise BAV node data.
 
     Output columns:
-        node_id              – xtf_id (used for topology joins with segments)
-        Betriebspunkt_Nummer – stable numeric public ID (matching key for HaltestellenOeV)
-        NAME, CODE           – station name and abbreviation
+        ID                   – xtf_id (used for topology joins with segments)
+        Number               – stable numeric public ID (matching key for HaltestellenOeV)
+        Name, Code           – station name and abbreviation
         N, E                 – Northing and Easting (EPSG:2056)
-        parent_node          – rUebergeordnet
+        Parent_Node          – rUebergeordnet
 
-    node_class, transport_mode, platform_count, track_count are added later.
+    Node_Class, Transport_Mode, Platform_Count, Track_Count are added later.
     """
     print("Cleaning nodes...")
     print(f"  Columns: {list(raw_nodes.columns)}")
 
     out = gpd.GeoDataFrame(geometry=raw_nodes.geometry.copy(), crs=raw_nodes.crs)
 
-    out['node_id']              = raw_nodes['xtf_id']
-    out['Betriebspunkt_Nummer'] = raw_nodes.get('Betriebspunkt_Nummer', pd.NA)
-    out['NAME']                 = raw_nodes.get('Betriebspunkt_Name', pd.NA)
-    out['CODE']                 = raw_nodes.get('Betriebspunkt_Abkuerzung', pd.NA)
+    out['Node_ID']              = raw_nodes['xtf_id']
+    out['Number']               = raw_nodes.get('Betriebspunkt_Nummer', pd.NA)
+    out['Name']                 = raw_nodes.get('Betriebspunkt_Name', pd.NA)
+    out['Code']                 = raw_nodes.get('Betriebspunkt_Abkuerzung', pd.NA)
     out['E']                    = out.geometry.x
     out['N']                    = out.geometry.y
-    out['parent_node']          = raw_nodes.get('rUebergeordnet', pd.NA)
+    out['Parent_Node']          = raw_nodes.get('rUebergeordnet', pd.NA)
 
     n_before = len(out)
-    out = out.drop_duplicates(subset=['node_id'], keep='first')
+    out = out.drop_duplicates(subset=['Node_ID'], keep='first')
     if len(out) < n_before:
         print(f"  Removed {n_before - len(out)} duplicate nodes")
 
@@ -524,17 +540,17 @@ def clean_segments(raw_segments: gpd.GeoDataFrame,
     Route join:  segments.rKmLinie → routes.xtf_id
 
     Output columns:
-        segment_id              – xtf_id
-        from_node, to_node      – xtf_id references to nodes
-        from_N/E, to_N/E        – endpoint coordinates
-        length_m                – calculated from geometry
-        num_tracks              – AnzahlStreckengleise
-        gauge                   – Spurweite as integer mm
-        electrification         – Elektrifizierung string
-        km_start, km_end        – KmAnfang / KmEnde
-        route_number            – Nummer (from routes)
-        route_name              – Name (from routes)
-        route_owner             – Datenherr_TUAbkuerzung (from routes)
+        ID                      – xtf_id
+        from_node, to_node      – xtf_id references (internal; replaced by _add_segment_codes)
+        From_N/E, To_N/E        – endpoint coordinates
+        Length                  – calculated from geometry (metres)
+        Num_Tracks              – AnzahlStreckengleise
+        Gauge                   – Spurweite as integer mm
+        Electrification_Class   – harmonised from Elektrifizierung
+        Km_Start, Km_End        – KmAnfang / KmEnde
+        Route_Number            – Nummer (from routes)
+        Route_Name              – Name (from routes)
+        Route_Owner             – Datenherr_TUAbkuerzung (from routes)
         geometry                – MultiLineString preserved
     """
     print("Cleaning segments...")
@@ -542,38 +558,39 @@ def clean_segments(raw_segments: gpd.GeoDataFrame,
 
     out = gpd.GeoDataFrame(geometry=raw_segments.geometry.copy(), crs=raw_segments.crs)
 
-    out['segment_id']   = raw_segments['xtf_id']
-    out['segment_name'] = raw_segments.get('Name', pd.NA)
-    out['from_node']    = raw_segments['rAnfangsknoten']   # xtf_id, replaced by name after filtering
-    out['to_node']      = raw_segments['rEndknoten']       # xtf_id, replaced by name after filtering
+    out['Segment_ID'] = raw_segments['xtf_id']
+    out['from_node'] = raw_segments['rAnfangsknoten']   # xtf_id, replaced by _add_segment_codes
+    out['to_node']   = raw_segments['rEndknoten']       # xtf_id, replaced by _add_segment_codes
 
     # Endpoint coordinates from geometry
     endpoints = out.geometry.apply(_line_endpoints)
-    out['from_N'] = endpoints.apply(lambda x: x[0][0])
-    out['from_E'] = endpoints.apply(lambda x: x[0][1])
-    out['to_N']   = endpoints.apply(lambda x: x[1][0])
-    out['to_E']   = endpoints.apply(lambda x: x[1][1])
+    out['From_N'] = endpoints.apply(lambda x: x[0][0])
+    out['From_E'] = endpoints.apply(lambda x: x[0][1])
+    out['To_N']   = endpoints.apply(lambda x: x[1][0])
+    out['To_E']   = endpoints.apply(lambda x: x[1][1])
 
-    out['length_m'] = out.geometry.length
+    out['Length'] = out.geometry.length
 
-    out['num_tracks'] = (pd.to_numeric(raw_segments.get('AnzahlStreckengleise'), errors='coerce')
+    out['Num_Tracks'] = (pd.to_numeric(raw_segments.get('AnzahlStreckengleise'), errors='coerce')
                            .fillna(1).astype(int))
-    out['gauge'] = raw_segments.get('Spurweite', pd.NA).apply(parse_gauge)
-    out['electrification'] = raw_segments.get('Elektrifizierung', 'unknown')
-    out['km_start'] = raw_segments.get('KmAnfang', pd.NA)
-    out['km_end']   = raw_segments.get('KmEnde', pd.NA)
+    out['Gauge']               = raw_segments.get('Spurweite', pd.NA).apply(parse_gauge)
+    out['Electrification_Class'] = raw_segments.get('Elektrifizierung', pd.NA).apply(
+        _harmonise_electrification
+    )
+    out['Km_Start'] = raw_segments.get('KmAnfang', pd.NA)
+    out['Km_End']   = raw_segments.get('KmEnde', pd.NA)
 
     # ---- Route attribute join ------------------------------------------------
     route_lookup = raw_routes.set_index('xtf_id')[['Nummer', 'Name', 'Datenherr_TUAbkuerzung']]
     km_line = raw_segments['rKmLinie']
-    out['route_number'] = km_line.map(route_lookup['Nummer'])
-    out['route_name']   = km_line.map(route_lookup['Name'])
-    out['route_owner']  = km_line.map(route_lookup['Datenherr_TUAbkuerzung'])
+    out['Route_Number'] = km_line.map(route_lookup['Nummer'])
+    out['Route_Name']   = km_line.map(route_lookup['Name'])
+    out['Route_Owner']  = km_line.map(route_lookup['Datenherr_TUAbkuerzung'])
 
-    matched = out['route_number'].notna().sum()
+    matched = out['Route_Number'].notna().sum()
     print(f"  → {len(out)} segments  |  route join: {matched}/{len(out)} matched")
-    print(f"  Total length: {out['length_m'].sum() / 1000:.0f} km")
-    print(f"  Gauge distribution: {out['gauge'].value_counts().to_dict()}")
+    print(f"  Total length: {out['Length'].sum() / 1000:.0f} km")
+    print(f"  Gauge distribution: {out['Gauge'].value_counts().to_dict()}")
 
     return out.reset_index(drop=True)
 
@@ -586,15 +603,15 @@ def classify_nodes_bav(nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
     Phase-1 node classification from BAV Betriebspunkt_Name patterns.
 
-    Applied after catchment filtering.  Sets node_class for all nodes that
+    Applied after catchment filtering.  Sets Node_Class for all nodes that
     match a known pattern; unmatched nodes are labelled 'unclassified' and
     will be resolved in Phase 2 (enrich_nodes_oev).
     """
     print("Phase-1: classifying nodes from BAV name patterns...")
     nodes = nodes.copy()
-    nodes['node_class'] = nodes['NAME'].apply(classify_node)
-    n_classified   = (nodes['node_class'] != 'unclassified').sum()
-    n_unclassified = (nodes['node_class'] == 'unclassified').sum()
+    nodes['Node_Class'] = nodes['Name'].apply(classify_node)
+    n_classified   = (nodes['Node_Class'] != 'unclassified').sum()
+    n_unclassified = (nodes['Node_Class'] == 'unclassified').sum()
     print(f"  Classified: {n_classified}  |  Unclassified (→ OeV Phase 2): {n_unclassified}")
     return nodes
 
@@ -630,9 +647,9 @@ def enrich_nodes_oev(
         betriebspunkte = betriebspunkte.to_crs(SWISS_CRS)
 
     bp_num   = betriebspunkte['Nummer'].astype('Int64')
-    node_ids = nodes['Betriebspunkt_Nummer'].astype('Int64')
+    node_ids = nodes['Number'].astype('Int64')
 
-    # --- transport_mode -------------------------------------------------------
+    # --- Transport_Mode -------------------------------------------------------
     def _translate_modes(val):
         if pd.isna(val):
             return val
@@ -640,50 +657,50 @@ def enrich_nodes_oev(
         return ' / '.join(parts)
 
     mode_lookup = dict(zip(bp_num, betriebspunkte['Verkehrsmittel_Bezeichnung']))
-    nodes['transport_mode'] = node_ids.map(mode_lookup).apply(_translate_modes)
+    nodes['Transport_Mode'] = node_ids.map(mode_lookup).apply(_translate_modes)
 
-    # --- node_class: fill only unclassified nodes ----------------------------
+    # --- Node_Class: fill only unclassified nodes ----------------------------
     bp_type_lookup = dict(zip(bp_num, betriebspunkte['Betriebspunkttyp_Bezeichnung']))
     oev_class_raw  = node_ids.map(bp_type_lookup)
     oev_class      = oev_class_raw.apply(
         lambda x: BETRIEBSPUNKT_TYPE_MAPPING.get(str(x), 'unclassified') if pd.notna(x) else 'unclassified'
     )
 
-    unclassified_mask = nodes['node_class'] == 'unclassified'
-    nodes.loc[unclassified_mask, 'node_class'] = oev_class[unclassified_mask]
+    unclassified_mask = nodes['Node_Class'] == 'unclassified'
+    nodes.loc[unclassified_mask, 'Node_Class'] = oev_class[unclassified_mask]
 
-    n_filled  = int((unclassified_mask & (nodes['node_class'] != 'unclassified')).sum())
-    still_unc = int((nodes['node_class'] == 'unclassified').sum())
+    n_filled  = int((unclassified_mask & (nodes['Node_Class'] != 'unclassified')).sum())
+    still_unc = int((nodes['Node_Class'] == 'unclassified').sum())
     print(f"  OeV match: {oev_class_raw.notna().sum()}/{len(nodes)} nodes found in HaltestellenOeV")
     print(f"  Classification: {n_filled} filled from OeV  |  {still_unc} still unclassified")
 
-    # --- platform_count: Haltekante aggregation --------------------------------
+    # --- Platform_Count: Haltekante aggregation --------------------------------
     # Haltekante.rHaltestelle → Betriebspunkt.xtf_id → Betriebspunkt.Nummer
     bp_xtf_to_nummer = betriebspunkte.set_index('xtf_id')['Nummer'].astype('Int64').to_dict()
 
     hk_counts = (haltekanten
                  .groupby('rHaltestelle')
                  .size()
-                 .reset_index(name='platform_count'))
+                 .reset_index(name='hk_count'))
     hk_counts['Nummer'] = hk_counts['rHaltestelle'].map(bp_xtf_to_nummer)
 
     nummer_to_platforms = (hk_counts
                            .dropna(subset=['Nummer'])
-                           .set_index('Nummer')['platform_count']
+                           .set_index('Nummer')['hk_count']
                            .to_dict())
 
-    nodes['platform_count'] = node_ids.map(nummer_to_platforms)
+    nodes['Platform_Count'] = node_ids.map(nummer_to_platforms)
 
     # Enforce: only stations (and assigned_service_points promoted to station in
-    # network_builder) get a platform_count value
-    nodes.loc[~nodes['node_class'].isin({'station', 'assigned_service_point'}),
-              'platform_count'] = pd.NA
+    # network_builder) get a Platform_Count value
+    nodes.loc[~nodes['Node_Class'].isin({'station', 'assigned_service_point'}),
+              'Platform_Count'] = pd.NA
 
-    matched_plats = nodes['platform_count'].notna().sum()
+    matched_plats = nodes['Platform_Count'].notna().sum()
     print(f"  Platform counts: {matched_plats} station nodes have platform data")
 
     # --- Add OeV-only nodes (B/C/E/F mode, not in BAV set, within boundary) --
-    existing_nummers = set(nodes['Betriebspunkt_Nummer'].dropna().astype('Int64'))
+    existing_nummers = set(nodes['Number'].dropna().astype('Int64'))
     rail_mode_mask   = betriebspunkte['Verkehrsmittel_Code'].fillna('').apply(
         lambda c: bool(set(str(c)) & {'B', 'C', 'E', 'F'})
     )
@@ -704,21 +721,21 @@ def enrich_nodes_oev(
         )
 
         oev_nodes = gpd.GeoDataFrame({
-            'node_id':              new_bp['_Nummer_int'].values,
-            'Betriebspunkt_Nummer': new_bp['_Nummer_int'].values,
-            'NAME':                 new_bp['Name'].values,
-            'CODE':                 new_bp['Abkuerzung'].values,
-            'E':                    new_bp.geometry.x.values,
-            'N':                    new_bp.geometry.y.values,
-            'parent_node':          new_bp['rUebergeordneteHaltestelle'].values,
-            'node_class':           oev_class_new.values,
-            'transport_mode':       new_bp['Verkehrsmittel_Bezeichnung'].apply(_translate_modes).values,
-            'platform_count':       new_bp['_Nummer_int'].apply(_plat_count).values,
-            'geometry':             new_bp.geometry.values,
+            'Node_ID':          new_bp['_Nummer_int'].values,
+            'Number':           new_bp['_Nummer_int'].values,
+            'Name':             new_bp['Name'].values,
+            'Code':             new_bp['Abkuerzung'].values,
+            'E':                new_bp.geometry.x.values,
+            'N':                new_bp.geometry.y.values,
+            'Parent_Node':      new_bp['rUebergeordneteHaltestelle'].values,
+            'Node_Class':       oev_class_new.values,
+            'Transport_Mode':   new_bp['Verkehrsmittel_Bezeichnung'].apply(_translate_modes).values,
+            'Platform_Count':   new_bp['_Nummer_int'].apply(_plat_count).values,
+            'geometry':         new_bp.geometry.values,
         }, crs=nodes.crs)
 
-        # Enforce: only stations get a platform_count value
-        oev_nodes.loc[oev_nodes['node_class'] != 'station', 'platform_count'] = pd.NA
+        # Enforce: only stations get a Platform_Count value
+        oev_nodes.loc[oev_nodes['Node_Class'] != 'station', 'Platform_Count'] = pd.NA
 
         nodes = pd.concat([nodes, oev_nodes], ignore_index=True)
         print(f"  Added {len(oev_nodes)} OeV-only nodes (not in BAV, within boundary)")
@@ -733,44 +750,44 @@ def add_track_count(
     segments: gpd.GeoDataFrame,
 ) -> gpd.GeoDataFrame:
     """
-    Add track_count column and enforce nullable-integer types on both track columns.
+    Add Track_Count column and enforce nullable-integer types on both track columns.
 
-    track_count (stations only):
-        max(platform_count, max num_tracks of adjacent filtered segments).
+    Track_Count (stations only):
+        max(Platform_Count, max num_tracks of adjacent filtered segments).
         Defaults to 0 when neither source has data.  Non-station nodes get pd.NA.
 
-    Both platform_count and track_count are stored as Int64 (no decimal point;
+    Both Platform_Count and Track_Count are stored as Int64 (no decimal point;
     NA preserved for non-stations).
 
     Must be called while segments still carry from_node / to_node as BAV xtf_ids
-    (i.e. before substitute_node_names).
+    (i.e. before _add_segment_codes).
     """
     print("Computing track counts...")
     nodes = nodes.copy()
 
-    # Build node_id → max(num_tracks) from all adjacent filtered segments
+    # Build ID → max(Num_Tracks) from all adjacent filtered segments
     node_max_tracks: dict = {}
-    for row in segments[['from_node', 'to_node', 'num_tracks']].itertuples(index=False):
+    for row in segments[['from_node', 'to_node', 'Num_Tracks']].itertuples(index=False):
         for nid in (row.from_node, row.to_node):
             if nid is None or (isinstance(nid, float) and pd.isna(nid)):
                 continue
-            node_max_tracks[nid] = max(node_max_tracks.get(nid, 0), int(row.num_tracks))
+            node_max_tracks[nid] = max(node_max_tracks.get(nid, 0), int(row.Num_Tracks))
 
     def _track_count(row):
-        if row.get('node_class') not in ('station', 'assigned_service_point'):
+        if row.get('Node_Class') not in ('station', 'assigned_service_point'):
             return pd.NA
-        seg_tracks  = node_max_tracks.get(row['node_id'], 0)
-        plat_tracks = int(row['platform_count']) if pd.notna(row.get('platform_count')) else 0
+        seg_tracks  = node_max_tracks.get(row['Node_ID'], 0)
+        plat_tracks = int(row['Platform_Count']) if pd.notna(row.get('Platform_Count')) else 0
         return max(seg_tracks, plat_tracks)
 
-    nodes['track_count'] = nodes.apply(_track_count, axis=1)
+    nodes['Track_Count'] = nodes.apply(_track_count, axis=1)
 
     # Cast both columns to nullable integer (no decimal point, NA preserved)
-    nodes['platform_count'] = nodes['platform_count'].astype('Int64')
-    nodes['track_count']    = nodes['track_count'].astype('Int64')
+    nodes['Platform_Count'] = nodes['Platform_Count'].astype('Int64')
+    nodes['Track_Count']    = nodes['Track_Count'].astype('Int64')
 
-    n_tracks = nodes['track_count'].notna().sum()
-    print(f"  track_count set for {n_tracks} station nodes")
+    n_tracks = nodes['Track_Count'].notna().sum()
+    print(f"  Track_Count set for {n_tracks} station nodes")
     return nodes
 
 
@@ -802,7 +819,7 @@ def filter_to_catchment(
 
     # --- Classify nodes -------------------------------------------------------
     inside_mask   = nodes.geometry.within(boundary_geom)
-    inside_ids    = set(nodes.loc[inside_mask, 'node_id'])
+    inside_ids    = set(nodes.loc[inside_mask, 'Node_ID'])
     print(f"  Nodes inside boundary: {inside_mask.sum()} / {len(nodes)}")
 
     # --- Filter segments (at least one endpoint inside) -----------------------
@@ -816,12 +833,12 @@ def filter_to_catchment(
     # --- Add outside endpoint nodes for cross-boundary segments ---------------
     all_endpoint_ids     = set(filtered_segs['from_node']) | set(filtered_segs['to_node'])
     outside_endpoint_ids = all_endpoint_ids - inside_ids
-    outside_nodes        = nodes[nodes['node_id'].isin(outside_endpoint_ids)]
+    outside_nodes        = nodes[nodes['Node_ID'].isin(outside_endpoint_ids)]
     print(f"  Outside endpoint nodes included: {len(outside_nodes)}")
 
     filtered_nodes = pd.concat(
         [nodes[inside_mask], outside_nodes]
-    ).drop_duplicates(subset=['node_id']).reset_index(drop=True)
+    ).drop_duplicates(subset=['Node_ID']).reset_index(drop=True)
 
     print(f"  → {len(filtered_nodes)} nodes, {len(filtered_segs)} segments after filter")
     return filtered_nodes, filtered_segs
@@ -859,9 +876,9 @@ def build_segments_composition(
 
     Output columns
     --------------
-        segment_id, from_node, to_node,
-        construct_type, edge_level, under_construction,
-        track_config, railway_type, piece_length_m, geometry
+        ID, from_node, to_node,
+        Engineering_Structure, Edge_Level, Under_Construction,
+        Num_Tracks, Gauge, Piece_Length, geometry
     """
     print("Building segments_composition (projection-based)...")
 
@@ -885,20 +902,19 @@ def build_segments_composition(
     non_normal['track_config']       = non_normal['FCO'].fillna('Unknown')
     non_normal['railway_type']       = non_normal['OBJVAL'].map(OBJVAL_MAPPING).fillna(non_normal['OBJVAL'])
 
-    n_bridge  = non_normal['construct_type'].eq('bridge').sum()
-    n_tunnel  = non_normal['construct_type'].eq('tunnel').sum()
-    n_gallery = non_normal['construct_type'].eq('gallery').sum()
+    n_bridge = non_normal['construct_type'].eq('bridge').sum()
+    n_tunnel = non_normal['construct_type'].eq('tunnel').sum()
     print(f"  Non-normal rail TLMRegio: {len(non_normal)}  "
-          f"(bridges: {n_bridge}, tunnels: {n_tunnel}, galleries: {n_gallery})")
+          f"(bridges: {n_bridge}, tunnels: {n_tunnel})")
 
     # ------------------------------------------------------------------
     # 2. Explode BAV MultiLineStrings → one row per sub-line (edge case #1)
     # ------------------------------------------------------------------
     segs_for_comp = filtered_segments[
-        ['segment_id', 'from_node', 'to_node', 'gauge', 'geometry']
+        ['Segment_ID', 'from_node', 'to_node', 'Gauge', 'geometry']
     ].copy()
     segs_expl = segs_for_comp.explode(index_parts=False).reset_index(drop=True)
-    segs_expl['_sub_idx'] = segs_expl.groupby('segment_id').cumcount()
+    segs_expl['_sub_idx'] = segs_expl.groupby('Segment_ID').cumcount()
     print(f"  BAV sub-lines: {len(segs_expl)}  (from {len(filtered_segments)} segments)")
 
     # ------------------------------------------------------------------
@@ -918,7 +934,7 @@ def build_segments_composition(
     # 4. Gauge-compatibility filter (edge case #4)
     # ------------------------------------------------------------------
     def _gauge_ok(row):
-        allowed = GAUGE_TO_OBJVAL.get(int(row['gauge']), RAIL_OBJVALS)
+        allowed = GAUGE_TO_OBJVAL.get(int(row['Gauge']), RAIL_OBJVALS)
         return row['OBJVAL'] in allowed
 
     compat_mask = matches.apply(_gauge_ok, axis=1)
@@ -950,15 +966,15 @@ def build_segments_composition(
     interval_map = defaultdict(list)
     attr_cols = ['construct_type', 'edge_level', 'under_construction',
                  'track_config', 'railway_type']
-    for _, row in valid[['segment_id', '_sub_idx', '_d_start', '_d_end'] + attr_cols].iterrows():
-        key   = (row['segment_id'], row['_sub_idx'])
+    for _, row in valid[['Segment_ID', '_sub_idx', '_d_start', '_d_end'] + attr_cols].iterrows():
+        key   = (row['Segment_ID'], row['_sub_idx'])
         attrs = {c: row[c] for c in attr_cols}
         interval_map[key].append((row['_d_start'], row['_d_end'], attrs))
 
     # Build sub-line geometry + topology lookup
     subline_info = {}
     for _, row in segs_expl.iterrows():
-        subline_info[(row['segment_id'], row['_sub_idx'])] = {
+        subline_info[(row['Segment_ID'], row['_sub_idx'])] = {
             'geometry': row.geometry,
             'from_node': row['from_node'],
             'to_node':   row['to_node'],
@@ -990,16 +1006,14 @@ def build_segments_composition(
             if geom is None or geom.is_empty or geom.length < MIN_PIECE_LENGTH:
                 continue
             output_rows.append({
-                'segment_id':        key[0],
-                'from_node':         info['from_node'],
-                'to_node':           info['to_node'],
-                'construct_type':    attrs['construct_type'],
-                'edge_level':        attrs['edge_level'],
-                'under_construction': attrs['under_construction'],
-                'track_config':      attrs['track_config'],
-                'railway_type':      attrs['railway_type'],
-                'piece_length_m':    geom.length,
-                'geometry':          geom,
+                'Segment_ID':           key[0],
+                'from_node':            info['from_node'],
+                'to_node':              info['to_node'],
+                'Engineering_Structure': attrs['construct_type'],
+                'Edge_Level':           attrs['edge_level'],
+                'Under_Construction':   attrs['under_construction'],
+                'Piece_Length':         geom.length,
+                'geometry':             geom,
             })
 
     if not output_rows:
@@ -1008,19 +1022,17 @@ def build_segments_composition(
 
     composition = gpd.GeoDataFrame(output_rows, crs=SWISS_CRS)
 
-    # Replace TLMRegio-derived track_config / railway_type with the authoritative
-    # values from the BAV segments (num_tracks, gauge), matched by segment_id.
+    # Add authoritative Num_Tracks / Gauge from BAV segments matched by ID.
     seg_lookup = (
-        filtered_segments[['segment_id', 'num_tracks', 'gauge']]
-        .drop_duplicates(subset='segment_id')
-        .set_index('segment_id')
+        filtered_segments[['Segment_ID', 'Num_Tracks', 'Gauge']]
+        .drop_duplicates(subset='Segment_ID')
+        .set_index('Segment_ID')
     )
-    composition['num_tracks'] = composition['segment_id'].map(seg_lookup['num_tracks'])
-    composition['gauge']      = composition['segment_id'].map(seg_lookup['gauge'])
-    composition = composition.drop(columns=['track_config', 'railway_type'])
+    composition['Num_Tracks'] = composition['Segment_ID'].map(seg_lookup['Num_Tracks'])
+    composition['Gauge']      = composition['Segment_ID'].map(seg_lookup['Gauge'])
 
     print(f"  → {len(composition)} composition pieces")
-    print(f"     construct_type: {composition['construct_type'].value_counts().to_dict()}")
+    print(f"     Engineering_Structure: {composition['Engineering_Structure'].value_counts().to_dict()}")
     return composition
 
 
@@ -1031,36 +1043,204 @@ def build_segments_composition(
 def substitute_node_names(df: gpd.GeoDataFrame,
                           nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
-    Replace xtf_id values in from_node / to_node with human-readable node NAMEs.
-    Renames the columns to from_name / to_name.
+    Replace xtf_id values in from_node / to_node with human-readable node Names.
+    Renames the columns to From_Name / To_Name.
 
-    Called after filtering so that all referenced nodes are present in the
-    filtered node table.  Unmatched IDs (should not occur) are left as-is.
+    Used for composition (segments use _add_segment_codes instead).
+    Unmatched IDs (should not occur) are left as-is.
     """
-    id_to_name = nodes.set_index('node_id')['NAME'].to_dict()
+    id_to_name = nodes.set_index('Node_ID')['Name'].to_dict()
     df = df.copy()
     df['from_node'] = df['from_node'].map(id_to_name).fillna(df['from_node'])
     df['to_node']   = df['to_node'].map(id_to_name).fillna(df['to_node'])
-    df = df.rename(columns={'from_node': 'from_name', 'to_node': 'to_name'})
+    df = df.rename(columns={'from_node': 'From_Name', 'to_node': 'To_Name'})
     return df
+
+
+def _add_segment_codes(segments: gpd.GeoDataFrame,
+                        nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Resolve from_node / to_node xtf_ids to names, derive Number and Code.
+
+    Replaces substitute_node_names() for the segments GeoDataFrame.
+    Sets From_Name, To_Name, Number (e.g. '8503000_8503001'),
+    Code (e.g. 'ZUE_OL'), and drops from_node / to_node.
+    """
+    id_to_name   = nodes.set_index('Node_ID')['Name'].to_dict()
+    id_to_number = nodes.set_index('Node_ID')['Number'].to_dict()
+    id_to_code   = nodes.set_index('Node_ID')['Code'].to_dict()
+
+    segs = segments.copy()
+
+    segs['From_Name'] = segs['from_node'].map(id_to_name).fillna(segs['from_node'])
+    segs['To_Name']   = segs['to_node'].map(id_to_name).fillna(segs['to_node'])
+
+    def _num(xtf_id):
+        v = id_to_number.get(xtf_id)
+        return str(int(v)) if pd.notna(v) else str(xtf_id)
+
+    def _code(xtf_id):
+        v = id_to_code.get(xtf_id)
+        return str(v) if pd.notna(v) else str(xtf_id)
+
+    segs['Number'] = segs['from_node'].apply(_num) + '_' + segs['to_node'].apply(_num)
+    segs['Code']   = segs['from_node'].apply(_code) + '_' + segs['to_node'].apply(_code)
+
+    segs = segs.drop(columns=['from_node', 'to_node'])
+    return segs
+
+
+def _aggregate_engineering_structures(
+    segments: gpd.GeoDataFrame,
+    composition: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """
+    Add Tunnel_Length, Bridge_Length, Conventional_Length to segments.
+
+    Aggregates Piece_Length from composition grouped by Engineering_Structure,
+    then left-joins onto segments on ID.  Missing values (segments with no
+    composition match) are filled with 0.0.
+    """
+    if composition.empty:
+        segments = segments.copy()
+        segments['Tunnel_Length']       = 0.0
+        segments['Bridge_Length']       = 0.0
+        segments['Conventional_Length'] = 0.0
+        return segments
+
+    grp = composition.groupby(['Segment_ID', 'Engineering_Structure'])['Piece_Length'].sum().unstack(fill_value=0.0)
+    tunnel_len = grp.get('tunnel', pd.Series(0.0, index=grp.index))
+    bridge_len = grp.get('bridge', pd.Series(0.0, index=grp.index))
+    normal_len = grp.get('normal', pd.Series(0.0, index=grp.index))
+
+    agg = pd.DataFrame({
+        'Tunnel_Length':       tunnel_len,
+        'Bridge_Length':       bridge_len,
+        'Conventional_Length': normal_len,
+    })
+
+    segs = segments.merge(agg, on='Segment_ID', how='left')
+    segs['Tunnel_Length']       = segs['Tunnel_Length'].fillna(0.0)
+    segs['Bridge_Length']       = segs['Bridge_Length'].fillna(0.0)
+    segs['Conventional_Length'] = segs['Conventional_Length'].fillna(0.0)
+    return segs
 
 
 # =============================================================================
 # Lookup tables
 # =============================================================================
 
+def generate_missing_codes(nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Generate M_-prefixed codes for nodes whose Code is null.
+
+    Algorithm per node:
+    1. Strip parenthetical suffixes from Name (e.g. '(Vzw)', '(Wds)', '(Abzw)')
+    2. If Name contains a comma: split into city and stop parts.
+       candidate = first letter of city + first 3 letters of stop (letters only)
+    3. If no comma: candidate = first 4 letters of Name (letters only)
+    4. Check uniqueness; if taken slide a 4-char window over the source letters
+    5. If all windows exhausted append a digit suffix (M_ZSE1, M_ZSE2, …)
+    6. Prefix with 'M_'
+
+    Umlauts are transliterated (Ä→A, Ö→O, Ü→U) before letter extraction.
+    """
+    import re as _re
+
+    nodes = nodes.copy()
+    used_codes: set = set(nodes['Code'].dropna().str.strip())
+    null_mask  = nodes['Code'].isna()
+    null_idxs  = nodes.index[null_mask].tolist()
+
+    print(f"Generating M_ codes for {len(null_idxs)} nodes with null Code...")
+
+    _UMLAUT = str.maketrans({'Ä': 'A', 'Ö': 'O', 'Ü': 'U',
+                              'ä': 'A', 'ö': 'O', 'ü': 'U',
+                              'É': 'E', 'È': 'E', 'Ê': 'E',
+                              'À': 'A', 'Â': 'A', 'Î': 'I',
+                              'Ç': 'C', 'ç': 'C'})
+
+    def _letters(s: str) -> str:
+        return _re.sub(r'[^A-Z]', '', s.upper().translate(_UMLAUT))
+
+    def _clean_name(name: str) -> str:
+        return _re.sub(r'\s*\([^)]*\)\s*$', '', name).strip()
+
+    def _source_parts(name: str):
+        cleaned = _clean_name(name)
+        if ',' in cleaned:
+            city_raw, stop_raw = cleaned.split(',', 1)
+            city_l = _letters(city_raw.strip())
+            stop_l = _letters(stop_raw.strip())
+            city_ch = city_l[0] if city_l else ''
+            return city_ch, stop_l
+        return '', _letters(cleaned)
+
+    def _candidate(city_ch: str, src: str, start: int) -> str:
+        if city_ch:
+            chunk = src[start:start + 3]
+            if len(chunk) < 3:
+                chunk = (src[-3:] if len(src) >= 3 else src.ljust(3, 'X'))
+            return city_ch + chunk[:3]
+        chunk = src[start:start + 4]
+        if len(chunk) < 4:
+            chunk = (src[-4:] if len(src) >= 4 else src.ljust(4, 'X'))
+        return chunk[:4]
+
+    generated = 0
+    for idx in null_idxs:
+        name = nodes.at[idx, 'Name']
+        if pd.isna(name) or not str(name).strip():
+            base = 'UNKN'
+            city_ch, src = '', base
+        else:
+            city_ch, src = _source_parts(str(name))
+
+        if not src:
+            src = 'XXXX'
+
+        stop_len  = 3 if city_ch else 4
+        max_start = max(0, len(src) - stop_len)
+        code = None
+
+        for start in range(max_start + 1):
+            cand = f"M_{_candidate(city_ch, src, start)}"
+            if cand not in used_codes:
+                code = cand
+                break
+
+        if code is None:
+            base4 = _candidate(city_ch, src, 0)
+            for n in range(1, 100):
+                cand = f"M_{base4[:3]}{n}"
+                if cand not in used_codes:
+                    code = cand
+                    break
+
+        if code is None:
+            code = f"M_X{generated:03d}"
+
+        nodes.at[idx, 'Code'] = code
+        used_codes.add(code)
+        generated += 1
+
+    all_unique = nodes['Code'].nunique() == len(nodes)
+    print(f"  Generated {generated} codes  |  All codes unique: {all_unique}")
+    return nodes
+
+
 def build_node_lookups(nodes: gpd.GeoDataFrame) -> Dict[str, dict]:
     """Build lookup tables for downstream GTFS matching."""
     lookups = {'by_node_id': {}, 'by_bp_nummer': {}, 'by_name': {}, 'by_code': {}}
     for _, row in nodes.iterrows():
-        nid = row['node_id']
+        nid = row['Node_ID']
         lookups['by_node_id'][nid] = nid
-        if pd.notna(row.get('Betriebspunkt_Nummer')):
-            lookups['by_bp_nummer'][row['Betriebspunkt_Nummer']] = nid
-        if pd.notna(row.get('NAME')) and row['NAME']:
-            lookups['by_name'][str(row['NAME']).lower().strip()] = nid
-        if pd.notna(row.get('CODE')) and row['CODE']:
-            lookups['by_code'][str(row['CODE']).strip()] = nid
+        if pd.notna(row.get('Number')):
+            lookups['by_bp_nummer'][row['Number']] = nid
+        if pd.notna(row.get('Name')) and row['Name']:
+            lookups['by_name'][str(row['Name']).lower().strip()] = nid
+        if pd.notna(row.get('Code')) and row['Code']:
+            lookups['by_code'][str(row['Code']).strip()] = nid
     print(f"Built lookups: {len(lookups['by_node_id'])} node_id, "
           f"{len(lookups['by_bp_nummer'])} BP_Nummer, "
           f"{len(lookups['by_name'])} by name, {len(lookups['by_code'])} by code")
@@ -1123,13 +1303,21 @@ def run_filter_network(
     print("\n--- Computing track counts ---")
     nodes = add_track_count(nodes, segments)
 
+    # --- Generate codes for nodes without a BAV abbreviation ------------------
+    print("\n--- Generating M_ codes for null Code nodes ---")
+    nodes = generate_missing_codes(nodes)
+
     # --- Composition (built while from/to are still xtf_ids for overlay) ------
     print("\n--- Building segments_composition ---")
     composition = build_segments_composition(segments)
 
-    # --- Replace xtf_id references with node names ----------------------------
-    print("\n--- Substituting node names ---")
-    segments    = substitute_node_names(segments, nodes)
+    # --- Aggregate engineering structure lengths into segments -----------------
+    print("\n--- Aggregating engineering structure lengths ---")
+    segments = _aggregate_engineering_structures(segments, composition)
+
+    # --- Replace xtf_id references with node names / codes --------------------
+    print("\n--- Resolving node names and codes ---")
+    segments = _add_segment_codes(segments, nodes)
     if not composition.empty:
         composition = substitute_node_names(composition, nodes)
 
@@ -1142,6 +1330,49 @@ def run_filter_network(
     nodes_path       = output_dir / "nodes.gpkg"
     segments_path    = output_dir / "segments.gpkg"
     composition_path = output_dir / "segments_composition.gpkg"
+
+    # ---- Round numeric columns to 3 decimal places -------------------------
+    _SEG_ROUND_COLS = [
+        "Length", "Km_Start", "Km_End",
+        "Tunnel_Length", "Bridge_Length", "Conventional_Length",
+        "From_N", "From_E", "To_N", "To_E",
+    ]
+    for col in _SEG_ROUND_COLS:
+        if col in segments.columns:
+            segments[col] = segments[col].round(3)
+
+    _NODE_ROUND_COLS = ["E", "N"]
+    for col in _NODE_ROUND_COLS:
+        if col in nodes.columns:
+            nodes[col] = nodes[col].round(3)
+
+    # ---- Enforce canonical column order for Raw outputs --------------------
+    _RAW_SEG_COL_ORDER = [
+        "Segment_ID", "From_Name", "To_Name", "Number", "Code",
+        "From_N", "From_E", "To_N", "To_E",
+        "Length", "Num_Tracks", "Gauge", "Electrification_Class",
+        "Km_Start", "Km_End",
+        "Route_Number", "Route_Name", "Route_Owner",
+        "Tunnel_Length", "Bridge_Length", "Conventional_Length",
+    ]
+    segments = segments[
+        [c for c in _RAW_SEG_COL_ORDER if c in segments.columns]
+        + [c for c in segments.columns if c not in _RAW_SEG_COL_ORDER and c != segments.geometry.name]
+        + [segments.geometry.name]
+    ]
+
+    _RAW_NODE_COL_ORDER = [
+        "Node_ID", "Number", "Name", "Code",
+        "E", "N",
+        "Node_Class", "Transport_Mode",
+        "Track_Count", "Platform_Count",
+        "Parent_Node",
+    ]
+    nodes = nodes[
+        [c for c in _RAW_NODE_COL_ORDER if c in nodes.columns]
+        + [c for c in nodes.columns if c not in _RAW_NODE_COL_ORDER and c != nodes.geometry.name]
+        + [nodes.geometry.name]
+    ]
 
     nodes.to_file(nodes_path, driver="GPKG")
     print(f"  nodes.gpkg                → {nodes_path}")
@@ -1168,6 +1399,8 @@ def run_filter_network(
     print("\n" + "=" * 60)
     print(f"Done  |  {len(nodes)} nodes  |  {len(segments)} segments  |  "
           f"{len(composition)} composition pieces")
+    elec_dist = segments['Electrification_Class'].value_counts().to_dict()
+    print(f"  Electrification_Class: {elec_dist}")
     print("=" * 60)
 
     return nodes, segments, composition, lookups

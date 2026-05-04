@@ -60,7 +60,6 @@ GAUGE_COLORS = {
 GAUGE_DEFAULT = '#808080'
 
 # Category-based electrification colours (keyed by canonical class).
-# Raw BAV Elektrifizierung strings are classified via _classify_electrification().
 ELECTRIFICATION_COLORS = {
     'no_electrification': '#000000',  # black       – nicht elektrifiziert
     'dc':                 "#046DAA",  # light blue  – Gleichstrom
@@ -75,26 +74,18 @@ ELECTRIFICATION_LABELS = {
     'ac_25kv':            'AC 25 kV / 50 Hz',
     'unknown':            'Unknown',
 }
-ELECTRIFICATION_DEFAULT = '#7f7f7f'
+
+# Maps harmonised Electrification_Class values → ELECTRIFICATION_COLORS keys.
+# AC_16.7Hz_DC is plotted as ac_16_7hz (primary system on mixed segments).
+_ELEC_CLASS_PLOT = {
+    'AC_16.7Hz':     'ac_16_7hz',
+    'DC':            'dc',
+    'AC_16.7Hz_DC':  'ac_16_7hz',
+    'non_electrified': 'no_electrification',
+    'unknown':       'unknown',
+}
 
 
-def _classify_electrification(val) -> str:
-    """Map a raw BAV Elektrifizierung string to a canonical electrification class."""
-    if pd.isna(val):
-        return 'unknown'
-    s = (str(val).lower()
-         .replace('_', '').replace('-', '').replace(' ', '').replace(',', '.'))
-    if 'nicht' in s or s in ('na', 'nan', '', 'none', 'unknown'):
-        return 'no_electrification'
-    if 'gleichstrom' in s or (s.startswith('dc') and 'dec' not in s):
-        return 'dc'
-    if '16.7' in s or '167' in s or '15kv' in s or '15000' in s:
-        return 'ac_16_7hz'
-    if '25kv' in s or '25000' in s:
-        return 'ac_25kv'
-    if 'wechselstrom' in s or s.startswith('ac'):
-        return 'ac_16_7hz'  # Swiss default AC is 15 kV / 16.7 Hz
-    return 'unknown'
 
 # Speed colour bins (upper bound km/h → colour).  Ordered from slow to fast.
 # Segments with no speed data (NaN) use SPEED_NO_DATA_COLOR.
@@ -283,27 +274,28 @@ def _reverse_line(geom):
     return LineString(list(geom.coords)[::-1])
 
 
-def _build_merged_segment(s1: pd.Series, s2: pd.Series, node_name: str) -> Optional[dict]:
+def _build_merged_segment(s1: pd.Series, s2: pd.Series, node_name: str,
+                           nodes: Optional[gpd.GeoDataFrame] = None) -> Optional[dict]:
     """
     Merge two segments sharing node_name into a single segment A→B.
     Returns None when the merge would create a self-loop (A == B).
     """
-    if s1['from_name'] == node_name:
-        A = s1['to_name']
-        A_N, A_E = s1['to_N'], s1['to_E']
+    if s1['From_Name'] == node_name:
+        A = s1['To_Name']
+        A_N, A_E = s1['To_N'], s1['To_E']
         lines1 = [_reverse_line(g) for g in reversed(_sub_lines(s1.geometry))]
     else:
-        A = s1['from_name']
-        A_N, A_E = s1['from_N'], s1['from_E']
+        A = s1['From_Name']
+        A_N, A_E = s1['From_N'], s1['From_E']
         lines1 = _sub_lines(s1.geometry)
 
-    if s2['to_name'] == node_name:
-        B = s2['from_name']
-        B_N, B_E = s2['from_N'], s2['from_E']
+    if s2['To_Name'] == node_name:
+        B = s2['From_Name']
+        B_N, B_E = s2['From_N'], s2['From_E']
         lines2 = [_reverse_line(g) for g in reversed(_sub_lines(s2.geometry))]
     else:
-        B = s2['to_name']
-        B_N, B_E = s2['to_N'], s2['to_E']
+        B = s2['To_Name']
+        B_N, B_E = s2['To_N'], s2['To_E']
         lines2 = _sub_lines(s2.geometry)
 
     if A == B:
@@ -311,25 +303,44 @@ def _build_merged_segment(s1: pd.Series, s2: pd.Series, node_name: str) -> Optio
 
     merged_geom = linemerge(MultiLineString(lines1 + lines2))
 
+    # Derive Number and Code from surviving endpoint names
+    number = pd.NA
+    code   = pd.NA
+    if nodes is not None and not nodes.empty:
+        name_to_num  = nodes.dropna(subset=['Name']).set_index('Name')['Number'].to_dict()
+        name_to_code = nodes.dropna(subset=['Name']).set_index('Name')['Code'].to_dict()
+        a_num  = name_to_num.get(A)
+        b_num  = name_to_num.get(B)
+        a_code = name_to_code.get(A)
+        b_code = name_to_code.get(B)
+        if pd.notna(a_num) and pd.notna(b_num):
+            number = f"{int(a_num)}_{int(b_num)}"
+        if pd.notna(a_code) and pd.notna(b_code):
+            code = f"{a_code}_{b_code}"
+
     return {
-        'segment_id':      f"{s1['segment_id']}+{s2['segment_id']}",
-        'segment_name':    pd.NA,
-        'from_name':       A,
-        'to_name':         B,
-        'from_N':          A_N,
-        'from_E':          A_E,
-        'to_N':            B_N,
-        'to_E':            B_E,
-        'length_m':        s1['length_m'] + s2['length_m'],
-        'num_tracks':      s1['num_tracks'],
-        'gauge':           s1['gauge'],
-        'electrification': s1['electrification'],
-        'km_start':        s1.get('km_start', pd.NA),
-        'km_end':          s2.get('km_end', pd.NA),
-        'route_number':    s1.get('route_number', pd.NA),
-        'route_name':      s1.get('route_name', pd.NA),
-        'route_owner':     s1.get('route_owner', pd.NA),
-        'geometry':        merged_geom,
+        'Segment_ID':          f"{s1['Segment_ID']}+{s2['Segment_ID']}",
+        'Number':              number,
+        'Code':                code,
+        'From_Name':           A,
+        'To_Name':             B,
+        'From_N':              A_N,
+        'From_E':              A_E,
+        'To_N':                B_N,
+        'To_E':                B_E,
+        'Length':              s1['Length'] + s2['Length'],
+        'Num_Tracks':          s1['Num_Tracks'],
+        'Gauge':               s1['Gauge'],
+        'Electrification_Class': s1['Electrification_Class'],
+        'Km_Start':            s1.get('Km_Start', pd.NA),
+        'Km_End':              s2.get('Km_End', pd.NA),
+        'Route_Number':        s1.get('Route_Number', pd.NA),
+        'Route_Name':          s1.get('Route_Name', pd.NA),
+        'Route_Owner':         s1.get('Route_Owner', pd.NA),
+        'Tunnel_Length':       s1.get('Tunnel_Length', 0.0) + s2.get('Tunnel_Length', 0.0),
+        'Bridge_Length':       s1.get('Bridge_Length', 0.0) + s2.get('Bridge_Length', 0.0),
+        'Conventional_Length': s1.get('Conventional_Length', 0.0) + s2.get('Conventional_Length', 0.0),
+        'geometry':            merged_geom,
     }
 
 
@@ -357,15 +368,15 @@ def filter_macroscopic_nodes(
     segs_df = segments.copy().reset_index(drop=True)
 
     degree: Counter = Counter()
-    for fn, tn in zip(segs_df['from_name'], segs_df['to_name']):
+    for fn, tn in zip(segs_df['From_Name'], segs_df['To_Name']):
         degree[fn] += 1
         degree[tn] += 1
 
     _MACRO_KEEP = {'station', 'junction', 'abandoned_station'}
 
     def _is_candidate(row) -> bool:
-        nc   = str(row.get('node_class', ''))
-        name = row.get('NAME')
+        nc   = str(row.get('Node_Class', ''))
+        name = row.get('Name')
         if pd.isna(name):
             return False
         if nc not in _MACRO_KEEP:
@@ -373,7 +384,7 @@ def filter_macroscopic_nodes(
         return False
 
     candidate_names: set = set(
-        nodes.loc[nodes.apply(_is_candidate, axis=1), 'NAME'].dropna()
+        nodes.loc[nodes.apply(_is_candidate, axis=1), 'Name'].dropna()
     )
     print(f"  Removal candidates: {len(candidate_names)}")
 
@@ -391,9 +402,9 @@ def filter_macroscopic_nodes(
 
         if deg <= 1:
             dangling = segs_df[
-                (segs_df['from_name'] == name) | (segs_df['to_name'] == name)
+                (segs_df['From_Name'] == name) | (segs_df['To_Name'] == name)
             ]
-            segs_to_drop.update(dangling['segment_id'])
+            segs_to_drop.update(dangling['Segment_ID'])
             continue
 
         if deg >= 3:
@@ -401,27 +412,27 @@ def filter_macroscopic_nodes(
             continue
 
         connected = segs_df[
-            (segs_df['from_name'] == name) | (segs_df['to_name'] == name)
+            (segs_df['From_Name'] == name) | (segs_df['To_Name'] == name)
         ]
-        available = connected[~connected['segment_id'].isin(segs_to_drop)]
+        available = connected[~connected['Segment_ID'].isin(segs_to_drop)]
         if len(available) != 2:
             n_passthrough += 1
             continue
 
         s1, s2 = available.iloc[0], available.iloc[1]
         attrs_match = (
-            s1['num_tracks']      == s2['num_tracks'] and
-            s1['gauge']           == s2['gauge'] and
-            s1['electrification'] == s2['electrification']
+            s1['Num_Tracks']          == s2['Num_Tracks'] and
+            s1['Gauge']               == s2['Gauge'] and
+            s1['Electrification_Class'] == s2['Electrification_Class']
         )
 
         if attrs_match:
-            merged = _build_merged_segment(s1, s2, name)
+            merged = _build_merged_segment(s1, s2, name, nodes)
             if merged is None:
                 n_passthrough += 1
                 continue
             segs_to_add.append(merged)
-            segs_to_drop.update([s1['segment_id'], s2['segment_id']])
+            segs_to_drop.update([s1['Segment_ID'], s2['Segment_ID']])
             n_merged += 1
         else:
             n_passthrough += 1
@@ -430,22 +441,22 @@ def filter_macroscopic_nodes(
           f"|  Dead-end dropped: {len(drop_names) - n_merged}")
 
     macro_nodes = (
-        nodes[~nodes['NAME'].isin(drop_names)].copy().reset_index(drop=True)
+        nodes[~nodes['Name'].isin(drop_names)].copy().reset_index(drop=True)
     )
-    remaining = segs_df[~segs_df['segment_id'].isin(segs_to_drop)].copy()
+    remaining = segs_df[~segs_df['Segment_ID'].isin(segs_to_drop)].copy()
     if segs_to_add:
         added = gpd.GeoDataFrame(segs_to_add, crs=segments.crs)
         macro_segs = pd.concat([remaining, added], ignore_index=True)
     else:
         macro_segs = remaining
 
-    # Build segment ID remap: raw_segment_id → final_macro_segment_id.
+    # Build segment ID remap: raw_ID → final_macro_ID.
     # Used by run_build_base to update segment references in segments_composition.
     seg_id_remap: dict = {}
-    for sid in remaining['segment_id'].dropna():
+    for sid in remaining['Segment_ID'].dropna():
         seg_id_remap[str(sid)] = str(sid)
     for merged_row in segs_to_add:
-        merged_id = str(merged_row['segment_id'])
+        merged_id = str(merged_row['Segment_ID'])
         for part in merged_id.split('+'):
             seg_id_remap[part] = merged_id
 
@@ -555,7 +566,7 @@ def _resolve_osm_conflicts_at_nodes(
 
         template = conflict_rows[conflict_rows["osm_id"] == osm_id].iloc[0]
         osm_attrs = {col: template[col] for col in _OSM_COLS if col in template.index}
-        matched_segs = conflict_rows[conflict_rows["osm_id"] == osm_id]["segment_id"].tolist()
+        matched_segs = conflict_rows[conflict_rows["osm_id"] == osm_id]["Segment_ID"].tolist()
 
         for start, end in zip([0.0] + split_dists, split_dists + [total_len]):
             piece = shp_substring(osm_geom, start, end)
@@ -568,7 +579,7 @@ def _resolve_osm_conflicts_at_nodes(
             )
             if assigned is None:
                 continue
-            resolved.append({**osm_attrs, "segment_id": assigned, "geometry": piece})
+            resolved.append({**osm_attrs, "Segment_ID": assigned, "geometry": piece})
 
     parts = [non_conflict]
     if resolved:
@@ -580,9 +591,9 @@ def _resolve_osm_conflicts_at_nodes(
 
 def _empty_osm_result(bav: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     out = bav.copy()
-    out["average_speed"]                 = np.nan
-    out["predominant_speed"]             = np.nan
-    out["predominant_speed_coverage_pct"] = 0.0
+    out["Average_Speed"]       = np.nan
+    out["Predominant_Speed"]   = np.nan
+    out["Speed_Coverage_Pct"]  = 0.0
     return out
 
 
@@ -595,17 +606,16 @@ def _join_osm_speeds(
     Overlay OSM railway ways onto BAV segments and aggregate speed data.
 
     Returns bav with three new columns:
-      average_speed                — length-weighted mean speed (km/h) or NaN
-      predominant_speed            — modal speed by length (km/h) or NaN
-      predominant_speed_coverage_pct — fraction of segment length covered by
-                                       the predominant speed value
+      Average_Speed       — length-weighted mean speed (km/h) or NaN
+      Predominant_Speed   — modal speed by length (km/h) or NaN
+      Speed_Coverage_Pct  — fraction of segment length covered by the predominant speed
     """
-    buf_series  = bav.geometry.buffer(OSM_BUFFER_M)
-    bav_buf     = gpd.GeoDataFrame(bav[["segment_id"]].copy(), geometry=buf_series, crs=bav.crs)
-    buf_lookup  = bav_buf.set_index("segment_id")["geometry"]
-    bav_lengths = bav.set_index("segment_id")["length_m"]
-    bav_bearings = bav.set_index("segment_id")["geometry"].apply(_compute_osm_bearing)
-    seg_gauge   = bav.set_index("segment_id")["gauge"].to_dict()
+    buf_series   = bav.geometry.buffer(OSM_BUFFER_M)
+    bav_buf      = gpd.GeoDataFrame(bav[["Segment_ID"]].copy(), geometry=buf_series, crs=bav.crs)
+    buf_lookup   = bav_buf.set_index("Segment_ID")["geometry"]
+    bav_lengths  = bav.set_index("Segment_ID")["Length"]
+    bav_bearings = bav.set_index("Segment_ID")["geometry"].apply(_compute_osm_bearing)
+    seg_gauge    = bav.set_index("Segment_ID")["Gauge"].to_dict()
 
     osm_join = osm[_OSM_COLS + ["geometry"]].copy()
     pairs = gpd.sjoin(osm_join, bav_buf, how="inner", predicate="intersects")
@@ -618,7 +628,7 @@ def _join_osm_speeds(
     pairs = _resolve_osm_conflicts_at_nodes(pairs, bav_nodes, buf_lookup)
 
     pairs["clipped_geom"] = pairs.apply(
-        lambda r: r.geometry.intersection(buf_lookup[r["segment_id"]]), axis=1
+        lambda r: r.geometry.intersection(buf_lookup[r["Segment_ID"]]), axis=1
     )
     is_line = pairs["clipped_geom"].geom_type.isin(["LineString", "MultiLineString"])
     pairs = pairs[is_line].copy()
@@ -626,7 +636,7 @@ def _join_osm_speeds(
     pairs = pairs[pairs["clipped_length_m"] > 0].copy()
 
     pairs["osm_bearing"] = pairs["clipped_geom"].apply(_compute_osm_bearing)
-    pairs["bav_bearing"] = pairs["segment_id"].map(bav_bearings)
+    pairs["bav_bearing"] = pairs["Segment_ID"].map(bav_bearings)
     pairs["bearing_diff"] = pairs.apply(
         lambda r: _angular_diff_osm(r["osm_bearing"], r["bav_bearing"]), axis=1
     )
@@ -637,11 +647,11 @@ def _join_osm_speeds(
     print(f"  {n_before - len(pairs)} pairs removed by bearing filter")
 
     seg_mode = (
-        bav.set_index("segment_id")["transport_mode"].to_dict()
-        if "transport_mode" in bav.columns else {}
+        bav.set_index("Segment_ID")["Transport_Mode"].to_dict()
+        if "Transport_Mode" in bav.columns else {}
     )
-    pairs["bav_mode"]  = pairs["segment_id"].map(seg_mode)
-    pairs["bav_gauge"] = pairs["segment_id"].map(seg_gauge)
+    pairs["bav_mode"]  = pairs["Segment_ID"].map(seg_mode)
+    pairs["bav_gauge"] = pairs["Segment_ID"].map(seg_gauge)
 
     def _allowed_osm_types(mode, gauge) -> set:
         """Return the set of OSM railway types compatible with this segment."""
@@ -668,9 +678,9 @@ def _join_osm_speeds(
         valid   = g[g["speed_kmh"].notna()]
         if valid.empty:
             return pd.Series({
-                "average_speed":                  np.nan,
-                "predominant_speed":              np.nan,
-                "predominant_speed_coverage_pct": 0.0,
+                "Average_Speed":      np.nan,
+                "Predominant_Speed":  np.nan,
+                "Speed_Coverage_Pct": 0.0,
             })
 
         avg = (
@@ -685,21 +695,21 @@ def _join_osm_speeds(
             else 0.0
         )
         return pd.Series({
-            "average_speed":                  round(avg, 1),
-            "predominant_speed":              predominant,
-            "predominant_speed_coverage_pct": round(min(pct, 1.0), 3),
+            "Average_Speed":      round(avg, 1),
+            "Predominant_Speed":  predominant,
+            "Speed_Coverage_Pct": round(min(pct, 1.0), 3),
         })
 
     if pairs.empty:
         return _empty_osm_result(bav)
 
-    agg = pairs.groupby("segment_id").apply(_aggregate, include_groups=False)
+    agg = pairs.groupby("Segment_ID").apply(_aggregate, include_groups=False)
 
-    _SPEED_COLS = ("average_speed", "predominant_speed", "predominant_speed_coverage_pct")
+    _SPEED_COLS = ("Average_Speed", "Predominant_Speed", "Speed_Coverage_Pct")
     bav_base = bav.drop(columns=[c for c in _SPEED_COLS if c in bav.columns])
-    result = bav_base.merge(agg.reset_index(), on="segment_id", how="left")
-    result["predominant_speed_coverage_pct"] = (
-        result["predominant_speed_coverage_pct"].fillna(0.0)
+    result = bav_base.merge(agg.reset_index(), on="Segment_ID", how="left")
+    result["Speed_Coverage_Pct"] = (
+        result["Speed_Coverage_Pct"].fillna(0.0)
     )
     return result
 
@@ -719,12 +729,12 @@ def enrich_segments_with_osm_speed(
     warning — re-run infrabuild_filter_network.py to populate it.
 
     Adds three columns to the returned GeoDataFrame:
-      average_speed                — length-weighted mean OSM speed (km/h) or NaN
-      predominant_speed            — modal speed by segment length (km/h) or NaN
-      predominant_speed_coverage_pct — fraction of segment under predominant speed
+      Average_Speed       — length-weighted mean OSM speed (km/h) or NaN
+      Predominant_Speed   — modal speed by segment length (km/h) or NaN
+      Speed_Coverage_Pct  — fraction of segment under predominant speed
 
     Args:
-        segments: BAV segment GeoDataFrame (must have segment_id, length_m, gauge, geometry)
+        segments: BAV segment GeoDataFrame (must have ID, Length, Gauge, geometry)
         nodes:    BAV node GeoDataFrame (used for conflict resolution at junctions)
         raw_dir:  Override for Raw/ directory path (defaults to paths.NETWORK_INFRASTRUCTURE_RAW)
 
@@ -757,13 +767,13 @@ def enrich_segments_with_osm_speed(
 
     # When 100% of the segment runs at the predominant speed, the weighted
     # average is identical — use the exact value to avoid float rounding drift.
-    full_cov = joined["predominant_speed_coverage_pct"] == 1.0
-    joined.loc[full_cov, "average_speed"] = joined.loc[full_cov, "predominant_speed"]
+    full_cov = joined["Speed_Coverage_Pct"] == 1.0
+    joined.loc[full_cov, "Average_Speed"] = joined.loc[full_cov, "Predominant_Speed"]
 
     total     = len(joined)
-    has_speed = joined["average_speed"].notna().sum()
-    no_speed  = (joined["average_speed"].isna() & (joined["predominant_speed_coverage_pct"] > 0)).sum()
-    no_osm    = (joined["predominant_speed_coverage_pct"] == 0).sum()
+    has_speed = joined["Average_Speed"].notna().sum()
+    no_speed  = (joined["Average_Speed"].isna() & (joined["Speed_Coverage_Pct"] > 0)).sum()
+    no_osm    = (joined["Speed_Coverage_Pct"] == 0).sum()
     print(f"\n  OSM speed coverage:")
     print(f"    Speed assigned     : {has_speed:>4}  ({100*has_speed/total:.1f}%)")
     print(f"    OSM found, no speed: {no_speed:>4}  ({100*no_speed/total:.1f}%)")
@@ -788,11 +798,11 @@ def derive_segment_transport_mode(
     Args:
         nodes:    macro-level nodes GeoDataFrame (must have NAME, transport_mode,
                   node_class columns)
-        segments: macro-level segments GeoDataFrame (must have from_name, to_name)
+        segments: macro-level segments GeoDataFrame (must have From_Name, To_Name)
 
     Returns:
-        (nodes, segments) — nodes has derived transport_mode filled on previously-NaN
-        junctions; segments has a new transport_mode column.
+        (nodes, segments) — nodes has derived Transport_Mode filled on previously-NaN
+        junctions; segments has a new Transport_Mode column.
     """
     # Only modes that correspond to tracked rail infrastructure are propagated.
     # Bus, ship, etc. are excluded — they don't run on the BAV rail graph.
@@ -815,7 +825,7 @@ def derive_segment_transport_mode(
     # Adjacency: node_name → [(seg_index, other_node_name), ...]
     adj: Dict[str, list] = {}
     for idx, row in segments.iterrows():
-        fn, tn = row.get('from_name'), row.get('to_name')
+        fn, tn = row.get('From_Name'), row.get('To_Name')
         if fn and tn:
             adj.setdefault(fn, []).append((idx, tn))
             adj.setdefault(tn, []).append((idx, fn))
@@ -823,10 +833,10 @@ def derive_segment_transport_mode(
     # Collect OeV-sourced rail modes (non-rail modes stripped at source)
     node_modes: Dict[str, set] = {}
     for _, row in nodes.iterrows():
-        name = row.get('NAME')
+        name = row.get('Name')
         if not name:
             continue
-        m = _parse_rail(row.get('transport_mode'))
+        m = _parse_rail(row.get('Transport_Mode'))
         if m:
             node_modes[name] = m
 
@@ -857,14 +867,14 @@ def derive_segment_transport_mode(
                         node_modes[other] = new_o
                         queue.append(other)
 
-    # Write segment modes (all segments start without transport_mode)
-    segments['transport_mode'] = [_fmt(seg_modes.get(i, set())) for i in segments.index]
+    # Write segment modes
+    segments['Transport_Mode'] = [_fmt(seg_modes.get(i, set())) for i in segments.index]
 
     # Update junctions: only fill nodes that had no OeV rail data
     name_to_idx: Dict[str, int] = {
-        row.get('NAME'): idx
+        row.get('Name'): idx
         for idx, row in nodes.iterrows()
-        if row.get('NAME')
+        if row.get('Name')
     }
     for name, modes in node_modes.items():
         if name in original_rail_seeds:
@@ -873,15 +883,15 @@ def derive_segment_transport_mode(
         if idx is None:
             continue
         existing = _parse_all(
-            nodes.at[idx, 'transport_mode'] if 'transport_mode' in nodes.columns else pd.NA
+            nodes.at[idx, 'Transport_Mode'] if 'Transport_Mode' in nodes.columns else pd.NA
         )
         if not existing and modes:
-            nodes.at[idx, 'transport_mode'] = _fmt(modes)
+            nodes.at[idx, 'Transport_Mode'] = _fmt(modes)
 
-    n_segs = segments['transport_mode'].notna().sum()
+    n_segs = segments['Transport_Mode'].notna().sum()
     n_junc = (
-        nodes[nodes.get('node_class', pd.Series(dtype=str)) == 'junction']['transport_mode'].notna().sum()
-        if 'node_class' in nodes.columns else 0
+        nodes[nodes.get('Node_Class', pd.Series(dtype=str)) == 'junction']['Transport_Mode'].notna().sum()
+        if 'Node_Class' in nodes.columns else 0
     )
     print(f"  Mode assigned: {n_segs}/{len(segments)} segments, {n_junc} junctions derived")
     return nodes, segments
@@ -912,18 +922,18 @@ def _import_asp_stations(
     Qualifying nodes are reclassified as 'station'. Their raw connecting segments
     are added where the other endpoint is already in the (updated) macro_nodes.
     """
-    asp_raw = raw_nodes[raw_nodes['node_class'] == 'assigned_service_point'].copy()
+    asp_raw = raw_nodes[raw_nodes['Node_Class'] == 'assigned_service_point'].copy()
     if asp_raw.empty:
         return macro_nodes, macro_segs
 
-    macro_station_mask = macro_nodes['node_class'].isin({'station', 'abandoned_station'})
+    macro_station_mask = macro_nodes['Node_Class'].isin({'station', 'abandoned_station'})
     macro_stations = macro_nodes[macro_station_mask].copy()
-    macro_names = set(macro_nodes['NAME'].dropna())
+    macro_names = set(macro_nodes['Name'].dropna())
 
     # ── Pass 1: identify which ASP nodes to import ────────────────────────────
     to_import = []
     for _, asp in asp_raw.iterrows():
-        asp_name = str(asp['NAME'])
+        asp_name = str(asp['Name'])
         if asp_name in macro_names:
             continue  # already present
         asp_words = asp_name.lower().split()
@@ -933,7 +943,7 @@ def _import_asp_stations(
         best_parent_name = None
         best_len = 0
         for _, stn in macro_stations.iterrows():
-            stn_name = str(stn['NAME'])
+            stn_name = str(stn['Name'])
             stn_words = stn_name.lower().split()
             if len(stn_words) >= len(asp_words):
                 continue  # parent must have fewer words
@@ -946,7 +956,7 @@ def _import_asp_stations(
 
         if best_parent_name is not None:
             new_node = asp.copy()
-            new_node['node_class'] = 'station'
+            new_node['Node_Class'] = 'station'
             to_import.append((new_node, best_parent_name))
 
     if not to_import:
@@ -956,22 +966,22 @@ def _import_asp_stations(
     new_node_rows = [n for n, _ in to_import]
     new_nodes_gdf = gpd.GeoDataFrame(new_node_rows, crs=macro_nodes.crs)
     macro_nodes = pd.concat([macro_nodes, new_nodes_gdf], ignore_index=True)
-    macro_names = set(macro_nodes['NAME'].dropna())
+    macro_names = set(macro_nodes['Name'].dropna())
 
     new_segs = []
-    seen_seg_ids = set(macro_segs['segment_id'].dropna())
+    seen_seg_ids = set(macro_segs['Segment_ID'].dropna())
     for new_node, parent_name in to_import:
-        asp_name = str(new_node['NAME'])
-        mask = (raw_segs['from_name'] == asp_name) | (raw_segs['to_name'] == asp_name)
+        asp_name = str(new_node['Name'])
+        mask = (raw_segs['From_Name'] == asp_name) | (raw_segs['To_Name'] == asp_name)
         for _, seg in raw_segs[mask].iterrows():
-            other = seg['to_name'] if seg['from_name'] == asp_name else seg['from_name']
-            if other in macro_names and seg['segment_id'] not in seen_seg_ids:
+            other = seg['To_Name'] if seg['From_Name'] == asp_name else seg['From_Name']
+            if other in macro_names and seg['Segment_ID'] not in seen_seg_ids:
                 new_segs.append(seg)
-                seen_seg_ids.add(seg['segment_id'])
+                seen_seg_ids.add(seg['Segment_ID'])
         print(
             f"  [ASP] imported '{asp_name}' → station"
             f"  (prefix-parent: '{parent_name}',"
-            f" dist: {np.hypot(float(new_node['E']) - float(macro_nodes[macro_nodes['NAME'] == parent_name]['E'].iloc[0]), float(new_node['N']) - float(macro_nodes[macro_nodes['NAME'] == parent_name]['N'].iloc[0])):.0f}m)"
+            f" dist: {np.hypot(float(new_node['E']) - float(macro_nodes[macro_nodes['Name'] == parent_name]['E'].iloc[0]), float(new_node['N']) - float(macro_nodes[macro_nodes['Name'] == parent_name]['N'].iloc[0])):.0f}m)"
         )
 
     if new_segs:
@@ -982,7 +992,7 @@ def _import_asp_stations(
     # filter_macroscopic_nodes() merges degree-2 non-KEEP nodes by joining their
     # segment IDs with '+'. When an ASP node is rescued, those original segments
     # are restored, making the bypass a duplicate. Drop it.
-    rescued_ids = {str(s['segment_id']) for s in new_segs}
+    rescued_ids = {str(s['Segment_ID']) for s in new_segs}
     if rescued_ids:
         def _is_bypass(sid):
             sid_str = str(sid)
@@ -990,7 +1000,7 @@ def _import_asp_stations(
                 return False
             return bool(rescued_ids.intersection(sid_str.split('+')))
 
-        bypass_mask = macro_segs['segment_id'].apply(_is_bypass)
+        bypass_mask = macro_segs['Segment_ID'].apply(_is_bypass)
         n_bypass = int(bypass_mask.sum())
         if n_bypass:
             macro_segs = macro_segs[~bypass_mask].reset_index(drop=True)
@@ -1004,25 +1014,25 @@ def _assign_parent_child(macro_nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
     Detect parent-child station relationships via word-prefix name matching.
 
-    For each station with a NULL parent_node: if another station's NAME is a
-    strict word-for-word prefix of this station's NAME and lies within
+    For each station with a NULL Parent_Node: if another station's Name is a
+    strict word-for-word prefix of this station's Name and lies within
     PARENT_CHILD_RADIUS_M, the longer-named station becomes the child and the
-    shorter-named station's Betriebspunkt_Nummer is written into parent_node.
+    shorter-named station's Number is written into Parent_Node.
 
-    Only fills NULL parent_node values; never overwrites existing relationships.
+    Only fills NULL Parent_Node values; never overwrites existing relationships.
     """
-    station_mask = macro_nodes['node_class'].isin({'station', 'abandoned_station'})
+    station_mask = macro_nodes['Node_Class'].isin({'station', 'abandoned_station'})
     stations = macro_nodes[station_mask].reset_index()  # keep original index
 
     updated = 0
     for idx, row in macro_nodes.iterrows():
         if not station_mask.get(idx, False):
             continue
-        existing_parent = row.get('parent_node')
+        existing_parent = row.get('Parent_Node')
         if pd.notna(existing_parent) and str(existing_parent).strip().lower() not in ('', 'none', 'nan'):
             continue  # already has a parent
 
-        child_name = str(row.get('NAME', ''))
+        child_name = str(row.get('Name', ''))
         if not child_name:
             continue
         child_words = child_name.lower().split()
@@ -1032,7 +1042,7 @@ def _assign_parent_child(macro_nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         best_bpnr = None
         best_len = 0
         for _, stn in stations.iterrows():
-            stn_name = str(stn['NAME'])
+            stn_name = str(stn['Name'])
             if stn_name == child_name:
                 continue
             stn_words = stn_name.lower().split()
@@ -1043,17 +1053,80 @@ def _assign_parent_child(macro_nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
             dist = np.hypot(float(stn['E']) - cE, float(stn['N']) - cN)
             if dist > PARENT_CHILD_RADIUS_M:
                 continue
-            bpnr = stn.get('Betriebspunkt_Nummer')
+            bpnr = stn.get('Number')
             if pd.notna(bpnr) and len(stn_words) > best_len:
                 best_bpnr = int(float(bpnr))
                 best_len = len(stn_words)
 
         if best_bpnr is not None:
-            macro_nodes.at[idx, 'parent_node'] = best_bpnr
+            macro_nodes.at[idx, 'Parent_Node'] = best_bpnr
             updated += 1
 
     print(f"  [parent-child] {updated} relationship(s) assigned")
     return macro_nodes
+
+
+# Mode-specific speed defaults (km/h) — mirrors _MODE_DEFAULT_SPEEDS in
+# services_service_projection.py. Both dicts must be kept in sync.
+# Conservative values so that null-speed segments are not favoured in routing.
+_MODE_DEFAULT_SPEEDS: Dict[str, float] = {
+    'train':       50.0,
+    'tram':        30.0,
+    'funicular':   10.0,
+    'cog_railway': 15.0,
+    'bus':         30.0,
+}
+_MODE_DEFAULT_FALLBACK: float = 50.0  # matches RAIL_DEFAULT_SPEED_KMH
+
+
+def _compute_approx_travel_times(segments: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Add TT_Passing and TT_Stopping columns (approximate travel times in minutes).
+
+    Uses Average_Speed (OSM-derived) where available; falls back to
+    _MODE_DEFAULT_SPEEDS when null.
+
+    Formula
+    -------
+    v_ms = speed_kmh / 3.6
+
+    TT_Passing  = max(Length / v_ms * 1.15 / 60, 0.5)
+    TT_Stopping = max((Length / v_ms + v_ms / a) * 1.20 / 60, 0.5)
+
+    Deceleration a = 0.5 m/s²: conservative lower bound of the European service-
+    brake range (0.5–1.3 m/s², UIC 544-1 / ERTMS). Underestimates deceleration
+    capacity, which overestimates stopping time — appropriate for catchment
+    planning where under-estimating travel time is the greater risk.
+
+    Buffer 1.15 (passing): empirical overhead for signal delays, speed
+    restrictions, and acceleration margins on through-running services. No
+    direct GTFS calibration available for passing-only services.
+
+    Buffer 1.20 (stopping): calibrated against GTFS scheduled times. The raw
+    kinematic formula at OSM speed gives a median ratio of 0.863× GTFS; 1.20
+    brings the estimate to +3.5% above the GTFS median.
+    """
+    # Service-brake deceleration: lower bound of European service-brake range.
+    # See module docstring for calibration notes.
+    a = 0.5  # m/s²
+
+    def _speed(row) -> float:
+        spd = row.get('Average_Speed')
+        if pd.notna(spd) and float(spd) > 0:
+            return float(spd)
+        mode = str(row.get('Transport_Mode', '')).strip()
+        for m in mode.split('/'):
+            s = _MODE_DEFAULT_SPEEDS.get(m.strip())
+            if s:
+                return s
+        return _MODE_DEFAULT_FALLBACK
+
+    rows = segments.copy()
+    rows['_v_ms']   = rows.apply(_speed, axis=1) / 3.6
+    rows['_cruise'] = rows['Length'] / rows['_v_ms']
+    rows['TT_Passing']  = (rows['_cruise'] * 1.15 / 60).clip(lower=0.5)
+    rows['TT_Stopping'] = ((rows['_cruise'] + rows['_v_ms'] / a) * 1.20 / 60).clip(lower=0.5)
+    return rows.drop(columns=['_v_ms', '_cruise'])
 
 
 def run_build_base(
@@ -1116,8 +1189,58 @@ def run_build_base(
     print("\n--- OSM speed enrichment ---")
     macro_segs = enrich_segments_with_osm_speed(macro_segs, macro_nodes)
 
+    print("\n--- Approximate travel times ---")
+    macro_segs = _compute_approx_travel_times(macro_segs)
+
     out_path.mkdir(parents=True, exist_ok=True)
     print("\n--- Exporting ---")
+
+    # ---- Round numeric columns to 3 decimal places -------------------------
+    _SEG_ROUND_COLS = [
+        "Length", "Km_Start", "Km_End",
+        "Tunnel_Length", "Bridge_Length", "Conventional_Length",
+        "From_N", "From_E", "To_N", "To_E",
+        "TT_Passing", "TT_Stopping",
+    ]
+    for col in _SEG_ROUND_COLS:
+        if col in macro_segs.columns:
+            macro_segs[col] = macro_segs[col].round(3)
+
+    _NODE_ROUND_COLS = ["E", "N"]
+    for col in _NODE_ROUND_COLS:
+        if col in macro_nodes.columns:
+            macro_nodes[col] = macro_nodes[col].round(3)
+
+    # ---- Enforce canonical column order ------------------------------------
+    _SEG_COL_ORDER = [
+        "Segment_ID", "From_Name", "To_Name", "Number", "Code",
+        "From_N", "From_E", "To_N", "To_E",
+        "Length", "Num_Tracks", "Gauge", "Electrification_Class",
+        "Km_Start", "Km_End",
+        "Route_Number", "Route_Name", "Route_Owner",
+        "Tunnel_Length", "Bridge_Length", "Conventional_Length",
+        "Transport_Mode", "Average_Speed", "Predominant_Speed", "Speed_Coverage_Pct",
+        "TT_Passing", "TT_Stopping",
+    ]
+    macro_segs = macro_segs[
+        [c for c in _SEG_COL_ORDER if c in macro_segs.columns]
+        + [c for c in macro_segs.columns if c not in _SEG_COL_ORDER and c != macro_segs.geometry.name]
+        + [macro_segs.geometry.name]
+    ]
+
+    _NODE_COL_ORDER = [
+        "Node_ID", "Number", "Name", "Code",
+        "E", "N",
+        "Node_Class", "Transport_Mode",
+        "Track_Count", "Platform_Count",
+        "Parent_Node",
+    ]
+    macro_nodes = macro_nodes[
+        [c for c in _NODE_COL_ORDER if c in macro_nodes.columns]
+        + [c for c in macro_nodes.columns if c not in _NODE_COL_ORDER and c != macro_nodes.geometry.name]
+        + [macro_nodes.geometry.name]
+    ]
+
     macro_nodes.to_file(out_path / "nodes.gpkg", driver="GPKG")
     macro_segs.to_file(out_path  / "segments.gpkg", driver="GPKG")
     print(f"  nodes.gpkg    → {out_path / 'nodes.gpkg'}")
@@ -1151,11 +1274,11 @@ def _filter_composition_for_macro(
     Drops pieces for segments that were removed (dead-ends); remaps segment_id
     to the merged ID for segments that were joined through an intermediate node.
     """
-    if composition.empty or 'segment_id' not in composition.columns:
+    if composition.empty or 'Segment_ID' not in composition.columns:
         return composition
-    mask = composition['segment_id'].astype(str).isin(seg_id_remap)
+    mask = composition['Segment_ID'].astype(str).isin(seg_id_remap)
     result = composition[mask].copy()
-    result['segment_id'] = result['segment_id'].astype(str).map(seg_id_remap)
+    result['Segment_ID'] = result['Segment_ID'].astype(str).map(seg_id_remap)
     return result.reset_index(drop=True)
 
 
@@ -1169,9 +1292,9 @@ def _filter_composition_for_version(
     version_segment_ids and are simply dropped.  Manually added segments
     (new_From_To IDs) have no composition entry, so they are absent already.
     """
-    if composition_base.empty or 'segment_id' not in composition_base.columns:
+    if composition_base.empty or 'ID' not in composition_base.columns:
         return composition_base
-    mask = composition_base['segment_id'].isin(version_segment_ids)
+    mask = composition_base['Segment_ID'].isin(version_segment_ids)
     return composition_base[mask].reset_index(drop=True)
 
 
@@ -1238,10 +1361,10 @@ def _segments_maplayer_xml(layer_id: str, gpkg_relpath: str,
                             display_name: str) -> str:
     """<maplayer> XML for segments with a rule-based multi-track renderer."""
     _RULES = [
-        (1,  '&quot;num_tracks&quot; = 1',    '1 track',  '0'),
-        (2,  '&quot;num_tracks&quot; = 2',    '2 tracks', '1'),
-        (3,  '&quot;num_tracks&quot; = 3',    '3 tracks', '2'),
-        (99, '&quot;num_tracks&quot; &gt;= 4','4+ tracks','3'),
+        (1,  '&quot;Num_Tracks&quot; = 1',    '1 track',  '0'),
+        (2,  '&quot;Num_Tracks&quot; = 2',    '2 tracks', '1'),
+        (3,  '&quot;Num_Tracks&quot; = 3',    '3 tracks', '2'),
+        (99, '&quot;Num_Tracks&quot; &gt;= 4','4+ tracks','3'),
     ]
     root_key = uuid.uuid4().hex
     rules_parts, symbols_parts = [], []
@@ -1282,9 +1405,9 @@ def _nodes_maplayer_xml(layer_id: str, gpkg_relpath: str, display_name: str) -> 
     root_key = uuid.uuid4().hex
     rules_xml = f"""\
       <rules key="{root_key}">\
-        <rule key="{uuid.uuid4().hex}" filter="&quot;node_class&quot; = 'station' AND &quot;transport_mode&quot; LIKE '%train%'" label="Train Stations" symbol="0"/>\
-        <rule key="{uuid.uuid4().hex}" filter="&quot;node_class&quot; = 'station' AND (&quot;transport_mode&quot; LIKE '%tram%' OR &quot;transport_mode&quot; LIKE '%funicular%' OR &quot;transport_mode&quot; LIKE '%cog_railway%')" label="Tram / Funicular" symbol="1"/>\
-        <rule key="{uuid.uuid4().hex}" filter="&quot;node_class&quot; = 'junction'" label="Junctions" symbol="2"/>\
+        <rule key="{uuid.uuid4().hex}" filter="&quot;Node_Class&quot; = 'station' AND &quot;Transport_Mode&quot; LIKE '%train%'" label="Train Stations" symbol="0"/>\
+        <rule key="{uuid.uuid4().hex}" filter="&quot;Node_Class&quot; = 'station' AND (&quot;Transport_Mode&quot; LIKE '%tram%' OR &quot;Transport_Mode&quot; LIKE '%funicular%' OR &quot;Transport_Mode&quot; LIKE '%cog_railway%')" label="Tram / Funicular" symbol="1"/>\
+        <rule key="{uuid.uuid4().hex}" filter="&quot;Node_Class&quot; = 'junction'" label="Junctions" symbol="2"/>\
       </rules>"""
 
     marker_xml = f"""\
@@ -1347,9 +1470,9 @@ def _nodes_maplayer_xml(layer_id: str, gpkg_relpath: str, display_name: str) -> 
     labeling_xml = """\
     <labeling type="rule-based">
       <rules>
-        <rule filter="&quot;node_class&quot; = 'station' AND &quot;transport_mode&quot; LIKE '%train%'">
+        <rule filter="&quot;Node_Class&quot; = 'station' AND &quot;Transport_Mode&quot; LIKE '%train%'">
           <settings calloutType="simple">
-            <text-style fieldName="CODE" fontFamily="Arial" fontSize="8" fontWeight="0" fontItalic="0" fontUnderline="0" fontStrikeout="0" textColor="35,35,35,255" textOpacity="1" blendMode="0" namedStyle="Regular" isExpression="0" useSubstitutions="0" multilineHeight="1" fontCapitals="0" fontLetterSpacing="0" fontWordSpacing="0" fontSizeUnit="Point" textOrientation="horizontal" previewBkgrdColor="255,255,255,255"/>
+            <text-style fieldName="Code" fontFamily="Arial" fontSize="8" fontWeight="0" fontItalic="0" fontUnderline="0" fontStrikeout="0" textColor="35,35,35,255" textOpacity="1" blendMode="0" namedStyle="Regular" isExpression="0" useSubstitutions="0" multilineHeight="1" fontCapitals="0" fontLetterSpacing="0" fontWordSpacing="0" fontSizeUnit="Point" textOrientation="horizontal" previewBkgrdColor="255,255,255,255"/>
             <text-buffer bufferDraw="1" bufferSize="1" bufferColor="255,255,255,255" bufferOpacity="1" bufferJoinStyle="128" bufferNoFill="1" bufferSizeUnits="MM" bufferSizeMapUnitScale="3x:0,0,0,0,0,0" bufferBlendMode="0"/>
             <background shapeDraw="0"/>
             <shadow shadowDraw="0"/>
@@ -1513,29 +1636,29 @@ def build_networkx_graph(
     """
     Build a NetworkX graph from macroscopic nodes and segments.
 
-    Node key  : NAME (station/junction name)
-    Node attrs: CODE, N, E, node_class, geometry
-    Edge attrs: segment_id, length_m, num_tracks, gauge, electrification, geometry
+    Node key  : Name (station/junction name)
+    Node attrs: Code, N, E, Node_Class, geometry
+    Edge attrs: ID, Length, Num_Tracks, Gauge, Electrification_Class, geometry
     """
     G = nx.Graph()
 
     for _, row in nodes.iterrows():
-        name = row.get('NAME')
+        name = row.get('Name')
         if pd.isna(name):
             continue
         G.add_node(
             name,
-            CODE=row.get('CODE', ''),
+            Code=row.get('Code', ''),
             N=row.get('N', 0),
             E=row.get('E', 0),
-            node_class=row.get('node_class', 'unknown'),
+            Node_Class=row.get('Node_Class', 'unknown'),
             geometry=row.geometry,
         )
 
     skipped = 0
     for _, row in segments.iterrows():
-        fn = row.get('from_name')
-        tn = row.get('to_name')
+        fn = row.get('From_Name')
+        tn = row.get('To_Name')
         if pd.isna(fn) or pd.isna(tn):
             skipped += 1
             continue
@@ -1544,11 +1667,11 @@ def build_networkx_graph(
             continue
         G.add_edge(
             fn, tn,
-            segment_id=row.get('segment_id'),
-            length_m=row.get('length_m', 0),
-            num_tracks=row.get('num_tracks', 1),
-            gauge=row.get('gauge', 1435),
-            electrification=row.get('electrification', 'unknown'),
+            segment_id=row.get('Segment_ID'),
+            length_m=row.get('Length', 0),
+            num_tracks=row.get('Num_Tracks', 1),
+            gauge=row.get('Gauge', 1435),
+            electrification=row.get('Electrification_Class', 'unknown'),
             geometry=row.geometry,
         )
 
@@ -1567,17 +1690,17 @@ def _classify_nodes(nodes: gpd.GeoDataFrame):
 
     train_stations : node_class == 'station' AND transport_mode contains 'train'
                      OR node_class == 'abandoned_station'
-    tram_funicular : node_class == 'station' AND transport_mode contains
+    tram_funicular : Node_Class == 'station' AND Transport_Mode contains
                      'tram', 'funicular', or 'cog_railway' (and NOT 'train')
-    junctions      : node_class == 'junction'
+    junctions      : Node_Class == 'junction'
     """
     if nodes is None or nodes.empty:
         empty = gpd.GeoDataFrame()
         return empty, empty, empty
 
-    nc = (nodes['node_class']     if 'node_class'     in nodes.columns
+    nc = (nodes['Node_Class']     if 'Node_Class'     in nodes.columns
           else pd.Series([''] * len(nodes), index=nodes.index))
-    tm = (nodes['transport_mode'] if 'transport_mode' in nodes.columns
+    tm = (nodes['Transport_Mode'] if 'Transport_Mode' in nodes.columns
           else pd.Series([''] * len(nodes), index=nodes.index))
 
     is_station = nc.astype(str) == 'station'
@@ -1761,7 +1884,7 @@ def plot_infrastructure(
     # Segments by track count
     if len(segs) > 0:
         for n_tracks, color in TRACK_COLORS.items():
-            mask = segs['num_tracks'] == n_tracks
+            mask = segs['Num_Tracks'] == n_tracks
             if mask.any():
                 tracks_present.add(n_tracks)
                 for _, row in segs[mask].iterrows():
@@ -1775,7 +1898,7 @@ def plot_infrastructure(
                         zorder=2,
                         track_spacing_m=_TRACK_SPACING_M_CA if is_catchment else _TRACK_SPACING_M_SA
                     )
-        other = ~segs['num_tracks'].isin(TRACK_COLORS)
+        other = ~segs['Num_Tracks'].isin(TRACK_COLORS)
         if other.any():
             has_other_tracks = True
             for _, row in segs[other].iterrows():
@@ -1795,7 +1918,7 @@ def plot_infrastructure(
     # Nodes by class
     if len(nodes) > 0:
         for cls, color in NODE_COLORS.items():
-            mask = nodes['node_class'] == cls
+            mask = nodes['Node_Class'] == cls
             if mask.any():
                 nodes_present.add(cls)
                 size   = 80 if cls == 'station' else 30
@@ -1808,9 +1931,9 @@ def plot_infrastructure(
                 )
 
         if show_labels:
-            stations = nodes[nodes['node_class'] == 'station']
+            stations = nodes[nodes['Node_Class'] == 'station']
             for _, row in stations.iterrows():
-                name = row.get('NAME') or row.get('CODE', '')
+                name = row.get('Name') or row.get('Code', '')
                 if pd.notna(name):
                     ax.annotate(
                         str(name)[:25],
@@ -1910,31 +2033,31 @@ def plot_gauge_map(
         # Ghost pass
         if len(segs_all) > 0:
             for gauge, color in GAUGE_COLORS.items():
-                mask = segs_all['gauge'] == gauge
+                mask = segs_all['Gauge'] == gauge
                 if mask.any():
                     gauges_present.add(gauge)
                     segs_all[mask].plot(ax=ax, color=color, linewidth=2.5, alpha=0.40)
-            unknown = ~segs_all['gauge'].isin(GAUGE_COLORS)
+            unknown = ~segs_all['Gauge'].isin(GAUGE_COLORS)
             if unknown.any():
                 segs_all[unknown].plot(ax=ax, color=GAUGE_DEFAULT, linewidth=2, alpha=0.40)
                 gauges_present.add('unknown')
         # Solid pass
         if len(segs_in) > 0:
             for gauge, color in GAUGE_COLORS.items():
-                mask = segs_in['gauge'] == gauge
+                mask = segs_in['Gauge'] == gauge
                 if mask.any():
                     segs_in[mask].plot(ax=ax, color=color, linewidth=2.5, alpha=1.0)
-            unknown = ~segs_in['gauge'].isin(GAUGE_COLORS)
+            unknown = ~segs_in['Gauge'].isin(GAUGE_COLORS)
             if unknown.any():
                 segs_in[unknown].plot(ax=ax, color=GAUGE_DEFAULT, linewidth=2, alpha=1.0)
     else:
         if len(segs) > 0:
             for gauge, color in GAUGE_COLORS.items():
-                mask = segs['gauge'] == gauge
+                mask = segs['Gauge'] == gauge
                 if mask.any():
                     gauges_present.add(gauge)
                     segs[mask].plot(ax=ax, color=color, linewidth=2.5, alpha=0.85)
-            unknown = ~segs['gauge'].isin(GAUGE_COLORS)
+            unknown = ~segs['Gauge'].isin(GAUGE_COLORS)
             if unknown.any():
                 segs[unknown].plot(ax=ax, color=GAUGE_DEFAULT, linewidth=2, alpha=0.7)
                 gauges_present.add('unknown')
@@ -1989,8 +2112,8 @@ def plot_electrification_map(
     cats_present = set()
     
     if show_outside and segs_in is not None:
-        if len(segs_all) > 0 and 'electrification' in segs_all.columns:
-            elec_cat_all = segs_all['electrification'].apply(_classify_electrification)
+        if len(segs_all) > 0 and 'Electrification_Class' in segs_all.columns:
+            elec_cat_all = segs_all['Electrification_Class'].map(_ELEC_CLASS_PLOT).fillna('unknown')
             for cat, color in ELECTRIFICATION_COLORS.items():
                 mask = elec_cat_all == cat
                 if mask.any():
@@ -1998,8 +2121,8 @@ def plot_electrification_map(
                     lw = 2 if cat == 'no_electrification' else 3
                     segs_all[mask].plot(ax=ax, color=color, linewidth=lw, alpha=0.40, zorder=2)
                     
-        if len(segs_in) > 0 and 'electrification' in segs_in.columns:
-            elec_cat_in = segs_in['electrification'].apply(_classify_electrification)
+        if len(segs_in) > 0 and 'Electrification_Class' in segs_in.columns:
+            elec_cat_in = segs_in['Electrification_Class'].map(_ELEC_CLASS_PLOT).fillna('unknown')
             for cat, color in ELECTRIFICATION_COLORS.items():
                 mask = elec_cat_in == cat
                 if mask.any():
@@ -2007,8 +2130,8 @@ def plot_electrification_map(
                     lw = 2 if cat == 'no_electrification' else 3
                     segs_in[mask].plot(ax=ax, color=color, linewidth=lw, alpha=0.85, zorder=3)
     else:
-        if len(segs) > 0 and 'electrification' in segs.columns:
-            elec_cat = segs['electrification'].apply(_classify_electrification)
+        if len(segs) > 0 and 'Electrification_Class' in segs.columns:
+            elec_cat = segs['Electrification_Class'].map(_ELEC_CLASS_PLOT).fillna('unknown')
             for cat, color in ELECTRIFICATION_COLORS.items():
                 mask = elec_cat == cat
                 if mask.any():
@@ -2264,20 +2387,20 @@ def plot_infrastructure_canonical(
     if show_outside and segs_in is not None:
         if len(segs_all) > 0:
             for _, row in segs_all.iterrows():
-                n = int(row.get('num_tracks', 1) or 1)
+                n = int(row.get('Num_Tracks', 1) or 1)
                 n = max(1, min(n, 4))
                 tracks_present.add(n)
                 _draw_parallel_tracks(ax, row.geometry, n, color='black', alpha=0.40, zorder=2, track_spacing_m=_TRACK_SPACING_M_CA if is_catchment else _TRACK_SPACING_M_SA)
         if len(segs_in) > 0:
             for _, row in segs_in.iterrows():
-                n = int(row.get('num_tracks', 1) or 1)
+                n = int(row.get('Num_Tracks', 1) or 1)
                 n = max(1, min(n, 4))
                 tracks_present.add(n)
                 _draw_parallel_tracks(ax, row.geometry, n, color='black', alpha=1.0, zorder=3, track_spacing_m=_TRACK_SPACING_M_CA if is_catchment else _TRACK_SPACING_M_SA)
     else:
         if len(segs) > 0:
             for _, row in segs.iterrows():
-                n = int(row.get('num_tracks', 1) or 1)
+                n = int(row.get('Num_Tracks', 1) or 1)
                 n = max(1, min(n, 4))
                 tracks_present.add(n)
                 _draw_parallel_tracks(ax, row.geometry, n, color='black', alpha=1.0, zorder=3, track_spacing_m=_TRACK_SPACING_M_CA if is_catchment else _TRACK_SPACING_M_SA)
@@ -2320,7 +2443,7 @@ def plot_infrastructure_canonical(
                      alpha=1.0, zorder=5)
         if show_labels and not is_catchment:
             for _, row in ts_draw.iterrows():
-                code = row.get('CODE', '')
+                code = row.get('Code', '')
                 if pd.notna(code) and str(code).strip():
                     ax.annotate(
                         str(code),
@@ -2448,20 +2571,20 @@ def plot_infrastructure_diff(
     nodes_b = _clip(net_b.nodes, net_b)
 
     # ── Segment diff ──────────────────────────────────────────────────────────
-    ids_a = set(segs_a['segment_id'].dropna())
-    ids_b = set(segs_b['segment_id'].dropna())
+    ids_a = set(segs_a['Segment_ID'].dropna())
+    ids_b = set(segs_b['Segment_ID'].dropna())
 
-    removed_segs  = segs_a[segs_a['segment_id'].isin(ids_a - ids_b)]
-    added_segs    = segs_b[segs_b['segment_id'].isin(ids_b - ids_a)]
+    removed_segs  = segs_a[segs_a['Segment_ID'].isin(ids_a - ids_b)]
+    added_segs    = segs_b[segs_b['Segment_ID'].isin(ids_b - ids_a)]
     common_ids    = ids_a & ids_b
 
-    # For common segments compare num_tracks
-    common_a = segs_a[segs_a['segment_id'].isin(common_ids)].set_index('segment_id')
-    common_b = segs_b[segs_b['segment_id'].isin(common_ids)].set_index('segment_id')
+    # For common segments compare Num_Tracks and other attributes
+    common_a = segs_a[segs_a['Segment_ID'].isin(common_ids)].set_index('ID')
+    common_b = segs_b[segs_b['Segment_ID'].isin(common_ids)].set_index('ID')
 
     _SEG_MOD_ATTRS = (
-        'gauge', 'electrification', 'average_speed',
-        'km_start', 'km_end', 'route_number', 'route_name', 'route_owner',
+        'Gauge', 'Electrification_Class', 'Average_Speed',
+        'Km_Start', 'Km_End', 'Route_Number', 'Route_Name', 'Route_Owner',
     )
 
     def _norm(v):
@@ -2478,8 +2601,8 @@ def plot_infrastructure_diff(
     for sid in common_ids:
         if sid not in common_a.index or sid not in common_b.index:
             continue
-        n_a  = int(common_a.loc[sid].get('num_tracks', 1) or 1)
-        n_b  = int(common_b.loc[sid].get('num_tracks', 1) or 1)
+        n_a  = int(common_a.loc[sid].get('Num_Tracks', 1) or 1)
+        n_b  = int(common_b.loc[sid].get('Num_Tracks', 1) or 1)
         geom = common_b.loc[sid].geometry
         if n_b > n_a:
             track_gained.append((geom, n_a, n_b))
@@ -2496,34 +2619,34 @@ def plot_infrastructure_diff(
             else:
                 unchanged_ids.append(sid)
 
-    unchanged_segs = segs_b[segs_b['segment_id'].isin(unchanged_ids)]
-    modified_segs  = segs_b[segs_b['segment_id'].isin(modified_ids)]
+    unchanged_segs = segs_b[segs_b['Segment_ID'].isin(unchanged_ids)]
+    modified_segs  = segs_b[segs_b['Segment_ID'].isin(modified_ids)]
 
     # ── Draw segments ─────────────────────────────────────────────────────────
     # 1) Unchanged — black, faded
     for _, row in unchanged_segs.iterrows():
-        n = int(row.get('num_tracks', 1) or 1)
+        n = int(row.get('Num_Tracks', 1) or 1)
         _draw_parallel_tracks(ax, row.geometry, n, color='black',
                               linewidth=1.05, alpha=0.20, zorder=2,
                               track_spacing_m=ts)
 
     # 2) Modified — dark yellow, above unchanged
     for _, row in modified_segs.iterrows():
-        n = int(row.get('num_tracks', 1) or 1)
+        n = int(row.get('Num_Tracks', 1) or 1)
         _draw_parallel_tracks(ax, row.geometry, n, color=_DIFF_YELLOW,
                               linewidth=1.4, alpha=0.9, zorder=3,
                               track_spacing_m=ts)
 
     # 3) Removed — red, full opacity
     for _, row in removed_segs.iterrows():
-        n = int(row.get('num_tracks', 1) or 1)
+        n = int(row.get('Num_Tracks', 1) or 1)
         _draw_parallel_tracks(ax, row.geometry, n, color=_DIFF_RED,
                               linewidth=1.4, alpha=0.9, zorder=4,
                               track_spacing_m=ts)
 
     # 4) Added — green, full opacity
     for _, row in added_segs.iterrows():
-        n = int(row.get('num_tracks', 1) or 1)
+        n = int(row.get('Num_Tracks', 1) or 1)
         _draw_parallel_tracks(ax, row.geometry, n, color=_DIFF_GREEN,
                               linewidth=1.4, alpha=0.9, zorder=4,
                               track_spacing_m=ts)
@@ -2543,20 +2666,20 @@ def plot_infrastructure_diff(
                                     track_spacing_m=ts)
 
     # ── Node diff ─────────────────────────────────────────────────────────────
-    names_a = set(nodes_a['NAME'].dropna()) if not nodes_a.empty else set()
-    names_b = set(nodes_b['NAME'].dropna()) if not nodes_b.empty else set()
+    names_a = set(nodes_a['Name'].dropna()) if not nodes_a.empty else set()
+    names_b = set(nodes_b['Name'].dropna()) if not nodes_b.empty else set()
 
-    removed_nodes = nodes_a[nodes_a['NAME'].isin(names_a - names_b)]
-    added_nodes   = nodes_b[nodes_b['NAME'].isin(names_b - names_a)]
+    removed_nodes = nodes_a[nodes_a['Name'].isin(names_a - names_b)]
+    added_nodes   = nodes_b[nodes_b['Name'].isin(names_b - names_a)]
 
-    # Split common nodes into unchanged vs modified (geometry or node_class changed)
-    _NODE_MOD_ATTRS = ('node_class',)
+    # Split common nodes into unchanged vs modified (geometry or Node_Class changed)
+    _NODE_MOD_ATTRS = ('Node_Class',)
     modified_node_names  = []
     unchanged_node_names = []
     if not nodes_a.empty and not nodes_b.empty:
         for _name in names_a & names_b:
-            _ra = nodes_a[nodes_a['NAME'] == _name]
-            _rb = nodes_b[nodes_b['NAME'] == _name]
+            _ra = nodes_a[nodes_a['Name'] == _name]
+            _rb = nodes_b[nodes_b['Name'] == _name]
             if _ra.empty or _rb.empty:
                 unchanged_node_names.append(_name)
                 continue
@@ -2572,8 +2695,8 @@ def plot_infrastructure_diff(
     else:
         unchanged_node_names = list(names_a & names_b)
 
-    modified_nodes  = nodes_b[nodes_b['NAME'].isin(modified_node_names)]
-    unchanged_nodes = nodes_b[nodes_b['NAME'].isin(unchanged_node_names)]
+    modified_nodes  = nodes_b[nodes_b['Name'].isin(modified_node_names)]
+    unchanged_nodes = nodes_b[nodes_b['Name'].isin(unchanged_node_names)]
 
     ms_ts = 20 if is_catchment else 55
     ms_jn = 5  if is_catchment else 8
@@ -2603,7 +2726,7 @@ def plot_infrastructure_diff(
                                  (modified_nodes, _DIFF_YELLOW)):
             ts_n, tf_n, _ = _classify_nodes(nodes_gdf)
             for _, row in pd.concat([ts_n, tf_n]).iterrows():
-                code = row.get('CODE', '')
+                code = row.get('Code', '')
                 if pd.notna(code) and str(code).strip():
                     ax.annotate(
                         str(code),
@@ -2689,7 +2812,7 @@ def _draw_tunnel_portals(ax, geom, num_tracks: int = 1, track_spacing_m: float =
     if len(all_coords) < 2:
         return
 
-    for i, (pt, ref) in enumerate(((all_coords[0], all_coords[1]),
+    for _, (pt, ref) in enumerate(((all_coords[0], all_coords[1]),
                                    (all_coords[-1], all_coords[-2]))):
         dx, dy = ref[0] - pt[0], ref[1] - pt[1]
         length = math.sqrt(dx * dx + dy * dy)
@@ -2738,8 +2861,8 @@ def plot_construction_components(
     composition_all = gpd.GeoDataFrame()
     composition_in = None
     if not composition.empty:
-        if 'num_tracks' not in composition.columns and 'segment_id' in composition.columns and not network.segments.empty:
-            composition = composition.merge(network.segments[['segment_id', 'num_tracks']], on='segment_id', how='left')
+        if 'Num_Tracks' not in composition.columns and 'ID' in composition.columns and not network.segments.empty:
+            composition = composition.merge(network.segments[['ID', 'Num_Tracks']], on='ID', how='left')
 
         composition_all = composition.copy()
         composition_in = (_clip_to_boundary(composition, network.boundary)
@@ -2768,15 +2891,15 @@ def plot_construction_components(
             )
 
     def _plot_comp_pass(comp_df, alpha, z_base):
-        if comp_df.empty or 'construct_type' not in comp_df.columns:
+        if comp_df.empty or 'Engineering_Structure' not in comp_df.columns:
             return
         for _, piece in comp_df.iterrows():
             geom  = piece.geometry
             if geom is None or geom.is_empty:
                 continue
-            ctype = str(piece.get('construct_type', 'normal')).lower()
+            ctype = str(piece.get('Engineering_Structure', 'normal')).lower()
             try:
-                nt = piece.get('num_tracks', 1)
+                nt = piece.get('Num_Tracks', 1)
                 num_tracks = int(float(nt)) if pd.notna(nt) else 1
             except (ValueError, TypeError):
                 num_tracks = 1
@@ -2826,7 +2949,7 @@ def plot_construction_components(
     if show_outside and composition_in is not None:
         _plot_comp_pass(composition_all, alpha=0.40, z_base=2)
         _plot_comp_pass(composition_in, alpha=1.0, z_base=10)
-    elif not composition.empty and 'construct_type' in composition.columns:
+    elif not composition.empty and 'Engineering_Structure' in composition.columns:
         _plot_comp_pass(composition, alpha=1.0, z_base=3)
     else:
         if len(network.segments) > 0:
@@ -2863,7 +2986,7 @@ def plot_construction_components(
                      markersize=_ms_ts, marker='o', linewidth=1.2,
                      alpha=1.0, zorder=16)
         for _, row in ts_draw.iterrows():
-            code = row.get('CODE', '')
+            code = row.get('Code', '')
             if pd.notna(code) and str(code).strip():
                 ax.annotate(
                     str(code),
@@ -2949,9 +3072,9 @@ def plot_owner_map(
     # Owners are drawn from catchment-clipped `segs`; `segs_all` used only for
     # background rendering when show_outside=True.
     catchment_segs = segs if len(segs) > 0 else segs_all
-    if len(catchment_segs) > 0 and 'route_owner' in catchment_segs.columns:
+    if len(catchment_segs) > 0 and 'Route_Owner' in catchment_segs.columns:
         # Determine owner set from catchment boundary only
-        unique_owners = catchment_segs['route_owner'].dropna().unique()
+        unique_owners = catchment_segs['Route_Owner'].dropna().unique()
 
         colors = {}
         palette_idx = 0
@@ -2966,21 +3089,21 @@ def plot_owner_map(
 
         if show_outside and segs_in is not None:
             for owner, color in colors.items():
-                mask_all = segs_all['route_owner'] == owner
+                mask_all = segs_all['Route_Owner'] == owner
                 if mask_all.any():
                     plotted_owners.add(owner)
                     segs_all[mask_all].plot(ax=ax, color=color, linewidth=2, alpha=0.40, zorder=2)
 
             if len(segs_in) > 0:
                 for owner, color in colors.items():
-                    mask_in = segs_in['route_owner'] == owner
+                    mask_in = segs_in['Route_Owner'] == owner
                     if mask_in.any():
                         plotted_owners.add(owner)
                         segs_in[mask_in].plot(ax=ax, color=color, linewidth=2, alpha=0.8, zorder=3)
         else:
             if len(segs) > 0:
                 for owner, color in colors.items():
-                    mask = segs['route_owner'] == owner
+                    mask = segs['Route_Owner'] == owner
                     if mask.any():
                         plotted_owners.add(owner)
                         segs[mask].plot(ax=ax, color=color, linewidth=2, alpha=0.8, zorder=2)
@@ -3031,7 +3154,7 @@ def plot_speed_map(
     )
     segs = _clip_to_boundary(network.segments, network.boundary)
 
-    if 'predominant_speed' not in network.segments.columns:
+    if 'Predominant_Speed' not in network.segments.columns:
         ax.text(0.5, 0.5, 'No speed data\n(run network builder with OSM enrichment)',
                 transform=ax.transAxes, ha='center', va='center', fontsize=12, color='grey')
         _add_north_arrow(ax)
@@ -3047,16 +3170,16 @@ def plot_speed_map(
     def _plot_segs(gdf, alpha):
         if gdf is None or gdf.empty:
             return
-        no_data = gdf['predominant_speed'].isna()
+        no_data = gdf['Predominant_Speed'].isna()
         if no_data.any():
             gdf[no_data].plot(ax=ax, color=SPEED_NO_DATA_COLOR, linewidth=2, alpha=alpha)
             bins_present.add('no_data')
         prev_upper = 0
         for upper, color, _ in SPEED_BINS:
             mask = (
-                ~gdf['predominant_speed'].isna()
-                & (gdf['predominant_speed'] > prev_upper)
-                & (gdf['predominant_speed'] <= upper)
+                ~gdf['Predominant_Speed'].isna()
+                & (gdf['Predominant_Speed'] > prev_upper)
+                & (gdf['Predominant_Speed'] <= upper)
             )
             if mask.any():
                 gdf[mask].plot(ax=ax, color=color, linewidth=2.5, alpha=alpha)
@@ -3292,17 +3415,17 @@ if __name__ == "__main__":
         print(f"  {len(_nodes)} nodes, {len(_segments)} segments")
 
         # Enrich any segments that were added via version manager and have no OSM speed
-        _speed_col_missing = 'average_speed' not in _segments.columns
+        _speed_col_missing = 'Average_Speed' not in _segments.columns
         if _speed_col_missing:
             _unmatched_mask = pd.Series([True] * len(_segments), index=_segments.index)
         else:
-            _unmatched_mask = _segments['average_speed'].isna()
+            _unmatched_mask = _segments['Average_Speed'].isna()
         if _unmatched_mask.any():
             _n_new = int(_unmatched_mask.sum())
             print(f"\n--- OSM speed enrichment for {_n_new} segment(s) missing speed ---")
             _new_segs = _segments[_unmatched_mask].copy()
             _enriched = enrich_segments_with_osm_speed(_new_segs, _nodes)
-            for _col in ('average_speed', 'predominant_speed', 'predominant_speed_coverage_pct'):
+            for _col in ('Average_Speed', 'Predominant_Speed', 'Speed_Coverage_Pct'):
                 if _col in _enriched.columns:
                     _segments.loc[_unmatched_mask, _col] = _enriched[_col].values
             _segments.to_file(_version_dir / 'segments.gpkg', driver='GPKG')
@@ -3312,7 +3435,7 @@ if __name__ == "__main__":
         _base_comp_path = _base_path / "segments_composition.gpkg"
         if _base_comp_path.exists():
             _base_comp    = gpd.read_file(_base_comp_path)
-            _ver_sids     = set(_segments['segment_id'].dropna())
+            _ver_sids     = set(_segments['Segment_ID'].dropna())
             _composition  = _filter_composition_for_version(_base_comp, _ver_sids)
             _composition.to_file(_version_dir / "segments_composition.gpkg", driver="GPKG")
             print(f"  segments_composition.gpkg → {_version_dir / 'segments_composition.gpkg'}"
