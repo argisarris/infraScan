@@ -2326,22 +2326,22 @@ def build_segments(lines_by_type, mode_class_tag):
                 geom = LineString([(from_pt.x, from_pt.y), (to_pt.x, to_pt.y)])
 
                 seg_rec = {
-                    'route_id':           row['route_id'],
+                    'GTFS_ID':            row['route_id'],
+                    'Service':            row['line_short_name'],
                     'direction_id':       row['direction_id'],
                     'variant_rank':       row['variant_rank'],
-                    'line_short_name':    row['line_short_name'],
                     'mode_label':         row['mode_label'],
                     'mode_class':         mode_class_tag,
-                    'from_stop_id':       from_sid,
-                    'to_stop_id':         to_sid,
+                    'from_stop_nr':       int(from_sid),
+                    'to_stop_nr':         int(to_sid),
                     'from_stop_name':     stop_name.get(from_sid, ''),
                     'to_stop_name':       stop_name.get(to_sid, ''),
                     'from_stop_E':        from_pt.x,
                     'from_stop_N':        from_pt.y,
                     'to_stop_E':          to_pt.x,
                     'to_stop_N':          to_pt.y,
-                    'travel_time_min':    seg_times[i]['travel_time_min'],
-                    'InVehWait_min':      seg_times[i]['InVehWait_min'],
+                    'TT':                 seg_times[i]['travel_time_min'],
+                    'IVWT':              seg_times[i]['InVehWait_min'],
                     'service_period':     row['service_period'],
                     'geometry':           geom,
                 }
@@ -2741,11 +2741,6 @@ if WRITE_FULLDAY:
                       rail_lines_by_type, RAIL_LINES_FILE,
                       rail_stops_by_type, RAIL_STOPS_FILE,
                       RAIL_LINE_TYPES, 'rail')
-
-    _build_segments_qgz(_rail_out_dir, RAIL_SEGMENTS_PROJECT_FILE,
-                         rail_segments_by_type, RAIL_SEGMENTS_FILE,
-                         rail_stops_by_type, RAIL_STOPS_FILE,
-                         RAIL_LINE_TYPES, 'rail')
 
 # Rail all-day QGZ
 if WRITE_ALLDAY:

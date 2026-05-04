@@ -87,14 +87,19 @@ TERMINAL_PREFERENCE_S: int = 300
 # Mixed-mode segments use the minimum (most conservative) of the applicable values.
 RAIL_DEFAULT_SPEED_KMH: int        = 50   # train (all gauges)
 TRAM_DEFAULT_SPEED_KMH: int        = 30   # urban tram / light rail
-FUNICULAR_DEFAULT_SPEED_KMH: int   = 20   # funicular
+FUNICULAR_DEFAULT_SPEED_KMH: int   = 10   # funicular / Standseilbahn
 COG_RAILWAY_DEFAULT_SPEED_KMH: int = 15   # cog railway
+BUS_DEFAULT_SPEED_KMH: int         = 30   # urban PT bus feeder
 
+# Canonical mode-speed lookup used as routing graph weight fallback when TT_Stopping
+# is absent from segments.gpkg. Conservative values — intentionally below typical operating speeds
+# so that segments with missing OSM data are not preferred in routing.
 _MODE_DEFAULT_SPEEDS: Dict[str, int] = {
     "train":       RAIL_DEFAULT_SPEED_KMH,
     "tram":        TRAM_DEFAULT_SPEED_KMH,
     "funicular":   FUNICULAR_DEFAULT_SPEED_KMH,
     "cog_railway": COG_RAILWAY_DEFAULT_SPEED_KMH,
+    "bus":         BUS_DEFAULT_SPEED_KMH,
 }
 
 # Layers subject to boundary gateway rerouting (Phase 1.5).
@@ -254,29 +259,29 @@ def _default_speed(mode, gauge=None) -> float:
 
 def _build_name_to_id(nodes: gpd.GeoDataFrame) -> Dict[str, int]:
     """
-    Build a stable name → Betriebspunkt_Nummer lookup.
+    Build a stable name → Number lookup.
 
-    Nodes that have a valid Betriebspunkt_Nummer use it directly.  Nodes that
+    Nodes that have a valid Number use it directly.  Nodes that
     were manually inserted without one (e.g. synthetic junction nodes added via
     the version manager) receive a synthetic integer >= 9_000_000, assigned in
     DataFrame order so the result is identical across all callers within the same
     run.
     """
     existing_ids: set = {
-        int(r["Betriebspunkt_Nummer"])
+        int(r["Number"])
         for _, r in nodes.iterrows()
-        if pd.notna(r.get("Betriebspunkt_Nummer"))
+        if pd.notna(r.get("Number"))
     }
     synth_counter = max(existing_ids, default=0)
     synth_counter = max(synth_counter, 9_000_000 - 1)
 
     name_to_id: Dict[str, int] = {}
     for _, row in nodes.iterrows():
-        name = row.get("NAME", "")
+        name = row.get("Name", "")
         if not name or not pd.notna(name):
             continue
-        if pd.notna(row.get("Betriebspunkt_Nummer")):
-            name_to_id[name] = int(row["Betriebspunkt_Nummer"])
+        if pd.notna(row.get("Number")):
+            name_to_id[name] = int(row["Number"])
         else:
             synth_counter += 1
             while synth_counter in existing_ids:
@@ -302,8 +307,8 @@ def _build_stop_coord_from_segments(svc_dir) -> dict:
         gdf = gpd.read_file(gpkg, layer=layer)
         for _, row in gdf.iterrows():
             for id_col, e_col, n_col in [
-                ("from_stop_id", "from_stop_E", "from_stop_N"),
-                ("to_stop_id",   "to_stop_E",   "to_stop_N"),
+                ("from_stop_nr", "from_stop_E", "from_stop_N"),
+                ("to_stop_nr",   "to_stop_E",   "to_stop_N"),
             ]:
                 sid = str(row.get(id_col, "")).strip()
                 E = row.get(e_col)
@@ -825,9 +830,9 @@ def _apply_zvv_postpass(
     flagged = 0
 
     for rec in rows:
-        from_sid  = str(rec.get("from_stop_id", "")).strip()
-        to_sid    = str(rec.get("to_stop_id",   "")).strip()
-        line_name = str(rec.get("line_short_name", "")).strip()
+        from_sid  = str(rec.get("from_stop_nr", "")).strip()
+        to_sid    = str(rec.get("to_stop_nr",   "")).strip()
+        line_name = str(rec.get("Service", "")).strip()
         if not from_sid or not to_sid:
             continue
 
@@ -893,40 +898,44 @@ def build_infra_graph(
     in which case missing nodes are added dynamically with `node_class='removed'`
     to heal broken graphs and enable continuous routing.
 
-    Edge attribute 'weight' = length_m.
-    Node attributes: name, code, E, N, node_class.
+    Edge attribute 'weight' = travel time in seconds (TT_Stopping × 60 when available;
+    falls back to length_m / speed for segments without TT_Stopping).
+    Node attributes: name, code, E, N, Node_Class.
     """
     name_to_id = _build_name_to_id(nodes)
 
     raw_name_lookup = {}
     if raw_nodes is not None:
         for _, row in raw_nodes.iterrows():
-            if pd.notna(row.get("NAME")) and row["NAME"] and pd.notna(row.get("Betriebspunkt_Nummer")):
-                raw_name_lookup[row["NAME"]] = row
+            if pd.notna(row.get("Name")) and row["Name"] and pd.notna(row.get("Number")):
+                raw_name_lookup[row["Name"]] = row
 
     G = nx.Graph()
 
     # Add all active nodes (synthetic-ID nodes included via name_to_id)
+    node_id_to_class: Dict[int, str] = {}
     for _, row in nodes.iterrows():
-        name = row.get("NAME", "")
+        name = row.get("Name", "")
         nid = name_to_id.get(name) if name else None
         if nid is None:
             continue
+        nc = str(row.get("Node_Class", "") or "")
         G.add_node(
             nid,
-            name=row.get("NAME", ""),
-            code=row.get("CODE", ""),
+            name=row.get("Name", ""),
+            code=row.get("Code", ""),
             E=float(row.get("E", 0)),
             N=float(row.get("N", 0)),
-            node_class=row.get("node_class", ""),
+            node_class=nc,
         )
+        node_id_to_class[nid] = nc
 
     # Add edges from segments, auto-healing missing nodes from raw_nodes
     skipped = 0
     healed = 0
     for _, seg in segments.iterrows():
-        fn_name = seg.get("from_name")
-        tn_name = seg.get("to_name")
+        fn_name = seg.get("From_Name")
+        tn_name = seg.get("To_Name")
 
         fn = name_to_id.get(fn_name)
         tn = name_to_id.get(tn_name)
@@ -936,12 +945,12 @@ def build_infra_graph(
             for name, missing_id_var in [(fn_name, 'fn'), (tn_name, 'tn')]:
                 if locals()[missing_id_var] is None and name in raw_name_lookup:
                     raw_row = raw_name_lookup[name]
-                    raw_id = int(raw_row["Betriebspunkt_Nummer"])
+                    raw_id = int(raw_row["Number"])
                     if raw_id not in G:
                         G.add_node(
                             raw_id,
-                            name=raw_row.get("NAME", ""),
-                            code=raw_row.get("CODE", ""),
+                            name=raw_row.get("Name", ""),
+                            code=raw_row.get("Code", ""),
                             E=float(raw_row.get("E", 0)),
                             N=float(raw_row.get("N", 0)),
                             node_class="removed",  # Flag as a healed virtual node
@@ -956,27 +965,47 @@ def build_infra_graph(
             skipped += 1
             continue
 
-        seg_length_m = float(seg.get("length_m", 0))
-        raw_speed    = seg.get("average_speed")
-        speed_kmh    = (
-            float(raw_speed)
-            if raw_speed is not None
-            and not (isinstance(raw_speed, float) and np.isnan(raw_speed))
-            else _default_speed(seg.get("transport_mode"), seg.get("gauge"))
+        seg_length_m = float(seg.get("Length", 0))
+
+        # Hybrid routing weight:
+        # Short segments (<400m) with at least one junction endpoint carry no
+        # decel/accel overhead — trains pass through at speed without stopping.
+        # The stopping overhead (v/a × 1.20) is physically incoherent when
+        # the braking distance at default speed (386m) exceeds the segment length.
+        # For all other segments use TT_Stopping (calibrated kinematic formula).
+        fn_is_station = node_id_to_class.get(fn, "") == "station"
+        tn_is_station = node_id_to_class.get(tn, "") == "station"
+        use_passthrough = seg_length_m < 400.0 and not (fn_is_station and tn_is_station)
+
+        tt_stopping = seg.get("TT_Stopping")
+        tt_valid = (
+            tt_stopping is not None
+            and not (isinstance(tt_stopping, float) and np.isnan(tt_stopping))
+            and float(tt_stopping) > 0
         )
-        travel_time_s = (
-            seg_length_m / (speed_kmh / 3.6)
-            if speed_kmh > 0
-            else seg_length_m / (RAIL_DEFAULT_SPEED_KMH / 3.6)
-        )
+
+        if use_passthrough:
+            speed_kmh = _default_speed(seg.get("Transport_Mode"), seg.get("Gauge"))
+            v_ms = (speed_kmh / 3.6) if speed_kmh > 0 else (RAIL_DEFAULT_SPEED_KMH / 3.6)
+            travel_time_s = (seg_length_m / v_ms) * 1.20
+        elif tt_valid:
+            travel_time_s = float(tt_stopping) * 60.0
+        else:
+            speed_kmh = _default_speed(seg.get("Transport_Mode"), seg.get("Gauge"))
+            travel_time_s = (
+                seg_length_m / (speed_kmh / 3.6)
+                if speed_kmh > 0
+                else seg_length_m / (RAIL_DEFAULT_SPEED_KMH / 3.6)
+            )
+
         G.add_edge(
             fn, tn,
             weight=travel_time_s,      # routing metric: travel time in seconds
             length_m=seg_length_m,     # physical distance for path_length_m output
-            segment_id=seg.get("segment_id", ""),
+            segment_id=seg.get("Segment_ID", ""),
             geometry=seg.geometry,
-            gauge=seg.get("gauge"),
-            electrification=seg.get("electrification"),
+            gauge=seg.get("Gauge"),
+            electrification=seg.get("Electrification_Class"),
         )
 
     if healed:
@@ -984,6 +1013,49 @@ def build_infra_graph(
     if skipped:
         print(f"  [graph] {skipped} segments skipped (from_name or to_name unresolvable).")
     return G
+
+
+def strategy3_journey_time(
+    segment_rows: List[dict],
+    pass_through_nodes: set,
+    a: float = 0.5,
+    buf: float = 1.20,
+) -> float:
+    """Estimate multi-segment journey time corrected for pass-through nodes (Strategy 3).
+
+    Sums TT_Stopping for all segments, then subtracts the stop overhead (v/a × buf / 60)
+    for each intermediate node the service does NOT stop at. This removes the phantom
+    decel+accel penalty that TT_Stopping adds at every segment boundary.
+
+    Only call when the stop pattern is known from GTFS (i.e. which nodes the service
+    actually stops at). Do not use for routing weight computation — use TT_Stopping
+    directly per segment for that.
+
+    Validated: S5/S15 Stadelhofen→Uster error +0.51 min (4.7%);
+               S9 stopping error −2.04 min (10.7%, limited by directional GTFS asymmetry).
+
+    Args:
+        segment_rows: Sequence of dicts, each with keys:
+            '_to_node'      — BAV Betriebspunkt_Nummer of the segment's destination node (int)
+            'TT_Stopping'   — calibrated stopping travel time in minutes (float)
+            'Average_Speed' — OSM-derived speed in km/h (float or None)
+        pass_through_nodes: Set of intermediate BAV node Numbers that the service does
+            NOT stop at (i.e. nodes to subtract the overhead for).
+        a: Service brake deceleration (m/s²). UIC 544-1 lower bound = 0.5.
+        buf: Calibration buffer matching the TT_Stopping formula (default 1.20).
+
+    Returns:
+        Estimated total journey time in minutes (minimum 0.5).
+    """
+    total = sum(float(s.get("TT_Stopping", 0)) for s in segment_rows)
+    for node_id in pass_through_nodes:
+        arriving = next(
+            (s for s in segment_rows if s.get("_to_node") == node_id), None
+        )
+        spd = float((arriving or {}).get("Average_Speed") or 50.0)
+        overhead = (spd / 3.6 / a) * buf / 60.0
+        total -= overhead
+    return max(total, 0.5)
 
 
 def build_segment_lookup(
@@ -1000,15 +1072,15 @@ def build_segment_lookup(
     raw_name_lookup = {}
     if raw_nodes is not None:
         raw_name_lookup = {
-            row["NAME"]: int(row["Betriebspunkt_Nummer"])
+            row["Name"]: int(row["Number"])
             for _, row in raw_nodes.iterrows()
-            if pd.notna(row.get("NAME")) and row["NAME"] and pd.notna(row.get("Betriebspunkt_Nummer"))
+            if pd.notna(row.get("Name")) and row["Name"] and pd.notna(row.get("Number"))
         }
 
     lookup: Dict[Tuple[int, int], pd.Series] = {}
     for _, seg in segments.iterrows():
-        fn_name = seg.get("from_name")
-        tn_name = seg.get("to_name")
+        fn_name = seg.get("From_Name")
+        tn_name = seg.get("To_Name")
 
         fn = name_to_id.get(fn_name)
         tn = name_to_id.get(tn_name)
@@ -1027,17 +1099,17 @@ def build_segment_lookup(
 
 def build_node_attrs(nodes: gpd.GeoDataFrame) -> Dict[int, Dict]:
     """
-    Build {Betriebspunkt_Nummer: {name, code, E, N, node_class}} dict for fast attribute lookup.
+    Build {Number: {name, code, E, N, node_class}} dict for fast attribute lookup.
     """
     return {
-        int(row["Betriebspunkt_Nummer"]): {
-            "name": row.get("NAME", ""),
-            "code": row.get("CODE", ""),
+        int(row["Number"]): {
+            "name": row.get("Name", ""),
+            "code": row.get("Code", ""),
             "E": float(row.get("E", 0)),
             "N": float(row.get("N", 0)),
-            "node_class": row.get("node_class", ""),
+            "node_class": row.get("Node_Class", ""),
         }
-        for _, row in nodes.iterrows() if pd.notna(row.get("Betriebspunkt_Nummer"))
+        for _, row in nodes.iterrows() if pd.notna(row.get("Number"))
     }
 
 
@@ -1208,17 +1280,17 @@ def build_hub_topology(
     # ── Build parent → [children] mapping from nodes table ───────────────────
     node_uuid_to_bpnr: Dict[str, int] = {}
     for _, row in nodes.iterrows():
-        if pd.notna(row.get("Betriebspunkt_Nummer")) and pd.notna(row.get("node_id")):
-            node_uuid_to_bpnr[str(row["node_id"]).strip()] = int(row["Betriebspunkt_Nummer"])
+        if pd.notna(row.get("Number")) and pd.notna(row.get("Node_ID")):
+            node_uuid_to_bpnr[str(row["Node_ID"]).strip()] = int(row["Number"])
 
     children_by_parent: Dict[int, List[int]] = {}
     node_class_map: Dict[int, str] = {}
     for _, row in nodes.iterrows():
-        if pd.isna(row.get("Betriebspunkt_Nummer")):
+        if pd.isna(row.get("Number")):
             continue
-        nid = int(row["Betriebspunkt_Nummer"])
-        node_class_map[nid] = str(row.get("node_class", ""))
-        pn = row.get("parent_node")
+        nid = int(row["Number"])
+        node_class_map[nid] = str(row.get("Node_Class", ""))
+        pn = row.get("Parent_Node")
         if pd.isna(pn):
             continue
         raw = str(pn).strip()
@@ -1336,9 +1408,9 @@ def build_hub_topology(
     # ── Print summary ─────────────────────────────────────────────────────────
     def _hub_name(nid: int) -> str:
         return next(
-            (str(r.get("NAME", nid)) for _, r in nodes.iterrows()
-             if pd.notna(r.get("Betriebspunkt_Nummer"))
-             and int(r["Betriebspunkt_Nummer"]) == nid),
+            (str(r.get("Name", nid)) for _, r in nodes.iterrows()
+             if pd.notna(r.get("Number"))
+             and int(r["Number"]) == nid),
             str(nid),
         )
 
@@ -1383,16 +1455,16 @@ def detect_boundary_station_candidates(
     the BAV network is spatially clipped at the buffer, so through-stations at
     the boundary appear as degree-1 leaf nodes.
 
-    Returns a sorted list of Betriebspunkt_Nummer (int).
+    Returns a sorted list of Number (int).
     """
     if buffer_geom is None:
         return []
     buf_boundary = buffer_geom.boundary
     candidates: List[int] = []
     for _, row in nodes.iterrows():
-        if pd.isna(row.get("Betriebspunkt_Nummer")):
+        if pd.isna(row.get("Number")):
             continue
-        nid = int(row["Betriebspunkt_Nummer"])
+        nid = int(row["Number"])
         if G.nodes.get(nid, {}).get("node_class") != "station":
             continue
         if nid not in G or G.degree(nid) != 1:
@@ -1498,26 +1570,26 @@ def build_stop_lookups(nodes: gpd.GeoDataFrame) -> Dict[str, dict]:
 
     Returns:
         {
-          'by_id':   {Betriebspunkt_Nummer (int): Betriebspunkt_Nummer},
-          'by_name': {normalized_name (str): Betriebspunkt_Nummer},
-          'by_code': {CODE (str): Betriebspunkt_Nummer},
+          'by_id':   {Number (int): Number},
+          'by_name': {normalized_name (str): Number},
+          'by_code': {Code (str): Number},
           'children':{parent_node_id (int): [child_node_id...]}
         }
 
-    Parent-child relationships are built from the `parent_node` column.  The BAV
-    geopackage stores parent references as the UUID value found in the `node_id`
-    column of the parent node — not as a numeric Betriebspunkt_Nummer.  A first
-    pass therefore builds a node_id-UUID → Betriebspunkt_Nummer reverse-lookup so
-    that UUID-style parent_node values can be resolved to their numeric parent ID.
+    Parent-child relationships are built from the `Parent_Node` column.  The BAV
+    geopackage stores parent references as the UUID value found in the `ID`
+    column of the parent node — not as a numeric Number.  A first
+    pass therefore builds a ID-UUID → Number reverse-lookup so
+    that UUID-style Parent_Node values can be resolved to their numeric parent ID.
     """
-    # First pass: build node_id (UUID) → Betriebspunkt_Nummer reverse-lookup
+    # First pass: build ID (UUID) → Number reverse-lookup
     node_uuid_to_bpnr: Dict[str, int] = {}
     for _, row in nodes.iterrows():
-        if pd.isna(row.get("Betriebspunkt_Nummer")):
+        if pd.isna(row.get("Number")):
             continue
-        raw_uuid = str(row.get("node_id", "")).strip() if pd.notna(row.get("node_id")) else ""
+        raw_uuid = str(row.get("Node_ID", "")).strip() if pd.notna(row.get("Node_ID")) else ""
         if raw_uuid:
-            node_uuid_to_bpnr[raw_uuid] = int(row["Betriebspunkt_Nummer"])
+            node_uuid_to_bpnr[raw_uuid] = int(row["Number"])
 
     # Second pass: build all lookup tables
     by_id: Dict[int, int] = {}
@@ -1526,29 +1598,29 @@ def build_stop_lookups(nodes: gpd.GeoDataFrame) -> Dict[str, dict]:
     children_by_parent: Dict[int, List[int]] = {}
 
     for _, row in nodes.iterrows():
-        if pd.isna(row.get("Betriebspunkt_Nummer")):
+        if pd.isna(row.get("Number")):
             continue
-        nid = int(row["Betriebspunkt_Nummer"])
+        nid = int(row["Number"])
         by_id[nid] = nid
 
         # Build parent-child relationships
-        if "parent_node" in row and pd.notna(row["parent_node"]):
-            raw_pid = str(row["parent_node"]).strip()
+        if "Parent_Node" in row and pd.notna(row["Parent_Node"]):
+            raw_pid = str(row["Parent_Node"]).strip()
             if raw_pid and raw_pid.lower() not in ["none", "nan"]:
                 try:
-                    # Numeric Betriebspunkt_Nummer stored directly
+                    # Numeric Number stored directly
                     pid = int(float(raw_pid))
                     children_by_parent.setdefault(pid, []).append(nid)
                 except ValueError:
-                    # UUID — resolve via node_id reverse-lookup
+                    # UUID — resolve via ID reverse-lookup
                     pid = node_uuid_to_bpnr.get(raw_pid)
                     if pid is not None:
                         children_by_parent.setdefault(pid, []).append(nid)
 
-        if pd.notna(row.get("NAME")) and row["NAME"]:
-            by_name[normalize_stop_name(str(row["NAME"]))] = nid
-        if pd.notna(row.get("CODE")) and row["CODE"]:
-            by_code[str(row["CODE"]).strip()] = nid
+        if pd.notna(row.get("Name")) and row["Name"]:
+            by_name[normalize_stop_name(str(row["Name"]))] = nid
+        if pd.notna(row.get("Code")) and row["Code"]:
+            by_code[str(row["Code"]).strip()] = nid
 
     return {"by_id": by_id, "by_name": by_name, "by_code": by_code, "children": children_by_parent}
 
@@ -1611,7 +1683,7 @@ def match_stop_to_node(
         min_dist = float(distances[min_idx])
         if min_dist <= SPATIAL_MATCH_THRESHOLD:
             return _make_result(
-                int(nodes.loc[min_idx, "Betriebspunkt_Nummer"]),
+                int(nodes.loc[min_idx, "Number"]),
                 0.7 * (1 - min_dist / SPATIAL_MATCH_THRESHOLD),
                 "spatial",
                 min_dist,
@@ -1652,10 +1724,10 @@ def _tier4_raw_bav_fallback(
         return None, working_nodes, working_segments
 
     # Found in raw — explain and ask user
-    raw_row = raw_nodes[raw_nodes["Betriebspunkt_Nummer"] == raw_result.node_id].iloc[0]
+    raw_row = raw_nodes[raw_nodes["Number"] == raw_result.node_id].iloc[0]
     print(f"\n  [Tier 4] Stop '{stop_name}' not in current version but found in Raw:")
-    print(f"    Name:   {raw_row.get('NAME', '?')}")
-    print(f"    Code:   {raw_row.get('CODE', '?')}")
+    print(f"    Name:   {raw_row.get('Name', '?')}")
+    print(f"    Code:   {raw_row.get('Code', '?')}")
     print(f"    Match:  {raw_result.method}  (confidence {raw_result.confidence:.2f})")
 
     ans = input(
@@ -1673,9 +1745,9 @@ def _tier4_raw_bav_fallback(
         return None, working_nodes, working_segments
 
     raw_segs = gpd.read_file(raw_segments_path)
-    node_name = raw_row["NAME"]
+    node_name = raw_row["Name"]
     conn_mask = (
-        (raw_segs["from_name"] == node_name) | (raw_segs["to_name"] == node_name)
+        (raw_segs["From_Name"] == node_name) | (raw_segs["To_Name"] == node_name)
     )
     conn_segs = raw_segs[conn_mask]
 
@@ -1686,10 +1758,10 @@ def _tier4_raw_bav_fallback(
 
     # Append connecting segments to working_segments (only those connecting to
     # existing working nodes — avoids dangling chain additions)
-    existing_names = set(working_nodes["NAME"].dropna().tolist())
+    existing_names = set(working_nodes["Name"].dropna().tolist())
     for _, seg in conn_segs.iterrows():
         other_name = (
-            seg["to_name"] if seg["from_name"] == node_name else seg["from_name"]
+            seg["To_Name"] if seg["From_Name"] == node_name else seg["From_Name"]
         )
         if other_name in existing_names:
             new_seg = seg.to_frame().T.reset_index(drop=True)
@@ -1891,7 +1963,7 @@ def build_stop_sequence_feeder(
     """
     sequences: Dict[Tuple[str, int, int], List[Dict]] = {}
 
-    group_cols = ["route_id", "direction_id", "variant_rank"]
+    group_cols = ["GTFS_ID", "direction_id", "variant_rank"]
     for key_vals, group in segments.groupby(group_cols):
         key = (str(key_vals[0]), int(key_vals[1]), int(key_vals[2]))
         stops: List[Dict] = []
@@ -1899,7 +1971,7 @@ def build_stop_sequence_feeder(
 
         for _, row in group.iterrows():
             for prefix in ("from", "to"):
-                sid = str(row.get(f"{prefix}_stop_id", "")).strip()
+                sid = str(row.get(f"{prefix}_stop_nr", "")).strip()
                 sname = str(row.get(f"{prefix}_stop_name", "")).strip()
                 E = float(row.get(f"{prefix}_stop_E", 0))
                 N = float(row.get(f"{prefix}_stop_N", 0))
@@ -1921,13 +1993,73 @@ def build_stop_sequence_feeder(
 # =============================================================================
 
 _NEW_COLS = [
-    "node_id_from", "node_id_to",
+    "node_id_from", "node_id_to",   # internal; dropped at file write via _OUTPUT_DROP
+    "from_code", "to_code",
     "match_method_from", "match_method_to",
-    "Via_Station", "Via_Junction",
+    "Via_Nodes", "Via_Segment",
+    "Via_Station", "Via_Junction",  # internal; dropped at file write via _OUTPUT_DROP
     "path_length_m", "needs_correction",
-    "path_nodes",
+    "path_nodes",                   # internal; dropped at file write via _OUTPUT_DROP
     "elec_mismatch",
 ]
+
+# Rename internal processing column names → final output column names.
+# Applied at every write to edges_in_corridor.gpkg so the file on disk
+# uses the agreed schema while rail_enriched keeps internal names for
+# downstream Phase 1.5 / correction processing.
+_OUTPUT_RENAME: Dict[str, str] = {
+    "Service":     "GTFS_ID",
+    "TrainType":   "Service",
+    "Direction":   "direction_id",
+    "FromCode":    "from_stop_nr",
+    "ToCode":      "to_stop_nr",
+    "FromStation": "from_stop_name",
+    "ToStation":   "to_stop_name",
+    "x_origin":    "from_stop_E",
+    "y_origin":    "from_stop_N",
+    "x_dest":      "to_stop_E",
+    "y_dest":      "to_stop_N",
+    "TravelTime":  "TT",
+    "InVehWait":   "IVWT",
+}
+
+# Columns that are internal-only and must not appear in the output file.
+_OUTPUT_DROP: List[str] = [
+    "node_id_from", "node_id_to", "line_short_name",
+    "Via_Station", "Via_Junction", "path_nodes",
+]
+
+
+def _make_via_cols(path_nodes_str: str) -> tuple:
+    """Derive Via_Nodes and Via_Segment from a semicolon-separated path string.
+
+    Args:
+        path_nodes_str: ';'-joined BAV Betriebspunkt_Nummer integers for every
+            node on the routed path including endpoints (as returned by
+            route_between_nodes). Empty string when no path is available.
+
+    Returns:
+        (via_nodes, via_segment) where:
+          via_nodes   — pipe-separated integers for intermediate nodes only
+          via_segment — pipe-separated 'FROM-TO' pairs for all consecutive node pairs
+    """
+    if not path_nodes_str:
+        return "", ""
+    path = [int(n) for n in path_nodes_str.split(";") if n.strip()]
+    via_nodes   = "|".join(str(n) for n in path[1:-1])
+    via_segment = "|".join(f"{a}-{b}" for a, b in zip(path[:-1], path[1:]))
+    return via_nodes, via_segment
+
+
+def _lookup_node_code(node_id, nodes: "gpd.GeoDataFrame") -> str:
+    """Return the BAV Code abbreviation for a node Number, or '' if not found."""
+    if node_id is None:
+        return ""
+    match = nodes[nodes["Number"] == node_id]
+    if match.empty:
+        return ""
+    code = match.iloc[0].get("Code", "")
+    return str(code) if pd.notna(code) else ""
 
 
 def _apply_enrichment(
@@ -2146,19 +2278,35 @@ def _apply_enrichment(
                 f"({from_name or from_id} → {to_name or to_id})"
             )
 
+    _via_nodes, _via_segment = _make_via_cols(path_nodes_str)
     enrichment = {
+        # Internal columns (kept for Phase 1.5 rerouting; dropped at file write)
         "node_id_from": node_id_from,
-        "node_id_to": node_id_to,
+        "node_id_to":   node_id_to,
         "match_method_from": match_from.method,
-        "match_method_to": match_to.method,
-        "Via_Station": via_st,
-        "Via_Junction": via_jn,
-        "path_length_m": path_len,
+        "match_method_to":   match_to.method,
+        # New derived columns
+        "from_code": _lookup_node_code(node_id_from, nodes),
+        "to_code":   _lookup_node_code(node_id_to,   nodes),
+        "Via_Nodes":    _via_nodes,
+        "Via_Segment":  _via_segment,
+        # Internal via/path columns kept for Phase 1.5; dropped at file write
+        "Via_Station":      via_st,
+        "Via_Junction":     via_jn,
+        "path_nodes":       path_nodes_str,
+        "path_length_m":    path_len,
         "needs_correction": needs_correction,
-        "path_nodes": path_nodes_str,
-        "elec_mismatch": elec_mismatch,
-        "geometry": geom,
+        "elec_mismatch":    elec_mismatch,
+        "geometry":         geom,
     }
+    # Also overwrite FromCode/ToCode with matched BAV Number so the final
+    # output (after _OUTPUT_RENAME: FromCode → from_stop_nr) carries the
+    # authoritative BAV Number rather than the original GTFS stop integer.
+    if node_id_from is not None:
+        enrichment["FromCode"] = node_id_from
+    if node_id_to is not None:
+        enrichment["ToCode"] = node_id_to
+
     return enrichment, nodes, bav_segments, G, seg_lookup, match_cache
 
 
@@ -2652,9 +2800,9 @@ def enrich_feeder_segments(
     for idx, row in segments.iterrows():
         enrichment, nodes, bav_segments, G, seg_lookup, match_cache = _apply_enrichment(
             idx,
-            str(row.get("from_stop_id", "")), str(row.get("from_stop_name", "")),
+            str(row.get("from_stop_nr", "")), str(row.get("from_stop_name", "")),
             float(row.get("from_stop_E", 0)), float(row.get("from_stop_N", 0)),
-            str(row.get("to_stop_id", "")), str(row.get("to_stop_name", "")),
+            str(row.get("to_stop_nr", "")), str(row.get("to_stop_name", "")),
             float(row.get("to_stop_E", 0)), float(row.get("to_stop_N", 0)),
             nodes, bav_segments, G, seg_lookup, node_attrs, lookups,
             buffer_geom, match_cache, raw_nodes, raw_segs, infra_version_dir,
@@ -3151,6 +3299,140 @@ def _run_phase0() -> Optional[Tuple[ProjectionConfig, str]]:
     return config, mode
 
 # =============================================================================
+# Spatial Output Helpers
+# =============================================================================
+
+def _load_polygon(path: Path):
+    """Load a geopackage boundary and return its unioned geometry, or None."""
+    try:
+        if path.exists():
+            gdf = gpd.read_file(path)
+            return gdf.geometry.union_all()
+    except Exception:
+        pass
+    return None
+
+
+def _classify_edges_spatial(
+    gdf: gpd.GeoDataFrame,
+    sa_poly,
+    ca_poly,
+) -> gpd.GeoDataFrame:
+    """Add _sa_from/_sa_to and _ca_from/_ca_to boolean columns.
+
+    Uses internal column names x_origin/y_origin/x_dest/y_dest (before _OUTPUT_RENAME).
+    When a boundary polygon is None (file absent), all edges are treated as inside.
+    """
+    from shapely.geometry import Point
+
+    def _flags(row, poly):
+        if poly is None:
+            return True, True
+        fp = Point(float(row.get("x_origin", 0) or 0), float(row.get("y_origin", 0) or 0))
+        tp = Point(float(row.get("x_dest",   0) or 0), float(row.get("y_dest",   0) or 0))
+        return fp.within(poly), tp.within(poly)
+
+    result = gdf.copy()
+    if result.empty:
+        for col in ("_sa_from", "_sa_to", "_ca_from", "_ca_to"):
+            result[col] = pd.Series(dtype=bool)
+        return result
+
+    sa_flags = [_flags(row, sa_poly) for _, row in result.iterrows()]
+    ca_flags = [_flags(row, ca_poly) for _, row in result.iterrows()]
+    result["_sa_from"], result["_sa_to"] = zip(*sa_flags)
+    result["_ca_from"], result["_ca_to"] = zip(*ca_flags)
+    return result
+
+
+def _write_spatial_outputs(
+    enriched: gpd.GeoDataFrame,
+    out_dir: Path,
+) -> None:
+    """Write five spatially-filtered geopackages and three QGIS .qgz projects.
+
+    Geopackages (written to out_dir/):
+      edges_all.gpkg          — all projected edges
+      edges_in_sa.gpkg        — both endpoints within study area boundary
+      edges_extended_sa.gpkg  — at least one endpoint within study area boundary
+      edges_in_ca.gpkg        — both endpoints within catchment area boundary
+      edges_extended_ca.gpkg  — at least one endpoint within catchment area boundary
+
+    QGIS projects (written to out_dir/qgis/):
+      edges_in_sa.qgz, edges_in_ca.qgz, edges_all.qgz
+
+    Gracefully degrades when boundary files are absent: all edges are written to
+    all outputs (no crash, informational print).
+    """
+    main = Path(paths.MAIN)
+    sa_poly = _load_polygon(main / paths.STUDY_AREA_BOUNDARY_GPKG)
+    ca_poly = _load_polygon(main / paths.CATCHMENT_AREA_BOUNDARY_GPKG)
+
+    if sa_poly is None:
+        print("  [spatial] Study area boundary absent — all edges included in SA outputs.")
+    if ca_poly is None:
+        print("  [spatial] Catchment area boundary absent — all edges included in CA outputs.")
+
+    gdf = _classify_edges_spatial(enriched, sa_poly, ca_poly)
+    _TEMP_COLS = ["_sa_from", "_sa_to", "_ca_from", "_ca_to"]
+
+    subsets: Dict[str, gpd.GeoDataFrame] = {
+        "edges_all":         gdf,
+        "edges_in_sa":       gdf[gdf["_sa_from"] & gdf["_sa_to"]],
+        "edges_extended_sa": gdf[gdf["_sa_from"] | gdf["_sa_to"]],
+        "edges_in_ca":       gdf[gdf["_ca_from"] & gdf["_ca_to"]],
+        "edges_extended_ca": gdf[gdf["_ca_from"] | gdf["_ca_to"]],
+    }
+
+    drop_all = _OUTPUT_DROP + _TEMP_COLS
+
+    # In correction mode the GDF is loaded from an already-renamed file, so
+    # _OUTPUT_RENAME must not be applied again (would duplicate column names).
+    already_output = "GTFS_ID" in enriched.columns
+    rename_map = {} if already_output else _OUTPUT_RENAME
+
+    for name, subset in subsets.items():
+        out_path = out_dir / f"{name}.gpkg"
+        if "_source_layer" in subset.columns:
+            for layer_name, layer_gdf in subset.groupby("_source_layer"):
+                (layer_gdf
+                 .drop(columns=["_source_layer"] + drop_all, errors="ignore")
+                 .rename(columns=rename_map)
+                 .to_file(out_path, driver="GPKG", layer=layer_name))
+        else:
+            (subset
+             .drop(columns=drop_all, errors="ignore")
+             .rename(columns=rename_map)
+             .to_file(out_path, driver="GPKG"))
+        print(f"  Written: {name}.gpkg ({len(subset)} edges)")
+
+    # ── QGIS .qgz projects ─────────────────────────────────────────────────────
+    for project_name, gpkg_name in [
+        ("edges_in_sa",  "edges_in_sa.gpkg"),
+        ("edges_in_ca",  "edges_in_ca.gpkg"),
+        ("edges_all",    "edges_all.gpkg"),
+    ]:
+        subset_gdf = subsets[project_name]
+
+        by_type: Dict[int, gpd.GeoDataFrame] = {}
+        if "_source_layer" in subset_gdf.columns:
+            for layer_name, layer_gdf in subset_gdf.groupby("_source_layer"):
+                rt = _LAYER_NAME_TO_RT.get(str(layer_name))
+                if rt is not None:
+                    by_type[rt] = layer_gdf.drop(columns=["_source_layer"], errors="ignore")
+        if not by_type:
+            by_type[100] = subset_gdf
+
+        gpkg_relpath = gpkg_name
+        layers_list = _collect_qgz_line_layers(
+            by_type, gpkg_relpath, _RAIL_LINE_TYPES, suffix="Segments"
+        )
+        qgz_path = out_dir / f"{project_name}.qgz"
+        _build_qgz(str(qgz_path), layers_list)
+        print(f"  Written: {project_name}.qgz ({len(layers_list)} layer(s))")
+
+
+# =============================================================================
 # Phase 1 — Projection Orchestrator
 # =============================================================================
 
@@ -3234,19 +3516,20 @@ def _run_phase1(
     rail_segments = pd.concat(rail_gdfs, ignore_index=True) if rail_gdfs else gpd.GeoDataFrame()
 
     col_mapping = {
-        'route_id': 'Service',
-        'direction_id': 'Direction',
-        'line_short_name': 'TrainType',
-        'from_stop_id': 'FromCode',
-        'to_stop_id': 'ToCode',
+        # New pre-projection names → internal processing names (unchanged)
+        'GTFS_ID':        'Service',      # route_id (GTFS identifier)
+        'Service':        'TrainType',    # line_short_name (human-readable)
+        'direction_id':   'Direction',
+        'from_stop_nr':   'FromCode',     # BAV parent station integer
+        'to_stop_nr':     'ToCode',
         'from_stop_name': 'FromStation',
-        'to_stop_name': 'ToStation',
-        'from_stop_E': 'x_origin',
-        'from_stop_N': 'y_origin',
-        'to_stop_E': 'x_dest',
-        'to_stop_N': 'y_dest',
-        'travel_time_min': 'TravelTime',
-        'InVehWait_min': 'InVehWait',
+        'to_stop_name':   'ToStation',
+        'from_stop_E':    'x_origin',
+        'from_stop_N':    'y_origin',
+        'to_stop_E':      'x_dest',
+        'to_stop_N':      'y_dest',
+        'TT':             'TravelTime',
+        'IVWT':           'InVehWait',
     }
     rail_edges = rail_segments.rename(columns=col_mapping)
     if 'TrainType' in rail_edges.columns:
@@ -3329,19 +3612,8 @@ def _run_phase1(
             processed = _apply_zvv_postpass(segs, layer_name, is_track_based=False)
             non_track_feeder_processed[layer_name] = processed
 
-    # 1j. Save enriched files
+    # 1j. Rail spatial outputs are written after Phase 1.5 completes (in main())
     print("\n  Saving enriched geopackages...")
-    rail_out = config.rail_output_dir / "edges_in_corridor.gpkg"
-    if "_source_layer" in rail_enriched.columns:
-        saved_layers = []
-        for layer_name, layer_gdf in rail_enriched.groupby("_source_layer"):
-            layer_gdf = layer_gdf.drop(columns=["_source_layer"])
-            layer_gdf.to_file(rail_out, driver="GPKG", layer=layer_name)
-            saved_layers.append(layer_name)
-        print(f"  Rail -> {rail_out}  (layers: {', '.join(saved_layers)})")
-    else:
-        rail_enriched.to_file(rail_out, driver="GPKG")
-        print(f"  Rail -> {rail_out}")
 
     feeder_segs_out = config.feeder_output_dir / "pt_feeder_segments.gpkg"
     for layer_name, enriched_gdf in track_feeder_enriched.items():
@@ -3582,7 +3854,7 @@ def _apply_boundary_rerouting(
             continue
 
         # Route between the two effective endpoints on the BAV graph
-        routed_geom, via_st, via_jn, path_len, _, _, _ = route_between_nodes(
+        routed_geom, via_st, via_jn, path_len, _, _, _pns = route_between_nodes(
             G, [route_from], [route_to], seg_lookup, node_attrs,
         )
         if routed_geom is None:
@@ -3615,10 +3887,14 @@ def _apply_boundary_rerouting(
             else (geom_parts[0] if geom_parts else routed_geom)
         )
 
-        rail_enriched.at[idx, "geometry"]      = combined
-        rail_enriched.at[idx, "Via_Station"]   = via_st
-        rail_enriched.at[idx, "Via_Junction"]  = via_jn
-        rail_enriched.at[idx, "path_length_m"] = path_len
+        _via_nodes, _via_segment = _make_via_cols(_pns)
+        rail_enriched.at[idx, "geometry"]         = combined
+        rail_enriched.at[idx, "Via_Station"]      = via_st
+        rail_enriched.at[idx, "Via_Junction"]     = via_jn
+        rail_enriched.at[idx, "path_nodes"]       = _pns
+        rail_enriched.at[idx, "Via_Nodes"]        = _via_nodes
+        rail_enriched.at[idx, "Via_Segment"]      = _via_segment
+        rail_enriched.at[idx, "path_length_m"]    = path_len
         rail_enriched.at[idx, "needs_correction"] = False
         updated += 1
 
@@ -3735,16 +4011,6 @@ def _run_phase1_5(
         rail_enriched, boundary_mapping, node_attrs, G, seg_lookup, buffer_geom,
     )
 
-    # ── e. Overwrite Phase-1 on-disk output with updated geometry ─────────────
-    rail_out = config.rail_output_dir / "edges_in_corridor.gpkg"
-    if "_source_layer" in rail_enriched.columns:
-        for layer_name, layer_gdf in rail_enriched.groupby("_source_layer"):
-            layer_gdf = layer_gdf.drop(columns=["_source_layer"])
-            layer_gdf.to_file(rail_out, driver="GPKG", layer=layer_name)
-    else:
-        rail_enriched.to_file(rail_out, driver="GPKG")
-    print(f"  Updated rail output saved → {rail_out}")
-
     print("\n  Phase 1.5 complete.")
     return rail_enriched
 
@@ -3760,15 +4026,15 @@ def _save_phase2_outputs(
     func_enriched: gpd.GeoDataFrame,
 ) -> None:
     """
-    Build two QGIS project files (.qgz) and two clipped segment geopackages.
+    Build the PT-Feeder QGIS project file (.qgz) and two clipped segment geopackages.
 
     Outputs (written next to the existing Phase-1 enriched files):
-      rail_output_dir/   rail_segments.qgz
       feeder_output_dir/ pt_feeder_segments.qgz
       feeder_output_dir/ projected_segments_study.gpkg
       feeder_output_dir/ projected_segments_catchment.gpkg
 
-    The rail QGZ contains enriched rail segments + rail stops.
+    Rail outputs (edges_all.gpkg, edges_in_sa.gpkg, etc. and their .qgz projects)
+    are written by _write_spatial_outputs() called from main() after Phase 1.5.
     The PT-Feeder QGZ contains enriched tram/funicular segments and, for bus/ship
     (modes not touched by projection), inherits geometry from the parent svc_version
     geopackage one directory level up.
@@ -3777,41 +4043,7 @@ def _save_phase2_outputs(
     main = Path(paths.MAIN)
     print("\n  Building QGIS projects and clipped segment geopackages...")
 
-    # ── 1. Rail QGZ ────────────────────────────────────────────────────────────
-    # Group enriched rail by source layer → {route_type_int: GeoDataFrame}
-    rail_by_type: Dict[int, gpd.GeoDataFrame] = {}
-    if "_source_layer" in rail_enriched.columns:
-        for layer_name, gdf in rail_enriched.groupby("_source_layer"):
-            rt = _LAYER_NAME_TO_RT.get(str(layer_name))
-            if rt is not None:
-                rail_by_type[rt] = gdf.drop(columns=["_source_layer"])
-    if not rail_by_type:
-        # Fallback when _source_layer was lost (e.g. correction-mode reload)
-        rail_by_type[100] = rail_enriched
-
-    # Rail stops — from svc_version output (one level above infra-versioned dir)
-    rail_stops_path = config.rail_output_dir.parent / "rail_stops.gpkg"
-    rail_stops_by_type: Dict[int, gpd.GeoDataFrame] = {}
-    if rail_stops_path.exists():
-        for lname in _fiona.listlayers(str(rail_stops_path)):
-            rt = _LAYER_NAME_TO_RT.get(lname)
-            if rt is not None:
-                rail_stops_by_type[rt] = gpd.read_file(str(rail_stops_path), layer=lname)
-
-    rail_layers_list = []
-    if rail_stops_by_type:
-        rail_layers_list += _collect_qgz_stop_layers(
-            rail_stops_by_type, "../rail_stops.gpkg", _RAIL_LINE_TYPES, is_rail=True
-        )
-    rail_layers_list += _collect_qgz_line_layers(
-        rail_by_type, "./edges_in_corridor.gpkg", _RAIL_LINE_TYPES, suffix="Segments"
-    )
-
-    rail_qgz = config.rail_output_dir / "rail_segments.qgz"
-    _build_qgz(str(rail_qgz), rail_layers_list)
-    print(f"  Rail QGZ → {rail_qgz}  ({len(rail_layers_list)} layer(s))")
-
-    # ── 2. PT-Feeder QGZ ───────────────────────────────────────────────────────
+    # ── PT-Feeder QGZ ──────────────────────────────────────────────────────────
     orig_seg_path   = config.feeder_output_dir / "pt_feeder_segments.gpkg"
     orig_stops_path = config.feeder_output_dir / "pt_feeder_stops.gpkg"
 
@@ -4044,10 +4276,15 @@ def _reroute_link(
 
     new_geom = linemerge(geoms) if geoms else enriched.at[link_idx, "geometry"]
 
-    enriched.at[link_idx, "geometry"] = new_geom
-    enriched.at[link_idx, "Via_Station"] = ";".join(via_st)
-    enriched.at[link_idx, "Via_Junction"] = ";".join(via_jn)
-    enriched.at[link_idx, "path_length_m"] = path_length
+    _pns_manual = ";".join(str(n) for n in path_nodes)
+    _via_nodes, _via_segment = _make_via_cols(_pns_manual)
+    enriched.at[link_idx, "geometry"]         = new_geom
+    enriched.at[link_idx, "Via_Station"]      = ";".join(via_st)
+    enriched.at[link_idx, "Via_Junction"]     = ";".join(via_jn)
+    enriched.at[link_idx, "path_nodes"]       = _pns_manual
+    enriched.at[link_idx, "Via_Nodes"]        = _via_nodes
+    enriched.at[link_idx, "Via_Segment"]      = _via_segment
+    enriched.at[link_idx, "path_length_m"]    = path_length
     enriched.at[link_idx, "needs_correction"] = False
 
     print(
@@ -4089,9 +4326,9 @@ def _run_phase2(
     mode_map = {
         "rail": ("rail", rail_enriched, "Service", "FromStation", "ToStation",
                  "match_method_from", "path_length_m"),
-        "tram": ("tram", tram_enriched, "route_id", "from_stop_name", "to_stop_name",
+        "tram": ("tram", tram_enriched, "GTFS_ID", "from_stop_name", "to_stop_name",
                  "match_method_from", "path_length_m"),
-        "funicular": ("funicular", func_enriched, "route_id", "from_stop_name",
+        "funicular": ("funicular", func_enriched, "GTFS_ID", "from_stop_name",
                       "to_stop_name", "match_method_from", "path_length_m"),
     }
 
@@ -4145,9 +4382,7 @@ def _run_phase2(
         # Update the mode map reference
         if mode_input == "rail":
             rail_enriched = enriched_df
-            rail_enriched.to_file(
-                config.rail_output_dir / "edges_in_corridor.gpkg", driver="GPKG"
-            )
+            _write_spatial_outputs(rail_enriched, config.rail_output_dir)
         elif mode_input == "tram":
             tram_enriched = enriched_df
             tram_enriched.to_file(
@@ -4203,7 +4438,7 @@ def _add_scale_bar(ax, location=(0.72, 0.04)):
         label = f'{val_km:.0f} km' if val_km == int(val_km) else f'{val_km:.1f} km'
         ax.text(x0 + i * cell_m, y0 + bar_h * 1.6, label, ha='center', va='bottom', fontsize=7, zorder=7)
 
-def _plot_service_overview(
+def _plot_gazette_style(
     config: ProjectionConfig,
     rail_enriched: gpd.GeoDataFrame,
     tram_enriched: gpd.GeoDataFrame,
@@ -4211,99 +4446,75 @@ def _plot_service_overview(
     boundary_gpkg: Path,
     boundary_name: str,
 ) -> None:
-    """
-    Produce one overview plot for the given boundary (study area or catchment area).
+    """Railway Gazette style plot.
+
+    For each service/direction within the boundary:
+    - Draws inside links in mode colour.
+    - Exiting links are clipped to the boundary; a stub continues beyond it
+      labelled "{Service} → {next stop outside}".
+    - Terminated services get a filled circle at the terminus plus the service
+      label placed alongside the last inside segment.
     """
     if not boundary_gpkg.exists():
-        print(f"  Skipping {boundary_name} plot — boundary file not found.")
+        print(f"  Skipping gazette plot ({boundary_name}) — boundary file not found.")
         return
 
     main = Path(paths.MAIN)
-    boundary_gdf = gpd.read_file(boundary_gpkg)
+    boundary_gdf  = gpd.read_file(boundary_gpkg)
     boundary_poly = boundary_gdf.geometry.union_all()
-    is_sa = boundary_name == "study_area"
-    extent = _extent_from_gdf(boundary_gdf, margin_m=2000)
+    is_sa         = boundary_name == "study_area"
+    extent        = _extent_from_gdf(boundary_gdf, margin_m=2000)
 
-    # Load infrastructure
+    # ── Infrastructure ────────────────────────────────────────────────────────
     bav_segs = gpd.read_file(config.infra_dir / "segments.gpkg")
     node_gdf = gpd.read_file(config.infra_dir / "nodes.gpkg")
 
-    # Collect train stations to filter unused infrastructure
-    train_stations = node_gdf
-    if 'node_class' in node_gdf.columns and 'transport_mode' in node_gdf.columns:
-        train_stations = node_gdf[(node_gdf['node_class'] == 'station') & (node_gdf['transport_mode'].astype(str).str.contains('train', case=False, na=False))]
-    elif 'node_class' in node_gdf.columns:
-        train_stations = node_gdf[node_gdf['node_class'] == 'station']
+    nc_col = 'Node_Class' if 'Node_Class' in node_gdf.columns else \
+             'node_class'  if 'node_class'  in node_gdf.columns else None
+    tm_col = 'Transport_Mode' if 'Transport_Mode' in node_gdf.columns else \
+             'transport_mode'  if 'transport_mode'  in node_gdf.columns else None
 
-    train_names = set(train_stations['NAME'].tolist())
-    if train_names:
-        bav_segs_filtered = bav_segs[bav_segs['from_name'].isin(train_names) | bav_segs['to_name'].isin(train_names)].dropna(subset=['from_name', 'to_name'])
+    if nc_col:
+        train_stations = node_gdf[node_gdf[nc_col] == 'station']
     else:
-        bav_segs_filtered = bav_segs
+        train_stations = node_gdf
 
-    # Load lakes
+    # Rail-only stations used for code labelling (excludes tram/funicular stops)
+    if nc_col and tm_col:
+        rail_stations = train_stations[
+            train_stations[tm_col].astype(str).str.contains('train', case=False, na=False)
+        ]
+    else:
+        rail_stations = train_stations
+
+    train_names = set(train_stations['Name'].tolist())
+    bav_segs_filtered = (
+        bav_segs[bav_segs['From_Name'].isin(train_names) | bav_segs['To_Name'].isin(train_names)]
+        .dropna(subset=['From_Name', 'To_Name'])
+        if train_names else bav_segs
+    )
+
     lakes_path = main / paths.LAKES_SHP
-    lakes_gdf = gpd.read_file(lakes_path) if lakes_path.exists() else None
+    lakes_gdf  = gpd.read_file(lakes_path) if lakes_path.exists() else None
 
-    # Collect all used segment geometries per mode
-    mode_segments = {
-        "rail": rail_enriched,
-        "tram": tram_enriched,
-        "funicular": func_enriched,
-    }
-    
-    # Pre-calculate final destinations per (service, direction) to be direction-aware
-    final_destinations = {}
-    for mode, enriched in mode_segments.items():
-        if mode == "rail":
-            for (service_id, direction), rows in enriched.groupby(['Service', 'Direction']):
-                if pd.isna(service_id): continue
-                final_destinations[(str(service_id), str(direction))] = str(rows.iloc[-1].get('ToStation', ''))
-        else:
-            for (route_id, direction_id), rows in enriched.groupby(['route_id', 'direction_id']):
-                if pd.isna(route_id): continue
-                final_destinations[(str(route_id), str(direction_id))] = str(rows.iloc[-1].get('to_stop_name', ''))
-
-    # Calculate terminus stations per (service, direction) using line_short_name as label
-    station_termini_texts = {}
-    for mode, enriched in mode_segments.items():
-        if mode == "rail":
-            group_cols = ['Service', 'Direction']
-            label_col, fallback_col, id_col = 'line_short_name', 'TrainType', 'Service'
-        else:
-            group_cols = ['route_id', 'direction_id']
-            label_col, fallback_col, id_col = 'line_short_name', 'route_id', 'route_id'
-
-        for key_vals, rows in enriched.groupby(group_cols):
-            if any(pd.isna(k) for k in key_vals):
-                continue
-            label = str(rows.iloc[0].get(label_col,
-                        rows.iloc[0].get(fallback_col,
-                        str(rows.iloc[0].get(id_col, '')))))
-            f_nodes = set(rows['node_id_from'].dropna().unique())
-            t_nodes = set(rows['node_id_to'].dropna().unique())
-            for t_node in t_nodes - f_nodes:
-                try:
-                    station_termini_texts.setdefault(int(t_node), set()).add(label)
-                except (ValueError, TypeError):
-                    pass
-
+    # ── Figure ────────────────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(16, 12))
     ax.set_aspect("equal")
     ax.set_xlabel('E [m]', fontsize=10)
     ax.set_ylabel('N [m]', fontsize=10)
     ax.grid(True, alpha=0.3)
+    boundary_gdf.plot(ax=ax, facecolor='none', edgecolor='black',
+                      linewidth=1.5, linestyle='--', alpha=0.6)
 
-    boundary_gdf.plot(ax=ax, facecolor='none', edgecolor='black', linewidth=1.5, linestyle='--', alpha=0.6)
-
+    # ── Lakes ─────────────────────────────────────────────────────────────────
     if lakes_gdf is not None:
         try:
             if is_sa and extent is not None:
-                from shapely.geometry import box as _sbox
-                clip_geom = gpd.GeoDataFrame(
-                    geometry=[_sbox(extent[0], extent[2], extent[1], extent[3])],
+                from shapely.geometry import box as _sbox_lk
+                clip_box = gpd.GeoDataFrame(
+                    geometry=[_sbox_lk(extent[0], extent[2], extent[1], extent[3])],
                     crs=SWISS_CRS)
-                lakes_clipped = gpd.clip(lakes_gdf, clip_geom)
+                lakes_clipped = gpd.clip(lakes_gdf, clip_box)
             else:
                 lakes_clipped = gpd.clip(lakes_gdf, boundary_gdf)
             if not lakes_clipped.empty:
@@ -4311,149 +4522,332 @@ def _plot_service_overview(
         except Exception:
             pass
 
-    # Plot infrastructure background — SA: ghost all within extent + solid inside boundary;
-    # CA: solid inside boundary only (mirrors infra builder show_outside/is_catchment logic)
+    # ── BAV infrastructure background ─────────────────────────────────────────
     if is_sa and extent is not None:
         from shapely.geometry import box as _sbox
         bbox_gdf = gpd.GeoDataFrame(
             geometry=[_sbox(extent[0], extent[2], extent[1], extent[3])],
             crs=bav_segs.crs if bav_segs.crs else SWISS_CRS)
-        if not bav_segs.empty:
-            try:
-                segs_extent = gpd.clip(bav_segs, bbox_gdf)
-                if not segs_extent.empty:
-                    segs_extent.plot(ax=ax, color="#d0d0d0", linewidth=0.4, alpha=0.40, zorder=1)
-            except Exception:
-                pass
-        if not bav_segs_filtered.empty:
-            try:
-                segs_inside = gpd.clip(bav_segs_filtered, boundary_gdf)
-                if not segs_inside.empty:
-                    segs_inside.plot(ax=ax, color="#d0d0d0", linewidth=0.5, alpha=1.0, zorder=2)
-            except Exception:
-                pass
+        try:
+            segs_extent = gpd.clip(bav_segs, bbox_gdf)
+            if not segs_extent.empty:
+                segs_extent.plot(ax=ax, color="#d0d0d0", linewidth=0.4, alpha=0.40, zorder=1)
+        except Exception:
+            pass
+        try:
+            segs_inside = gpd.clip(bav_segs_filtered, boundary_gdf)
+            if not segs_inside.empty:
+                segs_inside.plot(ax=ax, color="#d0d0d0", linewidth=0.5, alpha=1.0, zorder=2)
+        except Exception:
+            pass
     else:
-        if not bav_segs_filtered.empty:
-            try:
-                segs_inside = gpd.clip(bav_segs_filtered, boundary_gdf)
-                if not segs_inside.empty:
-                    segs_inside.plot(ax=ax, color="#d0d0d0", linewidth=0.4, zorder=1)
-            except Exception:
-                bav_segs_filtered.plot(ax=ax, color="#d0d0d0", linewidth=0.4, zorder=1)
+        try:
+            segs_inside = gpd.clip(bav_segs_filtered, boundary_gdf)
+            if not segs_inside.empty:
+                segs_inside.plot(ax=ax, color="#d0d0d0", linewidth=0.4, zorder=1)
+        except Exception:
+            pass
 
-    crossing_points = []
-    
-    for mode, enriched in mode_segments.items():
-        colour = MODE_COLOURS[mode]
-        for _, row in enriched.iterrows():
-            geom = row.geometry
-            if geom is None or geom.is_empty:
+    # ── Column schema per mode ────────────────────────────────────────────────
+    # Maps each mode to the column names used in its enriched GeoDataFrame.
+    _MC = {
+        "rail": dict(
+            gdf=rail_enriched,
+            group_cols=["TrainType", "Direction"],
+            label_col="TrainType",
+            from_name="FromStation", to_name="ToStation",
+            from_e="x_origin",      from_n="y_origin",
+            to_e="x_dest",          to_n="y_dest",
+            from_id="FromCode",     to_id="ToCode",
+        ),
+        "tram": dict(
+            gdf=tram_enriched,
+            group_cols=["Service", "direction_id"],
+            label_col="Service",
+            from_name="from_stop_name", to_name="to_stop_name",
+            from_e="from_stop_E",       from_n="from_stop_N",
+            to_e="to_stop_E",           to_n="to_stop_N",
+            from_id="from_stop_nr",     to_id="to_stop_nr",
+        ),
+        "funicular": dict(
+            gdf=func_enriched,
+            group_cols=["Service", "direction_id"],
+            label_col="Service",
+            from_name="from_stop_name", to_name="to_stop_name",
+            from_e="from_stop_E",       from_n="from_stop_N",
+            to_e="to_stop_E",           to_n="to_stop_N",
+            from_id="from_stop_nr",     to_id="to_stop_nr",
+        ),
+    }
+
+    # ── Stub length (mirrors _plot_service_overview) ──────────────────────────
+    if extent is not None:
+        _map_min = min(extent[1] - extent[0], extent[3] - extent[2])
+    else:
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        _map_min = min(xlim[1] - xlim[0], ylim[1] - ylim[0])
+    _preferred_stub = max(375, _map_min * 0.03)
+
+    # ── Per-service rendering ─────────────────────────────────────────────────
+    exit_labels:  Dict = {}   # (grid_key) → {pt, texts, colour, udx, udy}
+    terminus_pts: list = []   # [(x, y, colour, label, mode, seg_geom)]
+    terminus_bpnr: set = set()  # BAV Numbers of inside terminus stops (for station labelling)
+
+    for mode, mc in _MC.items():
+        gdf = mc["gdf"]
+        if gdf is None or gdf.empty:
+            continue
+
+        colour    = MODE_COLOURS[mode]
+        lw_solid  = 1.8 if mode == "rail" else 0.9
+        lw_fall   = 1.2 if mode == "rail" else 0.6
+
+        gc = mc["group_cols"]
+        valid_gc = [c for c in gc if c in gdf.columns]
+        if not valid_gc:
+            continue
+
+        for _, grp in gdf.groupby(valid_gc):
+            svc_label = str(grp.iloc[0].get(mc["label_col"], ""))
+            if not svc_label:
                 continue
-            is_fallback = bool(row.get("needs_correction", False))
-            line_colour = MODE_COLOURS["fallback"] if is_fallback else colour
-            linestyle = "--" if is_fallback else "-"
-            base_width = 1.2 if is_fallback else 1.8
-            linewidth = base_width * 0.5 if mode in ("tram", "funicular") else base_width
 
-            try:
-                clipped = geom.intersection(boundary_poly)
-            except Exception:
-                clipped = geom
+            # Identify terminus: to_id values that never appear as from_id
+            from_ids = set(grp[mc["from_id"]].dropna().astype(str))
+            to_ids   = set(grp[mc["to_id"]].dropna().astype(str))
+            terminus_ids     = to_ids - from_ids
+            last_inside_geom = None  # geometry of terminus-bound inside link
 
-            if clipped.is_empty:
-                continue
+            for _, row in grp.iterrows():
+                geom = row.geometry
+                if geom is None or geom.is_empty:
+                    continue
 
-            seg_gdf = gpd.GeoDataFrame({"geometry": [clipped]}, crs=SWISS_CRS)
-            seg_gdf.plot(ax=ax, color=line_colour, linewidth=linewidth, linestyle=linestyle, zorder=2)
+                is_fallback = bool(row.get("needs_correction", False))
+                line_colour = MODE_COLOURS["fallback"] if is_fallback else colour
+                lw          = lw_fall if is_fallback else lw_solid
 
-            if not geom.within(boundary_poly):
-                diff = geom.difference(boundary_poly)
-                if not diff.is_empty:
+                # Classify link by endpoint containment
+                try:
+                    fe = float(row.get(mc["from_e"], 0) or 0)
+                    fn_ = float(row.get(mc["from_n"], 0) or 0)
+                    te = float(row.get(mc["to_e"], 0) or 0)
+                    tn_ = float(row.get(mc["to_n"], 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                from_pt   = Point(fe, fn_)
+                to_pt     = Point(te, tn_)
+                from_in   = boundary_poly.contains(from_pt)
+                to_in     = boundary_poly.contains(to_pt)
+
+                if not from_in and not to_in:
+                    continue  # entirely outside — skip
+
+                # Clip geometry to boundary for drawing
+                try:
+                    clipped = geom.intersection(boundary_poly)
+                except Exception:
+                    clipped = geom
+                if clipped.is_empty:
+                    continue
+
+                seg_gdf = gpd.GeoDataFrame({"geometry": [clipped]}, crs=SWISS_CRS)
+                seg_gdf.plot(ax=ax, color=line_colour, linewidth=lw, zorder=3)
+
+                # Track the terminus-bound inside link for label placement
+                to_id_str = str(row.get(mc["to_id"], ""))
+                if to_id_str in terminus_ids and from_in:
+                    last_inside_geom = clipped
+
+                # Exiting link: from inside, to outside → stub + destination label
+                if from_in and not to_in:
+                    to_stop_name = str(row.get(mc["to_name"], "") or "")
+                    if not to_stop_name:
+                        continue
+                    label_text = f"{svc_label} → {to_stop_name}"
+
+                    # Find crossing point
                     try:
-                        cross_pt = boundary_poly.boundary.intersection(geom)
+                        cross = boundary_poly.boundary.intersection(geom)
                     except Exception:
-                        cross_pt = None
-                    if cross_pt is not None and not cross_pt.is_empty:
-                        cp = None
-                        if cross_pt.geom_type == "Point":
-                            cp = cross_pt
-                        elif hasattr(cross_pt, "geoms") and list(cross_pt.geoms):
-                            cp_geom = list(cross_pt.geoms)[0]
-                            cp = cp_geom if cp_geom.geom_type == "Point" else Point(cp_geom.coords[0])
-                        elif cross_pt.geom_type in ("LineString", "MultiLineString"):
-                            cp = Point(cross_pt.coords[0])
+                        continue
+                    cp = None
+                    if cross.is_empty:
+                        continue
+                    if cross.geom_type == "Point":
+                        cp = cross
+                    elif hasattr(cross, "geoms"):
+                        pts = [g for g in cross.geoms if g.geom_type == "Point"]
+                        if pts:
+                            cp = pts[0]
+                    if cp is None:
+                        continue
 
-                        if cp is not None and getattr(cp, "geom_type", "") == "Point":
-                            # Only record exiting crossings (first coord inside, last coord outside).
-                            # Use covers() so stations exactly on the boundary edge are treated as
-                            # inside rather than outside (contains() is strictly interior-only).
-                            try:
-                                if geom.geom_type == 'LineString':
-                                    coords = list(geom.coords)
-                                else:
-                                    coords = []
-                                    for _part in geom.geoms:
-                                        coords.extend(list(_part.coords))
-                                first_inside = boundary_poly.covers(Point(coords[0]))
-                                last_inside  = boundary_poly.covers(Point(coords[-1]))
-                                if first_inside and not last_inside:
-                                    starts_inside = True   # exiting
-                                elif not first_inside and last_inside:
-                                    starts_inside = False  # entering — skip
-                                else:
-                                    starts_inside = True   # passthrough or ambiguous — include
-                            except Exception:
-                                starts_inside = True
-                            if starts_inside:
-                                svc_text = str(row.get("line_short_name",
-                                               row.get("TrainType",
-                                               row.get("Service", ""))))
-                                _last = coords[-1]
-                                _dx = _last[0] - cp.x
-                                _dy = _last[1] - cp.y
-                                _d  = (_dx**2 + _dy**2)**0.5
-                                _udx, _udy = (_dx/_d, _dy/_d) if _d > 0 else (1.0, 0.0)
-                                crossing_points.append({"pt": cp, "text": svc_text, "colour": line_colour, "udx": _udx, "udy": _udy})
+                    # Direction vector: crossing point → outside endpoint
+                    dx, dy = te - cp.x, tn_ - cp.y
+                    d = (dx**2 + dy**2) ** 0.5
+                    if d < 1:
+                        continue
+                    udx, udy = dx / d, dy / d
 
-    # For SA: show all stations within the plot extent (ghost outside boundary);
-    # for CA: only show stations clipped to the boundary polygon.
-    if is_sa and extent is not None:
-        from shapely.geometry import box as _sbox
-        _ext_box = gpd.GeoDataFrame(
-            geometry=[_sbox(extent[0], extent[2], extent[1], extent[3])],
-            crs=train_stations.crs if train_stations.crs else SWISS_CRS)
-        train_gdf_clip = gpd.clip(train_stations, _ext_box)
+                    grid_key = (round(cp.x / 100) * 100, round(cp.y / 100) * 100)
+                    if grid_key not in exit_labels:
+                        exit_labels[grid_key] = {
+                            "pt": cp, "texts": [], "colour": line_colour,
+                            "udx": udx, "udy": udy,
+                        }
+                    exit_labels[grid_key]["texts"].append(label_text)
+
+            # Record terminus for filled-circle drawing
+            for _, row in grp.iterrows():
+                to_id_str = str(row.get(mc["to_id"], ""))
+                if to_id_str not in terminus_ids:
+                    continue
+                try:
+                    te  = float(row.get(mc["to_e"], 0) or 0)
+                    tn_ = float(row.get(mc["to_n"], 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if not boundary_poly.contains(Point(te, tn_)):
+                    continue
+                terminus_pts.append((te, tn_, colour, svc_label, mode, last_inside_geom))
+                try:
+                    terminus_bpnr.add(int(float(to_id_str)))
+                except (ValueError, TypeError):
+                    pass
+
+    # ── Exit stubs + labels ───────────────────────────────────────────────────
+    if extent is not None:
+        _xmin, _xmax, _ymin, _ymax = extent[0], extent[1], extent[2], extent[3]
     else:
-        train_gdf_clip = gpd.clip(train_stations, boundary_gdf)
+        _xmin, _xmax = ax.get_xlim(); _ymin, _ymax = ax.get_ylim()
 
+    for cp_info in exit_labels.values():
+        cp  = cp_info["pt"]
+        ux, uy = cp_info["udx"], cp_info["udy"]
+        _margins = []
+        if ux > 0  and _xmax > cp.x: _margins.append((_xmax - cp.x) / ux)
+        elif ux < 0 and _xmin < cp.x: _margins.append((_xmin - cp.x) / ux)
+        if uy > 0  and _ymax > cp.y: _margins.append((_ymax - cp.y) / uy)
+        elif uy < 0 and _ymin < cp.y: _margins.append((_ymin - cp.y) / uy)
+        avail    = min(_margins) * 0.90 if _margins else _preferred_stub
+        stub_len = min(_preferred_stub, max(100, avail))
+        stub_end = Point(cp.x + ux * stub_len, cp.y + uy * stub_len)
+
+        stub_gdf = gpd.GeoDataFrame(
+            {"geometry": [LineString([(cp.x, cp.y), (stub_end.x, stub_end.y)])]},
+            crs=SWISS_CRS)
+        stub_gdf.plot(ax=ax, color=cp_info["colour"], linewidth=1.0, linestyle="--", zorder=4)
+
+        ha = "right" if ux < 0 else ("center" if abs(ux) < abs(uy) else "left")
+        va = "top"   if uy < 0 else ("center" if abs(uy) < abs(ux) else "bottom")
+        ox = (-4 if ux < 0 else (0 if abs(ux) < abs(uy) else 4))
+        oy = (-4 if uy < 0 else (0 if abs(uy) < abs(ux) else 4))
+
+        sorted_texts = sorted(set(cp_info["texts"]))
+        ax.annotate(
+            "\n".join(sorted_texts),
+            xy=(stub_end.x, stub_end.y),
+            xytext=(ox, oy), textcoords="offset points",
+            fontsize=5, color="#333333", va=va, ha=ha,
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="grey", alpha=0.75),
+            zorder=6,
+        )
+
+    # ── Terminus circles + service labels ─────────────────────────────────────
+    seen_termini: set = set()
+    for (te, tn_, colour, svc_label, t_mode, seg_geom) in terminus_pts:
+        coord_key = (round(te / 50) * 50, round(tn_ / 50) * 50)
+        if coord_key in seen_termini:
+            continue
+        seen_termini.add(coord_key)
+
+        # Filled circle — feeder termini at 1/3 the size of rail
+        _t_ms = 6 if t_mode == "rail" else 2
+        ax.plot(te, tn_, marker='o', markersize=_t_ms, color=colour,
+                markeredgecolor='white', markeredgewidth=0.8, zorder=8)
+
+        # Service label alongside last inside segment — suppressed for funiculars
+        if t_mode == "funicular":
+            continue
+        if seg_geom is not None and not seg_geom.is_empty:
+            try:
+                coords = list(seg_geom.coords) if seg_geom.geom_type == "LineString" \
+                    else list(seg_geom.geoms[0].coords)
+                if len(coords) >= 2:
+                    frac  = 0.60
+                    idx_f = int(frac * (len(coords) - 1))
+                    lx = coords[idx_f][0]
+                    ly = coords[idx_f][1]
+                    p1 = coords[max(0, idx_f - 1)]
+                    p2 = coords[min(len(coords) - 1, idx_f + 1)]
+                    sdx, sdy = p2[0] - p1[0], p2[1] - p1[1]
+                    slen = (sdx**2 + sdy**2) ** 0.5
+                    if slen > 0:
+                        px, py = -sdy / slen, sdx / slen
+                        lx += px * 350
+                        ly += py * 350
+                    ax.annotate(
+                        svc_label,
+                        xy=(lx, ly),
+                        fontsize=5, fontweight='bold', color=colour,
+                        ha='center', va='center', zorder=8,
+                        bbox=dict(boxstyle='round,pad=0.15', fc='white',
+                                  ec='none', alpha=0.75),
+                    )
+            except Exception:
+                pass
+
+    # ── Train stations ────────────────────────────────────────────────────────
     train_gdf_inside = gpd.clip(train_stations, boundary_gdf)
-    inside_ids = set(train_gdf_inside.index.tolist()) if not train_gdf_inside.empty else set()
+    inside_idx       = set(train_gdf_inside.index) if not train_gdf_inside.empty else set()
+    rail_gdf_inside  = gpd.clip(rail_stations, boundary_gdf)
+    rail_inside_idx  = set(rail_gdf_inside.index) if not rail_gdf_inside.empty else set()
 
-    _ms = 20 if not is_sa else 30
-    if is_sa:
-        # Ghost pass — all nodes within extent at 40% opacity, then solid inside on top.
-        train_gdf_clip.plot(ax=ax, facecolor='white', edgecolor='black',
-                            markersize=_ms, marker='o', linewidth=0.8, alpha=0.40, zorder=5)
+    # Non-rail (tram/funicular) stations — smaller markers in CA (1/3 of rail size)
+    other_stations      = train_stations[~train_stations.index.isin(rail_stations.index)]
+    other_gdf_inside    = gpd.clip(other_stations, boundary_gdf) if not other_stations.empty else other_stations
+
+    _ms_rail   = 30 if is_sa else 20
+    _ms_feeder = 30 if is_sa else 7   # 1/3 of 20 for CA
+
+    if is_sa and extent is not None:
+        from shapely.geometry import box as _sbox2
+        ext_box = gpd.GeoDataFrame(
+            geometry=[_sbox2(extent[0], extent[2], extent[1], extent[3])],
+            crs=train_stations.crs if train_stations.crs else SWISS_CRS)
+        train_clip = gpd.clip(train_stations, ext_box)
+        # Ghost pass (all stations at same size) then solid pass (inside only)
+        train_clip.plot(ax=ax, facecolor='white', edgecolor='black',
+                        markersize=_ms_rail, marker='o', linewidth=0.8, alpha=0.40, zorder=5)
         train_gdf_inside.plot(ax=ax, facecolor='white', edgecolor='black',
-                              markersize=_ms, marker='o', linewidth=0.8, alpha=1.0, zorder=6)
+                              markersize=_ms_rail, marker='o', linewidth=0.8, zorder=6)
     else:
-        train_gdf_clip.plot(ax=ax, facecolor='white', edgecolor='black',
-                            markersize=_ms, marker='o', linewidth=0.8, alpha=1.0, zorder=5)
+        train_clip = train_gdf_inside
+        # Rail stations
+        rail_gdf_inside.plot(ax=ax, facecolor='white', edgecolor='black',
+                             markersize=_ms_rail, marker='o', linewidth=0.8, zorder=5)
+        # Feeder stations — smaller
+        if not other_gdf_inside.empty:
+            other_gdf_inside.plot(ax=ax, facecolor='white', edgecolor='black',
+                                  markersize=_ms_feeder, marker='o', linewidth=0.5, zorder=5)
 
-    for idx, row in train_gdf_clip.iterrows():
-        code = str(row.get("CODE", "")).strip()
-        bp_num = int(row.get("Betriebspunkt_Nummer", 0))
-        is_inside = idx in inside_ids
-        termini = sorted(station_termini_texts.get(bp_num, set()))
-
-        if not is_inside:
+    # Station code labels: rail stations only.
+    # SA → all inside rail stations; CA → only where a service terminates.
+    for idx, row in train_clip.iterrows():
+        if idx not in inside_idx or idx not in rail_inside_idx:
             continue
-
-        # SA: always show code; CA: only when a service terminates here.
-        if not (is_sa or termini):
+        code = str(row.get("Code", "")).strip()
+        if not code:
             continue
-
-        # Station code — bold, matching SA infrastructure plot style.
+        if not is_sa:
+            # CA: only label where a service terminates
+            try:
+                bpnr = int(float(row.get("Number", 0)))
+            except (TypeError, ValueError):
+                continue
+            if bpnr not in terminus_bpnr:
+                continue
         ax.annotate(
             code,
             xy=(row.geometry.x, row.geometry.y),
@@ -4463,99 +4857,41 @@ def _plot_service_overview(
                       edgecolor='none', alpha=0.7),
         )
 
-        # Terminating services — separate box below the station code.
-        if termini:
-            ax.annotate(
-                "  ".join(termini),
-                xy=(row.geometry.x, row.geometry.y),
-                xytext=(5, -10), textcoords="offset points",
-                fontsize=5, color="#333333", zorder=7, va="top",
-                bbox=dict(boxstyle='round,pad=0.2', facecolor='#f5f5f5',
-                          edgecolor='#cccccc', linewidth=0.4, alpha=0.85),
-            )
-
-    grouped_cps = {}
-    for cp_info in crossing_points:
-        cp = cp_info["pt"]
-        key = (round(cp.x / 100) * 100, round(cp.y / 100) * 100)
-        if key not in grouped_cps:
-            grouped_cps[key] = {"pt": cp, "texts": set(), "colour": cp_info["colour"],
-                                 "udx": cp_info["udx"], "udy": cp_info["udy"]}
-        grouped_cps[key]["texts"].add(cp_info["text"])
-
-    if extent is not None:
-        _xmin, _xmax, _ymin, _ymax = extent[0], extent[1], extent[2], extent[3]
-    else:
-        _xmin, _xmax = ax.get_xlim()
-        _ymin, _ymax = ax.get_ylim()
-    # Stub length: 3% of shorter map dimension, at least 375 m.
-    _map_min = min(_xmax - _xmin, _ymax - _ymin)
-    _preferred_stub = max(375, _map_min * 0.03)
-
-    for cp_info in list(grouped_cps.values()):
-        cp = cp_info["pt"]
-        ux = cp_info["udx"]
-        uy = cp_info["udy"]
-        # Cap stub so endpoint stays within the plot extent (90% of available space).
-        _margins = []
-        if ux > 0  and _xmax > cp.x:  _margins.append((_xmax - cp.x) / ux)
-        elif ux < 0 and _xmin < cp.x: _margins.append((_xmin - cp.x) / ux)
-        if uy > 0  and _ymax > cp.y:  _margins.append((_ymax - cp.y) / uy)
-        elif uy < 0 and _ymin < cp.y: _margins.append((_ymin - cp.y) / uy)
-        _avail = min(_margins) * 0.90 if _margins else _preferred_stub
-        stub_len = min(_preferred_stub, max(100, _avail))
-        stub_end = Point(cp.x + ux * stub_len, cp.y + uy * stub_len)
-
-        if abs(ux) >= abs(uy):
-            ha     = "right" if ux < 0 else "left"
-            va     = "center"
-            offset = (-4, 0) if ux < 0 else (4, 0)
-        else:
-            ha     = "center"
-            va     = "top" if uy < 0 else "bottom"
-            offset = (0, -4) if uy < 0 else (0, 4)
-
-        stub_line = LineString([(cp.x, cp.y), (stub_end.x, stub_end.y)])
-        stub_gdf = gpd.GeoDataFrame({"geometry": [stub_line]}, crs=SWISS_CRS)
-        stub_gdf.plot(ax=ax, color=cp_info["colour"], linewidth=1.0, linestyle="--", zorder=3)
-
-        sorted_texts = sorted(list(cp_info["texts"]))
-        table_text = "\n".join(sorted_texts)
-
-        ax.annotate(
-            table_text,
-            xy=(stub_end.x, stub_end.y),
-            xytext=offset, textcoords="offset points",
-            fontsize=4, color="#333333", va=va, ha=ha,
-            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="grey", alpha=0.7), zorder=5
-        )
-
+    # ── Legend ────────────────────────────────────────────────────────────────
     legend_handles = [
-        Line2D([0], [0], color=MODE_COLOURS["rail"], linewidth=2, label="Rail"),
-        Line2D([0], [0], color=MODE_COLOURS["tram"], linewidth=2, label="Tram"),
-        Line2D([0], [0], color=MODE_COLOURS["funicular"], linewidth=2, label="Funicular"),
-        Line2D([0], [0], color=MODE_COLOURS["fallback"], linewidth=1.5, linestyle="--", label="Straight-line"),
+        Line2D([0], [0], color=MODE_COLOURS["rail"],     linewidth=2, label="Rail"),
+        Line2D([0], [0], color=MODE_COLOURS["tram"],     linewidth=2, label="Tram"),
+        Line2D([0], [0], color=MODE_COLOURS["funicular"],linewidth=2, label="Funicular"),
+        Line2D([0], [0], color=MODE_COLOURS["fallback"],  linewidth=1.5, linestyle="--",
+               label="Straight-line"),
         Line2D([0], [0], color="#d0d0d0", linewidth=1.5, label="Unused infrastructure"),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#1f3a6e',
+               markersize=6, label="Terminus"),
     ]
     ax.legend(handles=legend_handles, loc="upper right", fontsize=7)
 
-    ax.set_title(f"Service Projection — {config.svc_version} on {config.infra_version}\nBoundary: {boundary_name}", fontsize=14, fontweight='bold')
-
+    ax.set_title(
+        f"Service Projection — {config.svc_version} on {config.infra_version}"
+        f"\nBoundary: {boundary_name}",
+        fontsize=14, fontweight='bold',
+    )
     if extent is not None:
         ax.set_xlim(extent[0], extent[1])
         ax.set_ylim(extent[2], extent[3])
-        
+
     _add_north_arrow(ax, location='upper left', scale=0.5)
     _add_scale_bar(ax, location=(0.755, 0.012))
     plt.tight_layout()
 
-    out_dir = main / paths.NETWORK_PLOTS_DIR / "Rail_Lines" / config.svc_version / config.infra_version
+    out_dir = (main / paths.NETWORK_PLOTS_DIR / "Rail_Lines"
+               / config.svc_version / config.infra_version)
     out_dir.mkdir(parents=True, exist_ok=True)
-    fname = f"{config.svc_version}_{config.infra_version}_{boundary_name.replace(' ', '_')}.pdf"
+    fname    = f"{config.svc_version}_{config.infra_version}_{boundary_name}.pdf"
     out_path = out_dir / fname
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     print(f"  Plot saved → {out_path}")
+
 
 def _run_phase3(
     config: ProjectionConfig,
@@ -4569,18 +4905,18 @@ def _run_phase3(
     print("─" * 60)
 
     main = Path(paths.MAIN)
-    
+
     # Check Catchment_Area folder first for study_area_boundary (per user paths)
     study_area_boundary = main / paths.CATCHMENT_AREA_DIR / "study_area_boundary.gpkg"
     if not study_area_boundary.exists():
         study_area_boundary = main / paths.STUDY_AREA_BOUNDARY_GPKG
-        
+
     for boundary_path, label in [
         (study_area_boundary, "study_area"),
         (main / paths.CATCHMENT_AREA_BOUNDARY_GPKG, "catchment_area"),
     ]:
         print(f"\n  Plotting {label}...")
-        _plot_service_overview(
+        _plot_gazette_style(
             config, rail_enriched, tram_enriched, func_enriched,
             boundary_path, label,
         )
@@ -4605,9 +4941,11 @@ def main() -> None:
     if mode == "map":
         rail_enriched, tram_enriched, func_enriched = _run_phase1(config)
         rail_enriched = _run_phase1_5(config, rail_enriched)
+        print("\n  Writing spatial filter outputs...")
+        _write_spatial_outputs(rail_enriched, config.rail_output_dir)
     else:
         # Load existing projection for correction
-        rail_out = config.rail_output_dir / "edges_in_corridor.gpkg"
+        rail_out = config.rail_output_dir / "edges_all.gpkg"
         feeder_out = config.feeder_output_dir / "pt_feeder_segments.gpkg"
         if not rail_out.exists() or not feeder_out.exists():
             print(f"\n  ERROR: Projected files not found in {config.rail_output_dir}.")
@@ -4632,6 +4970,8 @@ def main() -> None:
             f"{len(func_enriched)} funicular segments."
         )
         rail_enriched = _run_phase1_5(config, rail_enriched)
+        print("\n  Writing spatial filter outputs...")
+        _write_spatial_outputs(rail_enriched, config.rail_output_dir)
 
     rail_enriched, tram_enriched, func_enriched = _run_phase2(
         config, rail_enriched, tram_enriched, func_enriched
