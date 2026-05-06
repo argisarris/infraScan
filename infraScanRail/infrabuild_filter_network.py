@@ -21,7 +21,6 @@ All data in EPSG:2056 (Swiss LV95).
 
 import geopandas as gpd
 import pandas as pd
-import numpy as np
 import requests
 from pathlib import Path
 from typing import Dict, Tuple, Optional
@@ -774,11 +773,15 @@ def add_track_count(
             node_max_tracks[nid] = max(node_max_tracks.get(nid, 0), int(row.Num_Tracks))
 
     def _track_count(row):
-        if row.get('Node_Class') not in ('station', 'assigned_service_point'):
-            return pd.NA
-        seg_tracks  = node_max_tracks.get(row['Node_ID'], 0)
-        plat_tracks = int(row['Platform_Count']) if pd.notna(row.get('Platform_Count')) else 0
-        return max(seg_tracks, plat_tracks)
+        nc = row.get('Node_Class')
+        if nc in ('station', 'assigned_service_point'):
+            seg_tracks  = node_max_tracks.get(row['Node_ID'], 0)
+            plat_tracks = int(row['Platform_Count']) if pd.notna(row.get('Platform_Count')) else 0
+            return max(seg_tracks, plat_tracks)
+        if nc == 'junction':
+            v = node_max_tracks.get(row['Node_ID'])
+            return v if v is not None else pd.NA
+        return pd.NA
 
     nodes['Track_Count'] = nodes.apply(_track_count, axis=1)
 
@@ -786,8 +789,13 @@ def add_track_count(
     nodes['Platform_Count'] = nodes['Platform_Count'].astype('Int64')
     nodes['Track_Count']    = nodes['Track_Count'].astype('Int64')
 
-    n_tracks = nodes['Track_Count'].notna().sum()
-    print(f"  Track_Count set for {n_tracks} station nodes")
+    n_tracks   = nodes['Track_Count'].notna().sum()
+    n_junctions = int((nodes['Node_Class'] == 'junction').sum())
+    n_jct_tracks = int(
+        nodes.loc[nodes['Node_Class'] == 'junction', 'Track_Count'].notna().sum()
+    )
+    print(f"  Track_Count set for {n_tracks} nodes "
+          f"(stations + {n_jct_tracks}/{n_junctions} junctions)")
     return nodes
 
 
@@ -1346,6 +1354,25 @@ def run_filter_network(
         if col in nodes.columns:
             nodes[col] = nodes[col].round(3)
 
+    # ---- Round Piece_Length; reconcile last piece per segment so pieces
+    #      sum exactly to the segment's rounded Length ----------------------
+    if not composition.empty and 'Piece_Length' in composition.columns:
+        composition = composition.copy()
+        composition['Piece_Length'] = composition['Piece_Length'].round(3)
+        seg_length_map = segments.set_index('Segment_ID')['Length'].to_dict()
+        for seg_id, grp_idx in composition.groupby('Segment_ID').groups.items():
+            target = seg_length_map.get(seg_id)
+            if target is None:
+                continue
+            grp_list = list(grp_idx)
+            current_sum = round(float(composition.loc[grp_list, 'Piece_Length'].sum()), 3)
+            delta = round(target - current_sum, 3)
+            if abs(delta) >= 0.001:
+                last = grp_list[-1]
+                new_len = round(float(composition.at[last, 'Piece_Length']) + delta, 3)
+                if new_len > 0:
+                    composition.at[last, 'Piece_Length'] = new_len
+
     # ---- Enforce canonical column order for Raw outputs --------------------
     _RAW_SEG_COL_ORDER = [
         "Segment_ID", "From_Name", "To_Name", "Number", "Code",
@@ -1410,6 +1437,31 @@ def run_filter_network(
 # Entry Point
 # =============================================================================
 
+def _configure_output_folder() -> str:
+    """Prompt for the Raw output folder name under data/Infrastructure/.
+
+    Returns a folder name starting with 'Raw' (e.g. 'Raw', 'Raw_ZH').
+    The network builder discovers all Raw-prefixed folders automatically.
+    """
+    infra_dir = Path(paths.MAIN) / paths.NETWORK_INFRASTRUCTURE_DIR
+    existing = sorted([
+        d.name for d in infra_dir.iterdir()
+        if d.is_dir() and d.name.startswith('Raw')
+    ]) if infra_dir.exists() else []
+
+    print("\n" + "─" * 60)
+    print("Output folder configuration")
+    print("─" * 60)
+    print(f"  Output base : data/Infrastructure/")
+    if existing:
+        print("  Existing Raw folders:")
+        for name in existing:
+            print(f"    {name}")
+    print("\n  Folder will be named 'Raw' or 'Raw_<suffix>'")
+    _suffix = input("  Suffix (empty = 'Raw', e.g. 'ZH' → 'Raw_ZH') []: ").strip()
+    return f"Raw_{_suffix}" if _suffix else "Raw"
+
+
 if __name__ == "__main__":
     import os
     os.chdir(paths.MAIN)
@@ -1418,22 +1470,27 @@ if __name__ == "__main__":
     print("infraScanRail — Filter Infrastructure Network")
     print("=" * 60)
     print("Loads BAV railway geopackages, cleans and enriches the data,")
-    print("filters to the catchment area, and exports to Raw/.")
-    print("\nOutputs: data/Infrastructure/Raw/nodes.gpkg")
-    print("         data/Infrastructure/Raw/segments.gpkg")
-    print("         data/Infrastructure/Raw/segments_composition.gpkg")
+    print("filters to the catchment area, and exports to Raw*/.")
 
-    raw_path = Path(paths.MAIN) / paths.NETWORK_INFRASTRUCTURE_RAW
-    raw_ready = (
-        (raw_path / "nodes.gpkg").exists() and
-        (raw_path / "segments.gpkg").exists()
+    _raw_folder = _configure_output_folder()
+    _raw_path   = Path(paths.MAIN) / paths.NETWORK_INFRASTRUCTURE_DIR / _raw_folder
+
+    print(f"\nOutputs: data/Infrastructure/{_raw_folder}/nodes.gpkg")
+    print(f"         data/Infrastructure/{_raw_folder}/segments.gpkg")
+    print(f"         data/Infrastructure/{_raw_folder}/segments_composition.gpkg")
+
+    _raw_ready = (
+        (_raw_path / "nodes.gpkg").exists() and
+        (_raw_path / "segments.gpkg").exists()
     )
 
-    if raw_ready:
-        print("\n   Raw/ already exists.")
-        ans = input("   Re-run the filter and overwrite Raw/? (y/n) [n]: ").strip().lower() or "n"
-        if ans != 'y':
+    if _raw_ready:
+        print(f"\n   {_raw_folder}/ already exists.")
+        _ans = input(
+            f"   Re-run the filter and overwrite {_raw_folder}/? (y/n) [n]: "
+        ).strip().lower() or "n"
+        if _ans != 'y':
             print("   Nothing to do. Exiting.")
             raise SystemExit(0)
 
-    run_filter_network()
+    run_filter_network(output_dir=str(_raw_path))
