@@ -36,22 +36,90 @@ import paths
 SWISS_CRS = "EPSG:2056"
 MERGE_ATTRS = ('Num_Tracks', 'Gauge', 'Electrification_Class')
 
-GAUGE_OPTIONS = {
-    '1': 1435, '2': 1000, '3': 900, '4': 800, '5': 750, '6': 600,
-}
+GAUGE_OPTIONS           = ['1435', '1000']
+ELECTRIFICATION_OPTIONS = ['AC_16.7Hz', 'DC', 'non_electrified']
+NODE_CLASS_OPTIONS      = ['station', 'junction', 'abandoned_station']
+CONSTRUCT_TYPE_OPTIONS  = ['bridge', 'normal', 'tunnel']
+SPEED_SOURCE_OPTIONS    = ['OSM', 'GTFS', 'infra']
+TRACK_MODE_OPTIONS      = ['train', 'tram', 'cog_railway', 'train / tram']
+_EDGE_LEVEL_BY_CT       = {'bridge': ['2', '3'], 'normal': ['1'], 'tunnel': ['-1', '-2']}
 
-ELECTRIFICATION_OPTIONS = {
-    '1': 'AC 15kV 16.7Hz', '2': 'DC 1500V',  '3': 'DC 1000V',
-    '4': 'DC 750V',        '5': 'DC 600V',   '6': 'nicht elektrifiziert',
-}
 
-NODE_CLASS_OPTIONS = {
-    '1': 'station', '2': 'junction', '3': 'abandoned_station',
-}
+# =============================================================================
+# Prompt helpers
+# =============================================================================
 
-CONSTRUCT_TYPE_OPTIONS = {
-    '1': 'bridge', '2': 'normal', '3': 'tunnel',
-}
+def _prompt_enum(
+    label: str,
+    options: List[str],
+    current: Optional[str] = None,
+    required: bool = False,
+    allow_other: bool = True,
+) -> Optional[str]:
+    """Single-question enum prompt. Enter keeps current or skips (add mode)."""
+    cur_str = f'  (current: {current})' if current is not None else ''
+    print(f'\n  {label}{cur_str}:')
+    for i, opt in enumerate(options, 1):
+        print(f'    {i}) {opt}')
+    other_n = len(options) + 1
+    if allow_other:
+        print(f'    {other_n}) other')
+    max_n = other_n if allow_other else len(options)
+    enter_hint = 'keep' if current is not None else ('required' if required else 'skip')
+    prompt = f'  Select (1–{max_n}' + (f', Enter to {enter_hint}' if not required else '') + '): '
+
+    while True:
+        raw = input(prompt).strip()
+        if not raw:
+            if required:
+                print('  This field is required.')
+                continue
+            return current
+        if raw.isdigit():
+            n = int(raw)
+            if 1 <= n <= len(options):
+                return options[n - 1]
+            if allow_other and n == other_n:
+                val = input('  Enter value: ').strip()
+                return val if val else current
+        print(f'  Enter 1–{max_n}.')
+
+
+def _prompt_text(
+    label: str,
+    example: str = '',
+    current: Optional[str] = None,
+    required: bool = False,
+    cast=None,
+) -> Optional[object]:
+    """Single-question free-text / numeric prompt. Enter keeps current or skips."""
+    if current is not None:
+        hint = f' (current: {current}, Enter to keep)'
+    elif example:
+        hint = f' (e.g. {example}, Enter to skip)'
+    else:
+        hint = ' (Enter to skip)'
+    prompt = f'\n  {label}{hint}: '
+
+    while True:
+        raw = input(prompt).strip()
+        if not raw:
+            if required:
+                print('  This field is required.')
+                continue
+            return current
+        if cast is not None:
+            try:
+                return cast(raw)
+            except (ValueError, TypeError):
+                print(f'  Expected {cast.__name__}. Try again.')
+                continue
+        return raw
+
+
+def _owner_options(segments: gpd.GeoDataFrame) -> List[str]:
+    """Return sorted unique Route_Owner values present in the loaded segments."""
+    return sorted(segments['Route_Owner'].dropna().astype(str).unique().tolist())
 
 
 def _prompt_composition_pieces(
@@ -65,9 +133,7 @@ def _prompt_composition_pieces(
     Interactively collect one or more composition pieces for a segment and
     return a GeoDataFrame of those pieces (NOT appended to composition yet).
     """
-    ct_options = CONSTRUCT_TYPE_OPTIONS
-
-    print(f"\n  Segment length: {seg_len:.0f} m")
+    print(f"\n  Segment length: {seg_len:.0f} m — all pieces must sum to this.")
     while True:
         multi_raw = input("  Multiple composition pieces? (y/n) [n]: ").strip().lower() or 'n'
         if multi_raw in ('y', 'n'):
@@ -79,11 +145,12 @@ def _prompt_composition_pieces(
     remaining = seg_len
 
     while True:
-        print(f"\n  Construct type (remaining: {remaining:.0f} m):")
-        for k, v in ct_options.items():
-            print(f"    {k}) {v}")
-        raw = input("  Select number or type custom value: ").strip()
-        ct = ct_options.get(raw, raw) if raw else 'normal'
+        ct = _prompt_enum(
+            f'Construct type (remaining: {remaining:.0f} m)',
+            CONSTRUCT_TYPE_OPTIONS,
+            required=True,
+            allow_other=False,
+        )
 
         if multi:
             try:
@@ -94,27 +161,23 @@ def _prompt_composition_pieces(
         else:
             pl = seg_len
 
-        el_raw = input("  Edge level [1]: ").strip() or '1'
-        try:
-            el = int(el_raw)
-        except ValueError:
-            el = 1
+        el_opts = _EDGE_LEVEL_BY_CT.get(ct, ['1'])
+        el_raw = _prompt_enum('Edge level', el_opts, current=el_opts[0], allow_other=False)
+        el = int(el_raw) if el_raw is not None else int(el_opts[0])
 
-        uc_raw = input("  Under construction (0/1) [0]: ").strip() or '0'
-        uc = 1 if uc_raw == '1' else 0
-
-        tc_raw = input("  Track config (Enter for none): ").strip()
-        rt_raw = input("  Railway type  (Enter for none): ").strip()
+        uc_raw = _prompt_enum('Under construction', ['0 — no', '1 — yes'],
+                              current='0 — no', allow_other=False)
+        uc = 1 if uc_raw and uc_raw.startswith('1') else 0
 
         pieces.append({
-            'Segment_ID':                   seg_id,
-            'From_Name':            from_name,
-            'To_Name':              to_name,
+            'Segment_ID':            seg_id,
+            'From_Name':             from_name,
+            'To_Name':               to_name,
             'Engineering_Structure': ct,
-            'Edge_Level':           el,
-            'Under_Construction':   uc,
-            'Piece_Length':         pl,
-            'geometry':             seg_geom,
+            'Edge_Level':            el,
+            'Under_Construction':    uc,
+            'Piece_Length':          pl,
+            'geometry':              seg_geom,
         })
         remaining -= pl
         print(f"  Piece added: {ct}  {pl:.0f} m.")
@@ -128,6 +191,20 @@ def _prompt_composition_pieces(
         if add_more != 'y':
             break
 
+    # Budget guard
+    total = sum(p['Piece_Length'] for p in pieces)
+    if pieces and abs(total - seg_len) > 0.5:
+        print(f"  WARNING: pieces sum to {total:.0f} m but segment length is {seg_len:.0f} m "
+              f"(delta = {total - seg_len:+.0f} m).")
+        adj = input("  Auto-adjust last piece to close the gap? (y/n) [y]: ").strip().lower() or 'y'
+        if adj == 'y':
+            corrected = seg_len - (total - pieces[-1]['Piece_Length'])
+            if corrected > 0:
+                pieces[-1]['Piece_Length'] = corrected
+                print(f"  Last piece adjusted to {corrected:.0f} m.")
+            else:
+                print("  Gap correction would produce a non-positive piece. Keeping as-is.")
+
     return gpd.GeoDataFrame(pieces, crs=SWISS_CRS)
 
 
@@ -136,7 +213,7 @@ def _prompt_composition_pieces(
 # =============================================================================
 
 def list_versions(infra_dir: Optional[str] = None) -> List[str]:
-    """Return selectable version names (excludes Raw/)."""
+    """Return selectable version names (excludes Raw* folders)."""
     root = Path(infra_dir or (Path(paths.MAIN) / paths.NETWORK_INFRASTRUCTURE_DIR))
     if not root.exists():
         return []
@@ -144,13 +221,14 @@ def list_versions(infra_dir: Optional[str] = None) -> List[str]:
     for sub in sorted(root.iterdir()):
         if not sub.is_dir():
             continue
-        if sub.name == 'Raw':
+        if sub.name.startswith('Raw'):
             continue
         if (sub / 'nodes.gpkg').exists() and (sub / 'segments.gpkg').exists():
             versions.append(sub.name)
-    if 'Base' in versions:
-        versions = ['Base'] + [v for v in versions if v != 'Base']
-    return versions
+    base_versions  = ['Base'] if 'Base' in versions else []
+    base_versions += sorted([v for v in versions if v.startswith('Base') and v != 'Base'])
+    other_versions = [v for v in versions if not v.startswith('Base')]
+    return base_versions + other_versions
 
 
 # =============================================================================
@@ -210,15 +288,17 @@ def _run_phase0() -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame,
     """
     infra_root = Path(paths.MAIN) / paths.NETWORK_INFRASTRUCTURE_DIR
 
-    # Prerequisite: Base version must exist with all three geopackages
-    base_dir = infra_root / 'Base'
+    # Prerequisite: at least one Base* folder with all three geopackages must exist
     required = ['nodes.gpkg', 'segments.gpkg', 'segments_composition.gpkg']
-    missing  = [f for f in required if not (base_dir / f).exists()]
-    if missing:
-        print("\n  ERROR: Base version is incomplete or missing.")
-        print(f"  Expected at: {base_dir}")
-        for f in missing:
-            print(f"    missing: {f}")
+    base_dirs = sorted([
+        d for d in infra_root.iterdir()
+        if d.is_dir() and d.name.startswith('Base')
+        and all((d / f).exists() for f in required)
+    ]) if infra_root.exists() else []
+    if not base_dirs:
+        print("\n  ERROR: No complete Base version found.")
+        print(f"  Expected a folder starting with 'Base' under: {infra_root}")
+        print(f"  Each must contain: {', '.join(required)}")
         print("  Run infrabuild_network_builder.py to build Base first.")
         raise SystemExit(1)
 
@@ -255,8 +335,8 @@ def _run_phase0() -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame,
             if not name:
                 print("  Name cannot be empty.")
                 continue
-            if name in ('Raw', 'Base'):
-                print(f"  '{name}' is a reserved name. Choose another.")
+            if name.startswith('Raw') or name.startswith('Base'):
+                print(f"  '{name}' starts with a reserved prefix (Raw/Base). Choose another.")
                 continue
             out_dir = infra_root / name
             if out_dir.exists() and (out_dir / 'nodes.gpkg').exists():
@@ -289,6 +369,8 @@ def _run_phase0() -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame,
     nodes       = gpd.read_file(out_dir / 'nodes.gpkg').reset_index(drop=True)
     segments    = gpd.read_file(out_dir / 'segments.gpkg').reset_index(drop=True)
     composition = gpd.read_file(out_dir / 'segments_composition.gpkg').reset_index(drop=True)
+    if 'speed_source' not in segments.columns:
+        segments['speed_source'] = 'OSM'
     print(f"  {len(nodes)} nodes, {len(segments)} segments, "
           f"{len(composition)} composition pieces loaded.")
 
@@ -300,7 +382,11 @@ def _run_phase0() -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame,
 # =============================================================================
 
 def _adjust_node(nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Inline CSV-style editing of a single node's attributes."""
+    """Inline editing of a single node's mutable attributes.
+
+    Read-only (identity): Name, Code, E, N.
+    Editable: Node_Class, Transport_Mode, Platform_Count, Track_Count, Parent_Node.
+    """
     term = input("  Search node (CODE or partial NAME): ").strip()
     if not term:
         return nodes
@@ -317,40 +403,37 @@ def _adjust_node(nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     row_idx = hits.index[idx]
     row = nodes.loc[row_idx]
 
-    COLS = ['Name', 'Code', 'E', 'N', 'Node_Class', 'Transport_Mode', 'Platform_Count']
-    header  = ", ".join(COLS)
-    current = ", ".join(str(row.get(c, '')) for c in COLS)
-    print(f"\n  {header}")
-    print(f"  {current}")
-    updated = input("  Enter updated values (same order; press Enter to keep): ").strip()
-    if not updated:
-        return nodes
+    print(f"\n  Node: {row.get('Name', '')}  [{row.get('Code', '')}]"
+          f"  E={row.get('E', '')}  N={row.get('N', '')}  [read-only]")
 
-    parts = [p.strip() for p in updated.split(',')]
-    if len(parts) != len(COLS):
-        print(f"  Expected {len(COLS)} values, got {len(parts)}. No changes made.")
-        return nodes
+    def _cur(col):
+        v = row.get(col)
+        return None if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)
 
-    for col, val in zip(COLS, parts):
-        if val == '':
-            continue
-        if col in ('E', 'N'):
-            try:
-                nodes.at[row_idx, col] = float(val)
-            except ValueError:
-                print(f"  Could not parse '{val}' as float for {col}. Skipping.")
-        elif col == 'Platform_Count':
-            try:
-                nodes.at[row_idx, col] = int(val)
-            except ValueError:
-                nodes.at[row_idx, col] = val
-        else:
-            nodes.at[row_idx, col] = val
+    nc = _prompt_enum('Node class', NODE_CLASS_OPTIONS, current=_cur('Node_Class'),
+                      allow_other=False)
+    if nc is not None:
+        nodes.at[row_idx, 'Node_Class'] = nc
 
-    # Always regenerate geometry from (possibly updated) E, N
-    E = nodes.at[row_idx, 'E']
-    N = nodes.at[row_idx, 'N']
-    nodes.at[row_idx, 'geometry'] = Point(float(E), float(N))
+    tm = _prompt_enum('Transport mode', TRACK_MODE_OPTIONS, current=_cur('Transport_Mode'),
+                      allow_other=False)
+    if tm is not None:
+        nodes.at[row_idx, 'Transport_Mode'] = tm
+
+    effective_class = nc if nc is not None else _cur('Node_Class')
+    if effective_class != 'junction':
+        pc = _prompt_text('Platform count', example='2', current=_cur('Platform_Count'), cast=int)
+        if pc is not None:
+            nodes.at[row_idx, 'Platform_Count'] = int(pc) if isinstance(pc, str) else pc
+
+    tc = _prompt_text('Track count', example='4', current=_cur('Track_Count'), cast=int)
+    if tc is not None:
+        nodes.at[row_idx, 'Track_Count'] = int(tc) if isinstance(tc, str) else tc
+
+    pn = _prompt_text('Parent node', example='Zürich HB', current=_cur('Parent_Node'))
+    if pn is not None:
+        nodes.at[row_idx, 'Parent_Node'] = pn
+
     print(f"  Node '{nodes.at[row_idx, 'Name']}' updated.")
     return nodes
 
@@ -721,12 +804,14 @@ def _add_node(
         except ValueError:
             print("  Invalid coordinates.")
             return nodes, segments, composition
-        pt         = Point(node_E, node_N)
-        seg_idx    = segments.geometry.distance(pt).idxmin()
-        S          = segments.loc[seg_idx]
-        split_dist = S.geometry.project(pt)
-        split_pt   = S.geometry.interpolate(split_dist)
-        node_E, node_N = split_pt.x, split_pt.y
+        snap_raw = input("  Snap to nearest segment and split it? (y/n) [n]: ").strip().lower() or 'n'
+        if snap_raw == 'y':
+            pt         = Point(node_E, node_N)
+            seg_idx    = segments.geometry.distance(pt).idxmin()
+            S          = segments.loc[seg_idx]
+            split_dist = S.geometry.project(pt)
+            split_pt   = S.geometry.interpolate(split_dist)
+            node_E, node_N = split_pt.x, split_pt.y
 
     # Prompt node attributes
     print(f"\n  New node will be at E={node_E:.1f}, N={node_N:.1f}")
@@ -739,16 +824,12 @@ def _add_node(
         return nodes, segments, composition
 
     code = input(f"  Code [{name[:4].upper()}]: ").strip() or name[:4].upper()
+    existing_codes = set(nodes['Code'].dropna().astype(str).str.strip())
+    if code in existing_codes:
+        print(f"  Code '{code}' is already used by another node. Cancelled.")
+        return nodes, segments, composition
 
-    print("  Node class:")
-    for k, v in NODE_CLASS_OPTIONS.items():
-        print(f"    {k}) {v}")
-    while True:
-        nc = input("  Select (1–6) [1]: ").strip() or '1'
-        if nc in NODE_CLASS_OPTIONS:
-            node_class = NODE_CLASS_OPTIONS[nc]
-            break
-        print("  Invalid — enter 1–6.")
+    node_class = _prompt_enum('Node class', NODE_CLASS_OPTIONS, required=True, allow_other=False)
 
     # Generate a synthetic Number above the BAV range (max + 1,
     # floored at 9_000_000 so synthetic nodes are clearly distinguishable).
@@ -765,7 +846,7 @@ def _add_node(
     synthetic_node_id = f"synth_{synthetic_bpnr}"
 
     new_node = {
-        'Segment_ID':               synthetic_node_id,
+        'Node_ID':                  synthetic_node_id,
         'Number':           synthetic_bpnr,
         'Name':             name,
         'Code':             code,
@@ -780,17 +861,20 @@ def _add_node(
     }
     print(f"  Assigned synthetic Number: {synthetic_bpnr}")
 
-    # Apply segment split
-    segments, composition = _split_segment_at(
-        segments, composition, seg_idx, split_dist, name, code, nodes
-    )
+    if seg_idx is not None:
+        segments, composition = _split_segment_at(
+            segments, composition, seg_idx, split_dist, name, code, nodes
+        )
 
     # Append new node
     nodes = pd.concat(
         [nodes, gpd.GeoDataFrame([new_node], crs=SWISS_CRS)],
         ignore_index=True
     )
-    print(f"  Added node '{name}' ({node_class}) and split segment into _A / _B.")
+    if seg_idx is not None:
+        print(f"  Added node '{name}' ({node_class}) — segment split at {split_dist:.0f} m.")
+    else:
+        print(f"  Added node '{name}' ({node_class}).")
     return nodes, segments, composition
 
 # =============================================================================
@@ -800,15 +884,16 @@ def _add_node(
 def _remove_segment(
     segments: gpd.GeoDataFrame,
     composition: gpd.GeoDataFrame,
-) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
-    """Phase 2 — Remove a segment."""
+    nodes: gpd.GeoDataFrame,
+) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """Phase 2 — Remove a segment, with optional orphan-node cleanup."""
     term = input("  Search segment (partial from-name, to-name, or segment_name): ").strip()
     if not term:
-        return segments, composition
+        return segments, composition, nodes
     hits = _search_segments(segments, term)
     if hits.empty:
         print(f"  No segments matching '{term}'.")
-        return segments, composition
+        return segments, composition, nodes
 
     labels = [
         f"{r['From_Name']} → {r['To_Name']}  [{r['Segment_ID']}]"
@@ -816,17 +901,33 @@ def _remove_segment(
     ]
     idx = _pick_one(labels, "Segment to remove")
     if idx is None:
-        return segments, composition
+        return segments, composition, nodes
 
     row_idx = hits.index[idx]
     S = segments.loc[row_idx]
 
     ans = input(f"  Remove segment '{S['From_Name']} → {S['To_Name']}'? (y/n) [n]: ").strip().lower() or 'n'
     if ans == 'y':
-        segments = segments[segments.index != row_idx].reset_index(drop=True)
+        endpoints = (S['From_Name'], S['To_Name'])
+        segments    = segments[segments.index != row_idx].reset_index(drop=True)
         composition = composition[composition['Segment_ID'] != S['Segment_ID']].reset_index(drop=True)
         print(f"  Removed segment '{S['Segment_ID']}'.")
-    return segments, composition
+
+        # Offer to remove any endpoint node now left with zero connected segments
+        for ep_name in endpoints:
+            still_connected = (
+                (segments['From_Name'] == ep_name) | (segments['To_Name'] == ep_name)
+            ).any()
+            if not still_connected and (nodes['Name'] == ep_name).any():
+                orphan_ans = input(
+                    f"  Node '{ep_name}' is now isolated (no connected segments). "
+                    f"Remove it? (y/n) [n]: "
+                ).strip().lower() or 'n'
+                if orphan_ans == 'y':
+                    nodes = nodes[nodes['Name'] != ep_name].reset_index(drop=True)
+                    print(f"  Removed orphan node '{ep_name}'.")
+
+    return segments, composition, nodes
 
 
 def _adjust_segment(
@@ -853,14 +954,9 @@ def _adjust_segment(
     row_idx = hits.index[idx]
     row = segments.loc[row_idx]
 
-    COLS = [
-        'From_Name', 'To_Name', 'Length', 'Num_Tracks', 'Gauge', 'Electrification_Class',
-        'Km_Start', 'Km_End', 'Route_Number', 'Route_Name', 'Route_Owner', 'Average_Speed',
-    ]
-    header  = ", ".join(COLS)
-    current = ", ".join(str(row.get(c, '')) for c in COLS)
-    print(f"\n  {header}")
-    print(f"  {current}")
+    # Read-only context
+    print(f"\n  Segment: {row.get('From_Name', '')} → {row.get('To_Name', '')}  [{row.get('Segment_ID', '')}]")
+    print(f"  Route: {row.get('Route_Number', 'N/A')} — {row.get('Route_Name', 'N/A')}  [read-only]")
     print(
         f"  OSM-derived (read-only): Predominant_Speed={row.get('Predominant_Speed', 'N/A')}  "
         f"Speed_Coverage_Pct={row.get('Speed_Coverage_Pct', 'N/A')}"
@@ -870,33 +966,59 @@ def _adjust_segment(
     comp_strs = [f"{p['Engineering_Structure']} {float(p['Piece_Length']):.0f}m" for _, p in pieces.iterrows()]
     print(f"  Composition: {len(pieces)} pieces — {' / '.join(comp_strs)}")
 
-    updated = input("  Enter updated values (same order; press Enter to keep): ").strip()
-    if updated:
-        parts = [p.strip() for p in updated.split(',')]
-        if len(parts) != len(COLS):
-            print(f"  Expected {len(COLS)} values, got {len(parts)}. No changes made.")
-            return segments, composition
+    # Editable fields (Length, Km_Start, Km_End are geometry-derived — not editable here;
+    # correct via remove + add-segment with accurate geometry)
+    EDITABLE_COLS = [
+        'Num_Tracks', 'Gauge', 'Electrification_Class',
+        'Route_Owner', 'Average_Speed', 'TT_Stopping', 'TT_Passing', 'speed_source',
+    ]
+    _readonly_ctx = (f"  Length={row.get('Length', 'N/A'):.0f} m  "
+                     f"Km_Start={row.get('Km_Start', 'N/A')}  "
+                     f"Km_End={row.get('Km_End', 'N/A')}  [read-only]"
+                     if pd.notna(row.get('Length')) else "")
+    if _readonly_ctx:
+        print(_readonly_ctx)
 
-        EDITABLE = [
-            'Num_Tracks', 'Gauge', 'Electrification_Class',
-            'Km_Start', 'Km_End', 'Route_Number', 'Route_Name', 'Route_Owner', 'Average_Speed',
-        ]
-        for col, val in zip(COLS, parts):
-            if val == '' or col not in EDITABLE:
-                continue
-            if col in ('Km_Start', 'Km_End', 'Average_Speed'):
-                try:
-                    segments.at[row_idx, col] = float(val)
-                except ValueError:
-                    pass
-            elif col in ('Num_Tracks', 'Gauge'):
-                try:
-                    segments.at[row_idx, col] = int(val)
-                except ValueError:
-                    segments.at[row_idx, col] = val
+    def _cur(col):
+        v = row.get(col)
+        return None if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)
+
+    owner_opts = _owner_options(segments)
+    changed = False
+
+    for col in EDITABLE_COLS:
+        if col not in segments.columns:
+            continue
+        cur = _cur(col)
+        if col == 'Num_Tracks':
+            val = _prompt_text('Num tracks', example='2', current=cur, cast=int)
+        elif col == 'Gauge':
+            val = _prompt_enum('Gauge (mm)', GAUGE_OPTIONS, current=cur)
+        elif col == 'Electrification_Class':
+            val = _prompt_enum('Electrification class', ELECTRIFICATION_OPTIONS, current=cur)
+        elif col == 'Route_Owner':
+            val = _prompt_enum('Route owner', owner_opts, current=cur)
+        elif col == 'Average_Speed':
+            val = _prompt_text('Average speed (km/h)', example='120', current=cur, cast=float)
+        elif col in ('TT_Stopping', 'TT_Passing'):
+            val = _prompt_text(col.replace('_', ' ') + ' (s)', example='45',
+                               current=cur, cast=float)
+        elif col == 'speed_source':
+            val = _prompt_enum('Speed source', SPEED_SOURCE_OPTIONS,
+                               current=cur or 'OSM', allow_other=False)
+        else:
+            val = _prompt_text(col, current=cur)
+
+        if val is not None and val != cur:
+            if col == 'Num_Tracks':
+                segments.at[row_idx, col] = int(val) if isinstance(val, str) else val
+            elif col in ('Average_Speed', 'TT_Stopping', 'TT_Passing'):
+                segments.at[row_idx, col] = float(val) if isinstance(val, str) else val
             else:
                 segments.at[row_idx, col] = val
+            changed = True
 
+    if changed:
         print(f"  Segment '{row['Segment_ID']}' attributes updated.")
 
     # Composition update
@@ -951,35 +1073,49 @@ def _add_segment(
         return segments, composition
 
     geom = LineString([(f_node['E'], f_node['N']), (t_node['E'], t_node['N'])])
-    
-    COLS = [
-        'Num_Tracks', 'Gauge', 'Electrification_Class', 'Route_Number',
-        'Route_Name', 'Route_Owner', 'Km_Start', 'Km_End'
-    ]
-    print(f"\n  Attributes: {', '.join(COLS)}")
-    val_str = input("  Values (comma-separated): ").strip()
-    parts = [p.strip() for p in val_str.split(',')]
-    if len(parts) != len(COLS):
-        print("  Invalid number of parts. Cancelled.")
-        return segments, composition
 
-    vals = {}
-    for col, v in zip(COLS, parts):
-        if col in ('Num_Tracks', 'Gauge'):
-            vals[col] = int(v) if v.isdigit() else pd.NA
-        elif col in ('Km_Start', 'Km_End'):
-            try: vals[col] = float(v)
-            except ValueError: vals[col] = pd.NA
-        else:
-            vals[col] = v if v else pd.NA
+    nt_raw  = _prompt_text('Num tracks', example='2', cast=int)
+    gauge   = _prompt_enum('Gauge (mm)', GAUGE_OPTIONS)
+    elec    = _prompt_enum('Electrification class', ELECTRIFICATION_OPTIONS)
+    rn      = _prompt_text('Route number', example='750')
+    rname   = _prompt_text('Route name', example='Zürich–Bern')
+    owner_opts = _owner_options(segments)
+    owner   = _prompt_enum('Route owner', owner_opts)
+    km_s    = _prompt_text('Km start', example='0.0', cast=float)
+    km_e    = _prompt_text('Km end', example='12.5', cast=float)
+    avg_spd = _prompt_text('Average speed (km/h)', example='120', cast=float)
 
-    spd_raw = input("  Average / predominant speed (km/h, Enter for none): ").strip()
-    try:
-        avg_speed = float(spd_raw) if spd_raw else pd.NA
-    except ValueError:
-        avg_speed = pd.NA
+    if avg_spd is not None:
+        speed_source = _prompt_enum('Speed source', SPEED_SOURCE_OPTIONS,
+                                    current='infra', allow_other=False) or 'infra'
+    else:
+        speed_source = 'OSM'
+
+    def _na(v):
+        return pd.NA if v is None else v
+
+    vals = {
+        'Num_Tracks':            int(nt_raw) if isinstance(nt_raw, str) else _na(nt_raw),
+        'Gauge':                 _na(gauge),
+        'Electrification_Class': _na(elec),
+        'Route_Number':          _na(rn),
+        'Route_Name':            _na(rname),
+        'Route_Owner':           _na(owner),
+        'Km_Start':              float(km_s) if isinstance(km_s, str) else _na(km_s),
+        'Km_End':                float(km_e) if isinstance(km_e, str) else _na(km_e),
+    }
+    avg_speed = float(avg_spd) if isinstance(avg_spd, str) else _na(avg_spd)
 
     seg_id  = f"c{f_node['Code']}_{t_node['Code']}"
+    existing_seg_ids = set(segments['Segment_ID'].dropna().astype(str))
+    if seg_id in existing_seg_ids:
+        suffix = 2
+        candidate = f"{seg_id}_{suffix}"
+        while candidate in existing_seg_ids:
+            suffix += 1
+            candidate = f"{seg_id}_{suffix}"
+        print(f"  Segment ID '{seg_id}' already exists. Using '{candidate}'.")
+        seg_id = candidate
     seg_len = geom.length
 
     fn_num = f_node.get('Number')
@@ -1008,6 +1144,7 @@ def _add_segment(
         'Average_Speed':         avg_speed,
         'Predominant_Speed':     avg_speed,
         'Speed_Coverage_Pct':    1.0 if pd.notna(avg_speed) else 0.0,
+        'speed_source':          speed_source,
         'geometry':              geom,
     }
 
@@ -1056,7 +1193,6 @@ def _edit_composition(
     COMP_COLS = ['Engineering_Structure', 'Piece_Length', 'Edge_Level', 'Under_Construction']
 
     while True:
-        ct_options = CONSTRUCT_TYPE_OPTIONS
         pieces = composition[composition['Segment_ID'] == seg_id].copy()
         total_comp = float(pieces['Piece_Length'].sum()) if not pieces.empty else 0.0
 
@@ -1080,39 +1216,36 @@ def _edit_composition(
             break
 
         elif c == '1':
-            print("  Construct type:")
-            for k, v in ct_options.items():
-                print(f"    {k}) {v}")
-            raw = input("  Select number or type custom value: ").strip() or '1'
-            ct = ct_options.get(raw, raw)
-
-            try:
-                pl = float(input("  Piece length (m): ").strip())
-            except ValueError:
-                print("  Invalid length. Cancelled.")
+            ct = _prompt_enum('Construct type', CONSTRUCT_TYPE_OPTIONS, required=True,
+                              allow_other=False)
+            pl_raw = _prompt_text('Piece length (m)', example='500', cast=float)
+            if pl_raw is None:
+                print("  Piece length required. Cancelled.")
                 continue
-
-            el_raw = input("  Edge level [1]: ").strip() or '1'
-            try:
-                el = int(el_raw)
-            except ValueError:
-                el = 1
-
-            uc_raw = input("  Under construction (0/1) [0]: ").strip() or '0'
-            uc = 1 if uc_raw == '1' else 0
+            pl = float(pl_raw) if isinstance(pl_raw, str) else pl_raw
+            el_opts = _EDGE_LEVEL_BY_CT.get(ct, ['1'])
+            el_raw = _prompt_enum('Edge level', el_opts, current=el_opts[0], allow_other=False)
+            el = int(el_raw) if el_raw is not None else int(el_opts[0])
+            uc_raw = _prompt_enum('Under construction', ['0 — no', '1 — yes'],
+                                  current='0 — no', allow_other=False)
+            uc = 1 if uc_raw and uc_raw.startswith('1') else 0
 
             new_piece = gpd.GeoDataFrame([{
-                'Segment_ID':                   seg_id,
-                'From_Name':            seg_row['From_Name'],
-                'To_Name':              seg_row['To_Name'],
+                'Segment_ID':            seg_id,
+                'From_Name':             seg_row['From_Name'],
+                'To_Name':               seg_row['To_Name'],
                 'Engineering_Structure': ct,
-                'Edge_Level':           el,
-                'Under_Construction':   uc,
-                'Piece_Length':         pl,
-                'geometry':             seg_geom,
+                'Edge_Level':            el,
+                'Under_Construction':    uc,
+                'Piece_Length':          pl,
+                'geometry':              seg_geom,
             }], crs=SWISS_CRS)
             composition = pd.concat([composition, new_piece], ignore_index=True)
             print(f"  Added piece: {ct}  {pl:.0f} m.")
+            new_total = float(composition[composition['Segment_ID'] == seg_id]['Piece_Length'].sum())
+            if abs(new_total - seg_len) > 0.5:
+                print(f"  Budget: {new_total:.0f} m / {seg_len:.0f} m  "
+                      f"(delta = {new_total - seg_len:+.0f} m).")
 
         elif c == '2':
             if pieces.empty:
@@ -1128,35 +1261,60 @@ def _edit_composition(
             edit_loc = pieces.index[pidx]
             p = composition.loc[edit_loc]
 
-            header  = ", ".join(COMP_COLS)
-            current = ", ".join(str(p.get(col, '')) for col in COMP_COLS)
-            print(f"  {header}")
-            print(f"  {current}")
-            updated = input("  Enter updated values (same order; Enter to keep): ").strip()
-            if not updated:
-                continue
+            def _pcur(col):
+                v = p.get(col)
+                return None if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)
 
-            parts = [v.strip() for v in updated.split(',')]
-            if len(parts) != len(COMP_COLS):
-                print(f"  Expected {len(COMP_COLS)} values. No changes made.")
-                continue
+            es = _prompt_enum('Construct type', CONSTRUCT_TYPE_OPTIONS,
+                              current=_pcur('Engineering_Structure'), allow_other=False)
+            if es is not None and es != _pcur('Engineering_Structure'):
+                composition.at[edit_loc, 'Engineering_Structure'] = es
 
-            for col, val in zip(COMP_COLS, parts):
-                if val == '':
-                    continue
-                if col == 'Piece_Length':
-                    try:
-                        composition.at[edit_loc, col] = float(val)
-                    except ValueError:
-                        print(f"  Could not parse '{val}' as float for {col}. Skipping.")
-                elif col in ('Edge_Level', 'Under_Construction'):
-                    try:
-                        composition.at[edit_loc, col] = int(val)
-                    except ValueError:
-                        composition.at[edit_loc, col] = val
-                else:
-                    composition.at[edit_loc, col] = val
+            pl_val = _prompt_text('Piece length (m)', example='500',
+                                  current=_pcur('Piece_Length'), cast=float)
+            if pl_val is not None:
+                composition.at[edit_loc, 'Piece_Length'] = (
+                    float(pl_val) if isinstance(pl_val, str) else pl_val
+                )
+
+            effective_ct = es if es is not None else _pcur('Engineering_Structure')
+            el_opts = _EDGE_LEVEL_BY_CT.get(effective_ct or '', ['1'])
+            el_val = _prompt_enum('Edge level', el_opts,
+                                  current=_pcur('Edge_Level') or el_opts[0], allow_other=False)
+            if el_val is not None:
+                composition.at[edit_loc, 'Edge_Level'] = int(el_val)
+
+            uc_cur = '1 — yes' if str(p.get('Under_Construction', 0)) == '1' else '0 — no'
+            uc_val = _prompt_enum('Under construction', ['0 — no', '1 — yes'],
+                                  current=uc_cur, allow_other=False)
+            if uc_val is not None and uc_val != uc_cur:
+                composition.at[edit_loc, 'Under_Construction'] = (
+                    1 if uc_val.startswith('1') else 0
+                )
             print("  Piece updated.")
+            new_total = float(composition[composition['Segment_ID'] == seg_id]['Piece_Length'].sum())
+            if abs(new_total - seg_len) > 0.5:
+                delta = new_total - seg_len
+                print(f"  Budget: {new_total:.0f} m / {seg_len:.0f} m  (delta = {delta:+.0f} m).")
+                other_pieces = composition[
+                    (composition['Segment_ID'] == seg_id) & (composition.index != edit_loc)
+                ]
+                if not other_pieces.empty:
+                    print(f"  Select a piece to absorb {-delta:+.0f} m (Enter to skip):")
+                    absorb_labels = [
+                        f"{p['Engineering_Structure']}  "
+                        f"{float(p['Piece_Length']):.0f} m → {float(p['Piece_Length']) - delta:.0f} m"
+                        for _, p in other_pieces.iterrows()
+                    ]
+                    absorb_idx = _pick_one(absorb_labels, "Absorb in")
+                    if absorb_idx is not None:
+                        absorb_loc  = other_pieces.index[absorb_idx]
+                        new_abs_len = float(composition.at[absorb_loc, 'Piece_Length']) - delta
+                        if new_abs_len > 0:
+                            composition.at[absorb_loc, 'Piece_Length'] = new_abs_len
+                            print(f"  Piece adjusted to {new_abs_len:.0f} m — budget closed.")
+                        else:
+                            print(f"  Cannot absorb: would result in {new_abs_len:.0f} m. Keeping as-is.")
 
         elif c == 'r':
             composition = composition[
@@ -1181,37 +1339,49 @@ def _edit_composition(
 
 def _import_nodes(
     current_nodes: gpd.GeoDataFrame,
+    current_version: str,
 ) -> gpd.GeoDataFrame:
-    """Import and update nodes from another version."""
+    """Import and update nodes from another version.
+
+    Shows three diff categories:
+      New     — in source, not in current → offer to add
+      Changed — in both but attributes differ → offer to replace
+      Removed — in current, not in source → offer to delete from current
+    """
     infra_root = Path(paths.MAIN) / paths.NETWORK_INFRASTRUCTURE_DIR
-    versions = list_versions(infra_root)
+    versions = [v for v in list_versions(infra_root) if v != current_version]
+    if not versions:
+        print("  No other versions available to import from.")
+        return current_nodes
     idx = _pick_one(versions, "Version to import nodes from")
     if idx is None:
         return current_nodes
     source_version = versions[idx]
-    
+
     print(f"  Loading nodes from '{source_version}'...")
     source_nodes = gpd.read_file(infra_root / source_version / 'nodes.gpkg').reset_index(drop=True)
-    
-    diff_items = []  # tuples of (source_idx, status, current_idx_to_drop, description)
-    
-    # Helper to generate a match key
+
+    # diff_items: (source_idx_or_None, status, current_idx_or_None, description)
+    diff_items = []
+
     def get_node_key(row):
-        nid = str(row.get('ID', ''))
         bpn = str(row.get('Number', ''))
         name = str(row.get('Name', ''))
-        if nid != 'None' and nid != 'nan' and nid != '' and bpn != 'None' and bpn != 'nan' and bpn != '':
-            return f"{nid}_{bpn}"
+        if bpn not in ('None', 'nan', '<NA>', ''):
+            return f"Number_{bpn}"
         return f"Name_{name}"
 
     curr_keys = current_nodes.apply(get_node_key, axis=1)
+    source_key_set = set(source_nodes.apply(get_node_key, axis=1))
 
+    # --- New / Changed (source → current) ------------------------------------
     for i, s_row in source_nodes.iterrows():
         s_key = get_node_key(s_row)
         match_idx = current_nodes.index[curr_keys == s_key].tolist()
 
         if not match_idx:
-            diff_items.append((i, "New", None, f"New node '{s_row.get('Name', 'Unknown')}'"))
+            diff_items.append((i, "New", None,
+                               f"New node '{s_row.get('Name', 'Unknown')}'"))
         else:
             c_idx = match_idx[0]
             c_row = current_nodes.loc[c_idx]
@@ -1220,7 +1390,8 @@ def _import_nodes(
             for col in ['E', 'N', 'Node_Class', 'Transport_Mode', 'Platform_Count', 'Name']:
                 s_val = s_row.get(col)
                 c_val = c_row.get(col)
-                if pd.isna(s_val) and pd.isna(c_val): continue
+                if pd.isna(s_val) and pd.isna(c_val):
+                    continue
                 if str(s_val) != str(c_val):
                     changes.append(f"{col}: {c_val} -> {s_val}")
 
@@ -1228,24 +1399,30 @@ def _import_nodes(
                 changes.append("geometry changed")
 
             if changes:
-                desc = f"Update node '{s_row.get('Name', 'Unknown')}' ({', '.join(changes)})"
-                diff_items.append((i, "Changed", c_idx, desc))
+                diff_items.append((i, "Changed", c_idx,
+                                   f"Update node '{s_row.get('Name', 'Unknown')}' ({', '.join(changes)})"))
+
+    # --- Removed (in current, absent from source) ----------------------------
+    for i, c_row in current_nodes.iterrows():
+        if get_node_key(c_row) not in source_key_set:
+            diff_items.append((None, "Removed", i,
+                               f"Remove node '{c_row.get('Name', 'Unknown')}' (not in source)"))
 
     if not diff_items:
-        print("  No new or modified nodes found in the selected version.")
+        print("  No differences found between current version and source.")
         return current_nodes
-        
+
     print("\n  Available imports:")
     for j, (_, status, _, desc) in enumerate(diff_items, 1):
         print(f"    {j}) [{status}] {desc}")
-        
-    ans = input("\n  Enter numbers to import (comma-separated), 'all', or Enter to cancel: ").strip().lower()
+
+    ans = input("\n  Enter numbers to apply (comma-separated), 'all', or Enter to cancel: ").strip().lower()
     if not ans:
         return current_nodes
-        
+
     selected_indices = []
     if ans == 'all':
-        selected_indices = range(len(diff_items))
+        selected_indices = list(range(len(diff_items)))
     else:
         for part in ans.split(','):
             part = part.strip()
@@ -1253,42 +1430,58 @@ def _import_nodes(
                 val = int(part) - 1
                 if 0 <= val < len(diff_items):
                     selected_indices.append(val)
-                    
+
     if not selected_indices:
         print("  No valid choices selected.")
         return current_nodes
-        
+
     new_rows = []
     drop_indices = []
-    
+
     for idx_in_diff in selected_indices:
         s_idx, status, c_idx, desc = diff_items[idx_in_diff]
-        new_rows.append(source_nodes.loc[s_idx])
-        if status == "Changed" and c_idx is not None:
+        if status == "Removed":
             drop_indices.append(c_idx)
-            
+        else:
+            new_rows.append(source_nodes.loc[s_idx])
+            if status == "Changed" and c_idx is not None:
+                drop_indices.append(c_idx)
+
     if drop_indices:
         current_nodes = current_nodes.drop(index=drop_indices)
-        
+
     if new_rows:
-        current_nodes = pd.concat([current_nodes, gpd.GeoDataFrame(new_rows, crs=SWISS_CRS)], ignore_index=True)
-        
-    print(f"  Successfully imported {len(selected_indices)} node(s).")
+        current_nodes = pd.concat(
+            [current_nodes, gpd.GeoDataFrame(new_rows, crs=SWISS_CRS)],
+            ignore_index=True
+        )
+
+    print(f"  Applied {len(selected_indices)} change(s).")
     return current_nodes
 
 
 def _import_segments(
     current_segs: gpd.GeoDataFrame,
     current_comp: gpd.GeoDataFrame,
+    current_version: str,
 ) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
-    """Import and update segments (and their composition) from another version."""
+    """Import and update segments (and their composition) from another version.
+
+    Shows three diff categories:
+      New     — in source, not in current → offer to add
+      Changed — in both but attributes differ → offer to replace
+      Removed — in current, not in source → offer to delete from current
+    """
     infra_root = Path(paths.MAIN) / paths.NETWORK_INFRASTRUCTURE_DIR
-    versions = list_versions(infra_root)
+    versions = [v for v in list_versions(infra_root) if v != current_version]
+    if not versions:
+        print("  No other versions available to import from.")
+        return current_segs, current_comp
     idx = _pick_one(versions, "Version to import segments from")
     if idx is None:
         return current_segs, current_comp
     source_version = versions[idx]
-    
+
     print(f"  Loading segments and composition from '{source_version}'...")
     source_dir = infra_root / source_version
     source_segs = gpd.read_file(source_dir / 'segments.gpkg').reset_index(drop=True)
@@ -1296,62 +1489,81 @@ def _import_segments(
         source_comp = gpd.read_file(source_dir / 'segments_composition.gpkg').reset_index(drop=True)
     else:
         source_comp = gpd.GeoDataFrame(columns=current_comp.columns)
-    
+
+    # diff_items: (source_idx_or_None, status, current_idx_or_None, description)
     diff_items = []
-    
+
     def get_seg_key(row):
-        sid = str(row.get('ID', ''))
-        return sid
-        
+        return str(row.get('Segment_ID', ''))
+
     curr_keys = current_segs.apply(get_seg_key, axis=1)
-    
+    source_key_set = set(source_segs.apply(get_seg_key, axis=1))
+
+    # --- New / Changed (source → current) ------------------------------------
     for i, s_row in source_segs.iterrows():
         s_key = get_seg_key(s_row)
         match_idx = current_segs.index[curr_keys == s_key].tolist()
-        
+
         if not match_idx:
-            desc = f"New segment '{s_row.get('ID', '')}' ({s_row.get('From_Name', '')} -> {s_row.get('To_Name', '')})"
+            desc = (f"New segment '{s_row.get('Segment_ID', '')}' "
+                    f"({s_row.get('From_Name', '')} -> {s_row.get('To_Name', '')})")
             diff_items.append((i, "New", None, desc))
         else:
             c_idx = match_idx[0]
             c_row = current_segs.loc[c_idx]
 
             changes = []
-            for col in ['Num_Tracks', 'Gauge', 'Electrification_Class', 'Length', 'Km_Start', 'Km_End', 'From_Name', 'To_Name']:
+            for col in [
+                'Num_Tracks', 'Gauge', 'Electrification_Class',
+                'Length', 'Km_Start', 'Km_End', 'From_Name', 'To_Name',
+                'Average_Speed', 'TT_Stopping', 'TT_Passing',
+                'speed_source', 'Transport_Mode', 'Route_Owner',
+            ]:
                 s_val = s_row.get(col)
                 c_val = c_row.get(col)
-                if pd.isna(s_val) and pd.isna(c_val): continue
+                s_na = s_val is None or (isinstance(s_val, float) and pd.isna(s_val))
+                c_na = c_val is None or (isinstance(c_val, float) and pd.isna(c_val))
+                if s_na and c_na:
+                    continue
                 if str(s_val) != str(c_val):
-                    changes.append(f"{col}")
-            
+                    changes.append(col)
+
             if not s_row.geometry.equals(c_row.geometry):
                 changes.append("geometry")
-                
-            # Check composition difference by row count
-            s_c = source_comp[source_comp['Segment_ID'] == s_row.get('ID', '')]
-            c_c = current_comp[current_comp['Segment_ID'] == c_row.get('ID', '')]
+
+            s_c = source_comp[source_comp['Segment_ID'] == s_row.get('Segment_ID', '')]
+            c_c = current_comp[current_comp['Segment_ID'] == c_row.get('Segment_ID', '')]
             if len(s_c) != len(c_c):
                 changes.append("composition count")
-                
+
             if changes:
-                desc = f"Update segment '{s_row.get('ID', '')}' ({', '.join(changes)})"
+                desc = (f"Update segment '{s_row.get('Segment_ID', '')}' "
+                        f"({s_row.get('From_Name', '')} -> {s_row.get('To_Name', '')}) "
+                        f"[{', '.join(changes)}]")
                 diff_items.append((i, "Changed", c_idx, desc))
-                
+
+    # --- Removed (in current, absent from source) ----------------------------
+    for i, c_row in current_segs.iterrows():
+        if get_seg_key(c_row) not in source_key_set:
+            desc = (f"Remove segment '{c_row.get('Segment_ID', '')}' "
+                    f"({c_row.get('From_Name', '')} -> {c_row.get('To_Name', '')})")
+            diff_items.append((None, "Removed", i, desc))
+
     if not diff_items:
-        print("  No new or modified segments found in the selected version.")
+        print("  No differences found between current version and source.")
         return current_segs, current_comp
-        
+
     print("\n  Available imports:")
     for j, (_, status, _, desc) in enumerate(diff_items, 1):
         print(f"    {j}) [{status}] {desc}")
-        
-    ans = input("\n  Enter numbers to import (comma-separated), 'all', or Enter to cancel: ").strip().lower()
+
+    ans = input("\n  Enter numbers to apply (comma-separated), 'all', or Enter to cancel: ").strip().lower()
     if not ans:
         return current_segs, current_comp
-        
+
     selected_indices = []
     if ans == 'all':
-        selected_indices = range(len(diff_items))
+        selected_indices = list(range(len(diff_items)))
     else:
         for part in ans.split(','):
             part = part.strip()
@@ -1359,45 +1571,112 @@ def _import_segments(
                 val = int(part) - 1
                 if 0 <= val < len(diff_items):
                     selected_indices.append(val)
-                    
+
     if not selected_indices:
         print("  No valid choices selected.")
         return current_segs, current_comp
-        
+
     new_seg_rows = []
     new_comp_rows = []
     drop_seg_indices = []
     drop_comp_seg_ids = []
-    
+
     for idx_in_diff in selected_indices:
         s_idx, status, c_idx, desc = diff_items[idx_in_diff]
-        s_row = source_segs.loc[s_idx]
-        s_id = s_row.get('Segment_ID')
-        
-        new_seg_rows.append(s_row)
-        if s_id:
-            s_comp_pieces = source_comp[source_comp['Segment_ID'] == s_id]
-            if not s_comp_pieces.empty:
-                new_comp_rows.extend(s_comp_pieces.to_dict('records'))
 
-        if status == "Changed" and c_idx is not None:
+        if status == "Removed":
             drop_seg_indices.append(c_idx)
-            drop_comp_seg_ids.append(current_segs.at[c_idx, 'ID'])
-            
+            drop_comp_seg_ids.append(current_segs.at[c_idx, 'Segment_ID'])
+        else:
+            s_row = source_segs.loc[s_idx]
+            s_id = s_row.get('Segment_ID')
+            new_seg_rows.append(s_row)
+            if s_id:
+                s_comp_pieces = source_comp[source_comp['Segment_ID'] == s_id]
+                if not s_comp_pieces.empty:
+                    new_comp_rows.extend(s_comp_pieces.to_dict('records'))
+            if status == "Changed" and c_idx is not None:
+                drop_seg_indices.append(c_idx)
+                drop_comp_seg_ids.append(current_segs.at[c_idx, 'Segment_ID'])
+
     if drop_seg_indices:
         current_segs = current_segs.drop(index=drop_seg_indices)
     if drop_comp_seg_ids:
         current_comp = current_comp[~current_comp['Segment_ID'].isin(drop_comp_seg_ids)]
-        
+
     if new_seg_rows:
-        current_segs = pd.concat([current_segs, gpd.GeoDataFrame(new_seg_rows, crs=SWISS_CRS)], ignore_index=True)
+        current_segs = pd.concat(
+            [current_segs, gpd.GeoDataFrame(new_seg_rows, crs=SWISS_CRS)],
+            ignore_index=True
+        )
     if new_comp_rows:
         geoms = [r.pop('geometry', None) for r in new_comp_rows]
         new_comp_gdf = gpd.GeoDataFrame(new_comp_rows, geometry=geoms, crs=SWISS_CRS)
         current_comp = pd.concat([current_comp, new_comp_gdf], ignore_index=True)
-        
-    print(f"  Successfully imported {len(selected_indices)} segment(s) and their compositions.")
+
+    print(f"  Applied {len(selected_indices)} change(s).")
     return current_segs, current_comp
+
+
+def _adjust_network_speed_source(
+    segments: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """Set speed_source for all segments in the network (or a filtered subset)."""
+    if 'speed_source' not in segments.columns:
+        segments['speed_source'] = 'OSM'
+
+    counts = segments['speed_source'].value_counts().to_dict()
+    print(f"\n  Current speed_source distribution:")
+    for val in ('OSM', 'GTFS', 'infra'):
+        print(f"    {val}: {counts.get(val, 0)} segment(s)")
+
+    print("\n  Set speed_source to:")
+    print("    1) OSM   — derived from OSM speeds; open to GTFS calibration")
+    print("    2) GTFS  — timetable-calibrated; locked until reset")
+    print("    3) infra — designer-set speed; locked unconditionally")
+    src_choice = input("  Select (1/2/3): ").strip()
+    target_map = {'1': 'OSM', '2': 'GTFS', '3': 'infra'}
+    if src_choice not in target_map:
+        print("  Cancelled.")
+        return segments
+    target_source = target_map[src_choice]
+
+    print(f"\n  Apply to:")
+    print(f"    1) All {len(segments)} segments")
+    print(f"    2) By Transport_Mode")
+    print(f"    3) By Segment_ID list")
+    scope = input("  Select (1/2/3): ").strip()
+
+    if scope == '1':
+        target_mask = pd.Series(True, index=segments.index)
+    elif scope == '2':
+        mode_term = input("  Transport_Mode filter (e.g. 'train', 'tram'): ").strip()
+        target_mask = (
+            segments.get('Transport_Mode', pd.Series('', index=segments.index))
+            .fillna('').str.lower().str.contains(mode_term.lower(), regex=False)
+        )
+    elif scope == '3':
+        raw_ids = input("  Segment_IDs (comma-separated): ").strip()
+        id_set = {s.strip() for s in raw_ids.split(',') if s.strip()}
+        target_mask = segments['Segment_ID'].isin(id_set)
+    else:
+        print("  Cancelled.")
+        return segments
+
+    n_target = int(target_mask.sum())
+    if n_target == 0:
+        print("  No matching segments found.")
+        return segments
+
+    ans = input(f"  Set speed_source='{target_source}' for {n_target} segment(s)? (y/n) [n]: "
+                ).strip().lower() or 'n'
+    if ans != 'y':
+        print("  Cancelled.")
+        return segments
+
+    segments.loc[target_mask, 'speed_source'] = target_source
+    print(f"  Updated {n_target} segment(s) to speed_source='{target_source}'.")
+    return segments
 
 
 # =============================================================================
@@ -1433,7 +1712,7 @@ def main():
                 elif c == '3':
                     nodes, segments, composition = _add_node(nodes, segments, composition)
                 elif c == '4':
-                    nodes = _import_nodes(nodes)
+                    nodes = _import_nodes(nodes, name)
                 elif c == '5':
                     phase = 2
                     break
@@ -1449,22 +1728,25 @@ def main():
                 print("    2) Adjust a segment")
                 print("    3) Add a segment")
                 print("    4) Import segments from another version")
-                print("    5) Proceed to composition editing  →")
-                print("    6) ← Back to node editing")
-                c = input("  Select (1-6): ").strip()
+                print("    5) Reset speed source (GTFS → OSM, for re-calibration)")
+                print("    6) Proceed to composition editing  →")
+                print("    7) ← Back to node editing")
+                c = input("  Select (1-7): ").strip()
 
                 if c == '1':
-                    segments, composition = _remove_segment(segments, composition)
+                    segments, composition, nodes = _remove_segment(segments, composition, nodes)
                 elif c == '2':
                     segments, composition = _adjust_segment(segments, composition)
                 elif c == '3':
                     segments, composition = _add_segment(nodes, segments, composition)
                 elif c == '4':
-                    segments, composition = _import_segments(segments, composition)
+                    segments, composition = _import_segments(segments, composition, name)
                 elif c == '5':
+                    segments = _adjust_network_speed_source(segments)
+                elif c == '6':
                     phase = 3
                     break
-                elif c == '6':
+                elif c == '7':
                     phase = 1
                     break
                 else:

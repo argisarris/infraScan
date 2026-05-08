@@ -1276,6 +1276,8 @@ def run_build_base(
             macro_nodes[col] = macro_nodes[col].round(3)
 
     # ---- Enforce canonical column order ------------------------------------
+    macro_segs['speed_source'] = 'OSM'
+
     _SEG_COL_ORDER = [
         "Segment_ID", "From_Name", "To_Name", "Number", "Code",
         "From_N", "From_E", "To_N", "To_E",
@@ -1284,7 +1286,7 @@ def run_build_base(
         "Route_Number", "Route_Name", "Route_Owner",
         "Tunnel_Length", "Bridge_Length", "Conventional_Length",
         "Transport_Mode", "Average_Speed", "Predominant_Speed", "Speed_Coverage_Pct",
-        "TT_Passing", "TT_Stopping",
+        "TT_Passing", "TT_Stopping", "speed_source",
     ]
     macro_segs = macro_segs[
         [c for c in _SEG_COL_ORDER if c in macro_segs.columns]
