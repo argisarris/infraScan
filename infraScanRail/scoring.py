@@ -1047,7 +1047,7 @@ def GetOevDemandPerCommune(tau = 0.13): # Data is in trips per OD combination pe
     # communalOD = data.drop(['jahr','quelle_name','quelle_gebietart','ziel_name','ziel_gebietart',"kategorie","verkehrsmittel","einheit","gebietsstand_jahr","zeit_dimension"],axis=1)
     # sum(communalOD['wert'])
     # # # Not binnenverkehr ... removes about 50% of trips
-    communalOD['wert'].loc[(communalOD['quelle_code'] == communalOD['ziel_code'])] = 0
+    communalOD.loc[communalOD['quelle_code'] == communalOD['ziel_code'], 'wert'] = 0
     # sum(communalOD['wert'])
     # # Take share of OD
     # todo adapt this value

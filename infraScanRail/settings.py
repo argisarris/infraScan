@@ -26,6 +26,17 @@ only_demand_from_to_perimeter = True
 # 'municipal' preserves the existing centroid-based approach.
 # 'pt_catchment_perimeter' (OD_type) and perimeter_demand are retained for cross-evaluation.
 CATCHMENT_METHOD = 'pt_feeder'
+# Generalised cost toggle: when True, catchment_allocate.py expresses all access
+# times in eq. IVT seconds (weights W_WALK, W_WAIT, W_BIKE applied; detour factors
+# applied to walk/cycle). When False, behaviour is unchanged (raw travel seconds).
+USE_GENERALISED_COST = True
+# OD method: 'municipal' uses existing commune→station lookup table;
+# 'pt_feeder_A' uses catchment_OD_preparation.prepare_od_pt_feeder_a()
+CATCHMENT_OD_METHOD = 'municipal'
+# Transfer cost model (requires USE_GENERALISED_COST = True):
+#   'axhausen' — flat 12.1 min eq. IVT (7.1 min × 1.7; Axhausen 2014, Fuchs 2025)
+#   'explicit' — W_TRANSFER × (TRANSFER_WALK_MIN + t_wait(h_connecting))
+TRANSFER_COST_MODEL = 'axhausen'
 # Canton name must match the attribute value in CANTON_BOUNDARIES_GPKG
 CATCHMENT_CANTON = ['Zürich']  # Add canton names to include multiple cantons in the boundary
 

@@ -1,6 +1,7 @@
 import pandas as pd
 import geopandas as gpd
 import numpy as np
+import paths
 import rasterio
 from rasterio.features import rasterize
 import os
@@ -55,7 +56,7 @@ def GetCommuneEmployment(y0): # we find employment in each commune.
 def GetHighwayPHDemandPerCommune():
     # now we extract an od matrix for pt from year 2019
     # we then modify the OD matrix to fit our needs of expressing peak hour pt travel demand
-    rawod = pd.read_excel('data\_basic_data\KTZH_00001982_00003903.xlsx')
+    rawod = pd.read_excel(paths.OD_KT_ZH_PATH)
     communalOD = rawod.loc[(rawod['jahr']==2018) & (rawod['kategorie']=='Verkehrsaufkommen') & (rawod['verkehrsmittel']=='oev')]
     #communalOD = data.drop(['jahr','quelle_name','quelle_gebietart','ziel_name','ziel_gebietart',"kategorie","verkehrsmittel","einheit","gebietsstand_jahr","zeit_dimension"],axis=1)
     #sum(communalOD['wert'])

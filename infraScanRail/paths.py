@@ -14,8 +14,24 @@ DEVELOPMENT_DIRECTORY = r"data\Network\processed\developments"
 
 RAIL_NODES_PATH = r"data\Network\Rail_Node.csv"
 RAIL_POINTS_PATH = r"data\Network\processed\points.gpkg"
-OD_KT_ZH_PATH = r'data/_basic_data/KTZH_00001982_00003903.xlsx'
+OD_KT_ZH_PATH = r'data/traffic_flow/od/original/KTZH_00001982_00003903.xlsx'
 OD_STATIONS_KT_ZH_PATH = r'data/traffic_flow/od/rail/ktzh/od_matrix_stations_ktzh_20.csv'
+# Station-pair OD matrices (W3): two methods × three time windows.
+OD_STATIONS_PT_FEEDER_AM_PEAK_PATH  = r'data/traffic_flow/od/rail/pt_feeder/od_matrix_stations_pt_feeder_am_peak.csv'
+OD_STATIONS_PT_FEEDER_OFF_PEAK_PATH = r'data/traffic_flow/od/rail/pt_feeder/od_matrix_stations_pt_feeder_off_peak.csv'
+OD_STATIONS_PT_FEEDER_ALL_DAY_PATH  = r'data/traffic_flow/od/rail/pt_feeder/od_matrix_stations_pt_feeder_all_day.csv'
+OD_STATIONS_MUNICIPAL_AM_PEAK_PATH  = r'data/traffic_flow/od/rail/municipal/od_matrix_stations_municipal_am_peak.csv'
+OD_STATIONS_MUNICIPAL_OFF_PEAK_PATH = r'data/traffic_flow/od/rail/municipal/od_matrix_stations_municipal_off_peak.csv'
+OD_STATIONS_MUNICIPAL_ALL_DAY_PATH  = r'data/traffic_flow/od/rail/municipal/od_matrix_stations_municipal_all_day.csv'
+# Rail network routing outputs (W4b): per-service assignment + expected-GC matrices.
+OD_RAIL_SF_SERVICE_ALL_DAY_PATH     = r'data/traffic_flow/od/rail/rail_routing/sf_service_assignment_all_day.csv'
+OD_RAIL_SF_SERVICE_AM_PEAK_PATH     = r'data/traffic_flow/od/rail/rail_routing/sf_service_assignment_am_peak.csv'
+OD_RAIL_SF_SERVICE_OFF_PEAK_PATH    = r'data/traffic_flow/od/rail/rail_routing/sf_service_assignment_off_peak.csv'
+OD_RAIL_LOGIT_SERVICE_ALL_DAY_PATH  = r'data/traffic_flow/od/rail/rail_routing/logit_service_assignment_all_day.csv'
+OD_RAIL_LOGIT_SERVICE_AM_PEAK_PATH  = r'data/traffic_flow/od/rail/rail_routing/logit_service_assignment_am_peak.csv'
+OD_RAIL_LOGIT_SERVICE_OFF_PEAK_PATH = r'data/traffic_flow/od/rail/rail_routing/logit_service_assignment_off_peak.csv'
+OD_RAIL_SF_GC_PATH                  = r'data/traffic_flow/od/rail/rail_routing/gc_matrix_sf.csv'
+OD_RAIL_LOGIT_GC_PATH               = r'data/traffic_flow/od/rail/rail_routing/gc_matrix_logit.csv'
 COMMUNE_TO_STATION_PATH = r"data\Network\processed\Communes_to_railway_stations_ZH.xlsx"
 GRAPH_POS_PATH = r"data\Network\processed\graph_data.pkl"
 
