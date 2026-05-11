@@ -126,7 +126,7 @@ def _configure_gtfs_folders():
     if os.path.isdir(gtfs_base):
         subfolders = sorted([
             d for d in os.listdir(gtfs_base)
-            if os.path.isdir(os.path.join(gtfs_base, d))
+            if os.path.isdir(os.path.join(gtfs_base, d)) and '_raw' in d
         ])
         if subfolders:
             print(f"   Available subfolders:")

@@ -394,18 +394,71 @@ def _minutes_to_time_str(m):
     return f"{h:02d}:{mins:02d}:{secs:02d}"
 
 
-def _detect_peak_windows(route_trip_ids):
+def _get_variant_dep_minutes(trip_ids, time_col):
+    """Return a set of weekday first-stop departure times (fractional minutes)
+    for the given trip_ids across the full operational day.
+
+    Uses the same dual-path logic (schedule + frequency-based trips) and
+    deduplication as _get_window_departures, but spans the whole day so
+    the mutual-exclusivity check in _detect_peak_windows sees every departure.
+    """
+    weekday_trips = set(
+        trips_all.loc[
+            trips_all['trip_id'].isin(trip_ids) &
+            trips_all['service_id'].isin(_weekday_service_ids),
+            'trip_id'
+        ]
+    )
+    if not weekday_trips:
+        return set()
+
+    sched_trips = weekday_trips - _freq_trip_ids
+    freq_trips  = weekday_trips & _freq_trip_ids
+
+    parts = []
+    if sched_trips:
+        _valid = list(sched_trips & _scheduled_trip_ids)
+        if _valid:
+            parts.append(_first_stop_per_trip.loc[_valid].reset_index())
+    if freq_trips:
+        freq_deps = _expand_freq_departures(
+            freq_trips, time_col, OPERATIONAL_DAY_START, OPERATIONAL_DAY_END)
+        if not freq_deps.empty:
+            parts.append(freq_deps)
+
+    if not parts:
+        return set()
+
+    combined = pd.concat(parts, ignore_index=True)
+    combined = _dedup_first_stops(combined, time_col)
+
+    result = set()
+    for t in combined[time_col].dropna():
+        m = _to_minutes_str(t)
+        if m is not None:
+            result.add(m)
+    return result
+
+
+def _detect_peak_windows(route_trip_ids, variants=None):
     """Detect adaptive AM and PM peak windows for a (route_id, direction_id).
 
-    Pools all weekday departures for the given trip set. Splits at
-    HALFDAY_MIDPOINT, bins into PEAK_BIN_WIDTH_MIN slots, finds the densest
-    contiguous cluster above the half-day median, then validates against the
-    fixed AM/PM windows.
+    Two detection paths are tried in order:
 
-    When pooled density is flat (all bins equal — common when an extended peak
-    variant interleaves with a shorter off-peak variant at the same headway),
-    falls back to detecting peaks from the longest stop-sequence variant's
-    departures, since the extended variant defines the peak service.
+    1. Mutual-exclusivity path (when *variants* is provided and has ≥ 2 entries):
+       Checks whether the accepted variants never share the same operational
+       hour.  If so, they replace each other across the day (e.g. S3: the
+       Bülach peak service runs instead of the Hardbrücke off-peak service).
+       The variant with the longest stop sequence is identified as the peak
+       service; its first AM/PM departures and the first subsequent off-peak
+       departure define the window boundaries directly from the timetable,
+       giving direction-specific adaptive windows without density clustering.
+
+    2. Density-clustering path (pooled departures, existing logic):
+       Pools all weekday departures, bins into PEAK_BIN_WIDTH_MIN slots, finds
+       the densest contiguous cluster above the half-day median, then validates
+       against the fixed AM/PM windows.  Falls back to the longest stop-sequence
+       variant when the pooled density is flat.
 
     Returns dict with keys:
         am_start, am_end, pm_start, pm_end, op_start, op_end (str 'HH:MM:SS')
@@ -420,6 +473,156 @@ def _detect_peak_windows(route_trip_ids):
 
     # Get weekday trips in this direction
     time_col = 'departure_time' if 'departure_time' in stop_times.columns else 'arrival_time'
+
+    # -------------------------------------------------------------------
+    # Path 1: mutual-exclusivity detection
+    # -------------------------------------------------------------------
+    if variants and len(variants) >= 2:
+        variant_dep_sets = [
+            _get_variant_dep_minutes(tids, time_col) for _, tids in variants
+        ]
+
+        # Check: no two variants have departures in the same operational hour.
+        # Hour-level granularity correctly identifies co-active services (S10:
+        # both variants depart HB every hour) vs. substituting services (S3:
+        # only one variant active per hour).
+        exclusive = True
+        for h in range(6, 20):
+            h_start, h_end = h * 60, (h + 1) * 60
+            n_active = sum(
+                1 for deps in variant_dep_sets
+                if any(h_start <= t < h_end for t in deps)
+            )
+            if n_active >= 2:
+                exclusive = False
+                break
+
+        if exclusive:
+            # Peak variant = most stops (extended service); tiebreak: fewest departures
+            peak_idx = max(
+                range(len(variants)),
+                key=lambda i: (len(variants[i][0]), -len(variant_dep_sets[i]))
+            )
+            peak_deps = variant_dep_sets[peak_idx]
+            offpeak_deps: set = set()
+            for i, deps in enumerate(variant_dep_sets):
+                if i != peak_idx:
+                    offpeak_deps |= deps
+
+            midpoint  = _to_minutes_str(HALFDAY_MIDPOINT)
+            day_start = _to_minutes_str(AM_PEAK_START)
+            day_end   = _to_minutes_str(PM_PEAK_END)
+
+            peak_am = sorted(t for t in peak_deps if day_start <= t < midpoint)
+            peak_pm = sorted(t for t in peak_deps if midpoint   <= t < day_end)
+
+            # AM_END: first off-peak departure strictly after the last peak AM dep
+            am_start = _to_minutes_str(AM_PEAK_START)
+            if peak_am:
+                later_offpeak = sorted(
+                    t for t in offpeak_deps if t > peak_am[-1] and t < midpoint
+                )
+                am_end = later_offpeak[0] if later_offpeak else _to_minutes_str(AM_PEAK_END)
+            else:
+                am_end = _to_minutes_str(AM_PEAK_END)
+
+            # PM_START: first peak departure in the PM half
+            pm_end = _to_minutes_str(PM_PEAK_END)
+            if peak_pm:
+                pm_start = peak_pm[0]
+            else:
+                pm_start = _to_minutes_str(PM_PEAK_START)
+
+            # Only use these windows if the off-peak gap has positive duration
+            if am_end < pm_start:
+                return {
+                    'am_start':    _minutes_to_time_str(am_start),
+                    'am_end':      _minutes_to_time_str(am_end),
+                    'pm_start':    _minutes_to_time_str(pm_start),
+                    'pm_end':      _minutes_to_time_str(pm_end),
+                    'op_start':    _minutes_to_time_str(am_end),
+                    'op_end':      _minutes_to_time_str(pm_start),
+                    'am_adaptive': True,
+                    'pm_adaptive': True,
+                }
+            # Guard failed — fall through to pairwise scan below
+
+        # -------------------------------------------------------------------
+        # Path 1b: pairwise mutual exclusivity
+        # -------------------------------------------------------------------
+        # When a co-active all-day variant (e.g. Seuzach on S11) prevents the
+        # all-variant check from succeeding, scan every pair of variants for
+        # one that is pairwise hour-exclusive AND whose stop sequences have a
+        # prefix or suffix containment relationship (the hallmark of a
+        # short-working / terminal-extension substitution).  That pair alone
+        # drives window derivation; co-active variants are left to the
+        # density-clustering fallback that follows.
+        _mid = _to_minutes_str(HALFDAY_MIDPOINT)
+        _ds  = _to_minutes_str(AM_PEAK_START)
+        _de  = _to_minutes_str(PM_PEAK_END)
+
+        for _i in range(len(variants)):
+            for _j in range(_i + 1, len(variants)):
+                _seq_i, _  = variants[_i]
+                _seq_j, _  = variants[_j]
+                _deps_i    = variant_dep_sets[_i]
+                _deps_j    = variant_dep_sets[_j]
+
+                # Pairwise hour-exclusivity
+                _pair_excl = True
+                for _h in range(6, 20):
+                    _hs, _he = _h * 60, (_h + 1) * 60
+                    if (any(_hs <= t < _he for t in _deps_i) and
+                            any(_hs <= t < _he for t in _deps_j)):
+                        _pair_excl = False
+                        break
+                if not _pair_excl:
+                    continue
+
+                # Stop-sequence containment: shorter must be a prefix or suffix
+                # of longer (short-working relationship)
+                _li, _lj = len(_seq_i), len(_seq_j)
+                if _li < _lj:
+                    _shorter, _longer  = _seq_i, _seq_j
+                    _off_deps, _pk_deps = _deps_i, _deps_j
+                else:
+                    _shorter, _longer  = _seq_j, _seq_i
+                    _off_deps, _pk_deps = _deps_j, _deps_i
+                _n = len(_shorter)
+                _is_prefix = _longer[:_n] == _shorter
+                _is_suffix = _longer[len(_longer) - _n:] == _shorter
+                if not (_is_prefix or _is_suffix):
+                    continue
+
+                # Derive windows from this exclusive pair (same logic as Path 1)
+                _pk_am = sorted(t for t in _pk_deps if _ds  <= t < _mid)
+                _pk_pm = sorted(t for t in _pk_deps if _mid <= t < _de)
+
+                _am_start_pw = _to_minutes_str(AM_PEAK_START)
+                if _pk_am:
+                    _later_pw  = sorted(t for t in _off_deps if t > _pk_am[-1] and t < _mid)
+                    _am_end_pw = _later_pw[0] if _later_pw else _to_minutes_str(AM_PEAK_END)
+                else:
+                    _am_end_pw = _to_minutes_str(AM_PEAK_END)
+
+                _pm_end_pw   = _to_minutes_str(PM_PEAK_END)
+                _pm_start_pw = _pk_pm[0] if _pk_pm else _to_minutes_str(PM_PEAK_START)
+
+                if _am_end_pw >= _pm_start_pw:
+                    continue  # degenerate window — try next pair
+
+                return {
+                    'am_start':    _minutes_to_time_str(_am_start_pw),
+                    'am_end':      _minutes_to_time_str(_am_end_pw),
+                    'pm_start':    _minutes_to_time_str(_pm_start_pw),
+                    'pm_end':      _minutes_to_time_str(_pm_end_pw),
+                    'op_start':    _minutes_to_time_str(_am_end_pw),
+                    'op_end':      _minutes_to_time_str(_pm_start_pw),
+                    'am_adaptive': True,
+                    'pm_adaptive': True,
+                }
+        # No exclusive pair found — fall through to density clustering
+
     weekday_trips = set(
         trips_all.loc[
             trips_all['trip_id'].isin(route_trip_ids) &
@@ -771,10 +974,20 @@ def _snap_to_standard_freq(raw_freq):
     return min(STANDARD_FREQUENCIES, key=lambda f: abs(f - raw_freq))
 
 
-def _median_freq(departures_df, time_col, min_departures=None):
-    """Compute dep/hr from median interior inter-departure gap, snapped to the
-    nearest standard frequency. Returns None if fewer than *min_departures*
-    departures (defaults to VARIANT_MIN_DEPARTURES_IN_WINDOW)."""
+def _median_freq(departures_df, time_col, min_departures=None, use_mean=False):
+    """Compute dep/hr from interior inter-departure gaps, snapped to the nearest
+    standard frequency. Returns None if fewer than *min_departures* departures
+    (defaults to VARIANT_MIN_DEPARTURES_IN_WINDOW).
+
+    use_mean=True  : use the arithmetic mean of interior gaps (appropriate for
+                     single-window queries — AM peak, PM peak — where two
+                     interlaced sub-series produce alternating short/long gaps
+                     and the median would be biased toward whichever gap type
+                     comes first in the window).
+    use_mean=False : use the lower-median (default, backward-compatible),
+                     which is robust to the large inter-window gap that appears
+                     when the combined off-peak pool (midday + evening) is passed.
+    """
     if min_departures is None:
         min_departures = VARIANT_MIN_DEPARTURES_IN_WINDOW
     if len(departures_df) < min_departures:
@@ -791,10 +1004,14 @@ def _median_freq(departures_df, time_col, min_departures=None):
     if not gaps:
         return None
 
-    median_gap = sorted(gaps)[len(gaps) // 2]
-    if median_gap <= 0:
+    if use_mean:
+        representative_gap = sum(gaps) / len(gaps)
+    else:
+        representative_gap = sorted(gaps)[len(gaps) // 2]
+
+    if representative_gap <= 0:
         return None
-    return _snap_to_standard_freq(60 / median_gap)
+    return _snap_to_standard_freq(60 / representative_gap)
 
 
 def _compute_frequencies(trip_ids, windows=None, min_departures=None):
@@ -812,39 +1029,33 @@ def _compute_frequencies(trip_ids, windows=None, min_departures=None):
         Defaults to VARIANT_MIN_DEPARTURES_IN_WINDOW.
 
     Returns dict with keys: freq_am_peak_dep_hr, freq_pm_peak_dep_hr, freq_offpeak_dep_hr.
+
+    Off-peak frequency uses the midday window only (op_start–op_end, typically 09:00–16:00
+    or an adaptive equivalent).  The evening off-peak window (19:00–20:00) is excluded from
+    frequency computation because its short duration (1 h) and the large gap separating it
+    from the midday pool would bias the mean upward.  Evening departures still count toward
+    total_dep, which is computed separately in build_outputs using the fixed OFFPEAK_WINDOWS.
+    All three windows use the arithmetic mean of interior gaps (use_mean=True) for consistency.
     """
     time_col = 'departure_time' if 'departure_time' in stop_times.columns else 'arrival_time'
 
     if windows is not None:
         am_s, am_e = windows['am_start'], windows['am_end']
         pm_s, pm_e = windows['pm_start'], windows['pm_end']
-        # When adaptive windows are provided, use only the midday off-peak from windows
-        # (evening off-peak is always added from OFFPEAK_WINDOWS)
-        op_windows_to_use = [(windows['op_start'], windows['op_end'])]
-        # Add evening off-peak window if it exists and differs from the adaptive window
-        for op_s, op_e in OFFPEAK_WINDOWS:
-            if (op_s, op_e) != (windows['op_start'], windows['op_end']):
-                op_windows_to_use.append((op_s, op_e))
+        op_s, op_e = windows['op_start'], windows['op_end']
     else:
         am_s, am_e = AM_PEAK_START, AM_PEAK_END
         pm_s, pm_e = PM_PEAK_START, PM_PEAK_END
-        op_windows_to_use = OFFPEAK_WINDOWS
+        op_s, op_e = OFFPEAK_START, OFFPEAK_END  # midday only: 09:00–16:00
 
     am_deps = _get_window_departures(trip_ids, time_col, am_s, am_e)
     pm_deps = _get_window_departures(trip_ids, time_col, pm_s, pm_e)
-
-    # Collect off-peak departures from all off-peak windows
-    op_parts = []
-    for op_s, op_e in op_windows_to_use:
-        op_deps = _get_window_departures(trip_ids, time_col, op_s, op_e)
-        if not op_deps.empty:
-            op_parts.append(op_deps)
-    combined_op_deps = pd.concat(op_parts, ignore_index=True) if op_parts else pd.DataFrame()
+    op_deps = _get_window_departures(trip_ids, time_col, op_s, op_e)
 
     return {
-        'freq_am_peak_dep_hr':  _median_freq(am_deps,  time_col, min_departures=min_departures),
-        'freq_pm_peak_dep_hr':  _median_freq(pm_deps,  time_col, min_departures=min_departures),
-        'freq_offpeak_dep_hr':  _median_freq(combined_op_deps,  time_col, min_departures=min_departures),
+        'freq_am_peak_dep_hr':  _median_freq(am_deps, time_col, min_departures=min_departures, use_mean=True),
+        'freq_pm_peak_dep_hr':  _median_freq(pm_deps, time_col, min_departures=min_departures, use_mean=True),
+        'freq_offpeak_dep_hr':  _median_freq(op_deps, time_col, min_departures=min_departures, use_mean=True),
     }
 
 
@@ -952,7 +1163,7 @@ _WMS_LAYER_NAME = 'Swisstopo National Map (grey)'
 _WMS_SOURCE     = ('contextualWMSLegend=0&amp;crs=EPSG:2056&amp;dpiMode=7'
                    '&amp;featureCount=10&amp;format=image/png'
                    '&amp;layers=ch.swisstopo.pixelkarte-grau'
-                   '&amp;styles=&amp;url=http://wms.geo.admin.ch/')
+                   '&amp;styles=&amp;url=https://wms.geo.admin.ch/')
 
 
 def _wms_maplayer():
@@ -1077,7 +1288,7 @@ def _configure_pipeline():
     if os.path.isdir(gtfs_base):
         subfolders = sorted([
             d for d in os.listdir(gtfs_base)
-            if os.path.isdir(os.path.join(gtfs_base, d))
+            if os.path.isdir(os.path.join(gtfs_base, d)) and '_raw' not in d
         ])
         if subfolders:
             print(f"   Available subfolders:")
@@ -2008,7 +2219,7 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
                 accepted_trips = set()
                 for _seq, _tids in variants:
                     accepted_trips |= _tids
-                dir_windows[direction_id] = _detect_peak_windows(accepted_trips)
+                dir_windows[direction_id] = _detect_peak_windows(accepted_trips, variants=variants)
             else:
                 dir_windows[direction_id] = None
             w = dir_windows[direction_id]
@@ -2047,6 +2258,20 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
                     continue
 
                 service_period  = _service_period_tag(variant_trip_ids, windows=_variant_windows)
+
+                # Align peak frequencies with service_period classification.
+                # offpeak_only: AM/PM values are artefacts of the off-peak service
+                #   running across a window boundary, not genuine peak service.
+                # peak_only: off-peak value is an artefact of the peak service
+                #   spilling into the off-peak window (rare, but makes it explicit).
+                freq_am = freqs['freq_am_peak_dep_hr']
+                freq_pm = freqs['freq_pm_peak_dep_hr']
+                freq_op = freqs['freq_offpeak_dep_hr']
+                if service_period == 'offpeak_only':
+                    freq_am = None
+                    freq_pm = None
+                elif service_period == 'peak_only':
+                    freq_op = None
 
                 # Total weekday departures across the full operational window (including all off-peak windows)
                 _time_col_td = 'departure_time' if 'departure_time' in stop_times.columns else 'arrival_time'
@@ -2096,9 +2321,9 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
                     'is_circular':           circular,
                     'n_stops':               len(seq),
                     'service_period':        service_period,
-                    'freq_am_peak_dep_hr':   freqs['freq_am_peak_dep_hr'],
-                    'freq_pm_peak_dep_hr':   freqs['freq_pm_peak_dep_hr'],
-                    'freq_offpeak_dep_hr':   freqs['freq_offpeak_dep_hr'],
+                    'freq_am_peak_dep_hr':   freq_am,
+                    'freq_pm_peak_dep_hr':   freq_pm,
+                    'freq_offpeak_dep_hr':   freq_op,
                     'total_dep':             total_dep,
                     'freq_directional':      False,  # placeholder — computed below
                     'geometry':              geom,
@@ -2213,11 +2438,11 @@ def build_outputs(route_ids, mode_label_map, mode_class_tag):
     return stops_by_type, lines_by_type
 
 
-def _round_half_min(minutes):
-    """Round a value in minutes to the nearest 0.5 (30-second precision), minimum 0.5."""
+def _round_half_min(minutes, floor=0.1):
+    """Round a value in minutes to the nearest 0.1. floor=0.1 for TT, floor=0 for IVWT."""
     if minutes is None:
         return None
-    return max(0.5, round(minutes * 2) / 2)
+    return max(floor, round(minutes * 10) / 10)
 
 
 def _compute_segment_travel_times(variant_trip_ids, seq, time_col='departure_time'):
@@ -2285,7 +2510,7 @@ def _compute_segment_travel_times(variant_trip_ids, seq, time_col='departure_tim
 
         results.append({
             'travel_time_min': _round_half_min(median_tt),
-            'InVehWait_min':   _round_half_min(median_dw),
+            'InVehWait_min':   _round_half_min(median_dw, floor=0),
         })
 
     return results
@@ -2341,8 +2566,12 @@ def build_segments(lines_by_type, mode_class_tag):
                     'to_stop_E':          to_pt.x,
                     'to_stop_N':          to_pt.y,
                     'TT':                 seg_times[i]['travel_time_min'],
+                    'tt_source':          'gtfs',
                     'IVWT':              seg_times[i]['InVehWait_min'],
                     'service_period':     row['service_period'],
+                    'freq_am_peak_dep_hr': row.get('freq_am_peak_dep_hr'),
+                    'freq_pm_peak_dep_hr': row.get('freq_pm_peak_dep_hr'),
+                    'freq_offpeak_dep_hr': row.get('freq_offpeak_dep_hr'),
                     'geometry':           geom,
                 }
                 segment_records.setdefault(rt, []).append(seg_rec)
@@ -2382,7 +2611,7 @@ def _build_stops_by_type(stop_ids_by_type, mode_class_tag, mode_label_map):
     keep_cols = [c for c in ['parent_numeric_id', 'stop_name', 'stop_lat', 'stop_lon',
                               'geometry'] if c in stops_sub.columns]
     stops_sub = stops_sub[keep_cols].copy()
-    stops_sub = stops_sub.rename(columns={'parent_numeric_id': 'stop_id'})
+    stops_sub = stops_sub.rename(columns={'parent_numeric_id': 'Number'})
 
     if mode_class_tag == 'rail':
         # Single layer: use the first (and typically only) route_type key
@@ -2397,7 +2626,7 @@ def _build_stops_by_type(stop_ids_by_type, mode_class_tag, mode_label_map):
                 return rt
         return next(iter(served)) if served else None
 
-    stops_sub['dominant_rt'] = stops_sub['stop_id'].map(_dominant)
+    stops_sub['dominant_rt'] = stops_sub['Number'].map(_dominant)
 
     stops_by_type = {}
     for rt in stops_sub['dominant_rt'].dropna().unique():
@@ -2539,7 +2768,7 @@ def _filter_stops_for_lines(lines_by_type, stops_by_type):
     for rt, gdf in stops_by_type.items():
         if gdf.empty:
             continue
-        filtered = gdf[gdf['stop_id'].isin(all_stop_ids)].copy()
+        filtered = gdf[gdf['Number'].isin(all_stop_ids)].copy()
         if not filtered.empty:
             result[rt] = filtered
     return result
@@ -2741,6 +2970,10 @@ if WRITE_FULLDAY:
                       rail_lines_by_type, RAIL_LINES_FILE,
                       rail_stops_by_type, RAIL_STOPS_FILE,
                       RAIL_LINE_TYPES, 'rail')
+    _build_segments_qgz(_rail_out_dir, RAIL_SEGMENTS_PROJECT_FILE,
+                        rail_segments_by_type, RAIL_SEGMENTS_FILE,
+                        rail_stops_by_type, RAIL_STOPS_FILE,
+                        RAIL_LINE_TYPES, 'rail')
 
 # Rail all-day QGZ
 if WRITE_ALLDAY:
