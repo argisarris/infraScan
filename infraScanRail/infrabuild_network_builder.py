@@ -277,6 +277,20 @@ def load_version(
 
     nodes    = gpd.read_file(nodes_path)
     segments = gpd.read_file(segs_path)
+
+    # GeoPackage can serialise numeric columns as string on round-trip.
+    # Coerce here so every downstream consumer sees proper numeric dtypes.
+    _SEG_NUM = ['Gauge', 'Length', 'Average_Speed', 'Predominant_Speed',
+                'Speed_Coverage_Pct', 'Track_Count']
+    for _col in _SEG_NUM:
+        if _col in segments.columns:
+            segments[_col] = pd.to_numeric(segments[_col], errors='coerce')
+
+    _NODE_NUM = ['Number', 'E', 'N']
+    for _col in _NODE_NUM:
+        if _col in nodes.columns:
+            nodes[_col] = pd.to_numeric(nodes[_col], errors='coerce')
+
     print(f"Loaded '{version}': {len(nodes)} nodes, {len(segments)} segments")
     return nodes, segments
 
@@ -1259,16 +1273,18 @@ def run_build_base(
     out_path.mkdir(parents=True, exist_ok=True)
     print("\n--- Exporting ---")
 
-    # ---- Round numeric columns to 3 decimal places -------------------------
-    _SEG_ROUND_COLS = [
+    # ---- Round numeric columns -----------------------------------------------
+    _SEG_ROUND_COLS_3 = [
         "Length", "Km_Start", "Km_End",
         "Tunnel_Length", "Bridge_Length", "Conventional_Length",
         "From_N", "From_E", "To_N", "To_E",
-        "TT_Passing", "TT_Stopping",
     ]
-    for col in _SEG_ROUND_COLS:
+    for col in _SEG_ROUND_COLS_3:
         if col in macro_segs.columns:
             macro_segs[col] = macro_segs[col].round(3)
+    for col in ("TT_Passing", "TT_Stopping"):
+        if col in macro_segs.columns:
+            macro_segs[col] = macro_segs[col].round(1)
 
     _NODE_ROUND_COLS = ["E", "N"]
     for col in _NODE_ROUND_COLS:
@@ -1798,30 +1814,33 @@ def _add_north_arrow(ax, location='upper left', scale=0.5):
     north_arrow(ax, location=location, scale=scale, rotation={"degrees": 0})
 
 
-def _add_scale_bar(ax, location=(0.755, 0.012)):
-    """Adaptive scale bar with 2-3 alternating black/white cells.
+def _add_scale_bar(ax, location=(0.97, 0.020)):
+    """Adaptive scale bar with 2-4 alternating black/white cells.
 
-    Automatically picks a round km value based on the current axes extent.
+    All coordinates are in axes fraction so the bar stays stable regardless
+    of aspect ratio or tight_layout timing.  location is (right_edge, bottom).
+    Bar length is derived from ax.get_xlim() and expressed as a fraction of
+    the axes width so the labelled distance remains accurate.
     """
-    xlim = ax.get_xlim()
-    ylim = ax.get_ylim()
+    xlim  = ax.get_xlim()
     map_w = xlim[1] - xlim[0]
-    map_h = ylim[1] - ylim[0]
 
     target_km = (map_w / 4.0) / 1000.0
     total_km  = min(_SCALE_BAR_NICE_KM, key=lambda v: abs(v - target_km))
     n_cells   = 4 if total_km >= 4 else 2
     cell_m    = (total_km * 1000.0) / n_cells
+    cell_frac = cell_m / map_w  # axes-fraction width per cell
 
-    x0    = xlim[0] + map_w * location[0]
-    y0    = ylim[0] + map_h * location[1]
-    bar_h = map_h * 0.008
+    x0    = location[0] - n_cells * cell_frac  # left edge, anchored from right
+    y0    = location[1]
+    bar_h = 0.012  # axes fraction
 
     for i in range(n_cells):
         color = 'black' if i % 2 == 0 else 'white'
         rect = Rectangle(
-            (x0 + i * cell_m, y0), cell_m, bar_h,
-            facecolor=color, edgecolor='black', linewidth=0.6, zorder=7,
+            (x0 + i * cell_frac, y0), cell_frac, bar_h,
+            facecolor=color, edgecolor='black', linewidth=0.6,
+            transform=ax.transAxes, zorder=7,
         )
         ax.add_patch(rect)
 
@@ -1830,8 +1849,9 @@ def _add_scale_bar(ax, location=(0.755, 0.012)):
         label  = (f'{val_km:.0f} km' if val_km == int(val_km)
                   else f'{val_km:.1f} km')
         ax.text(
-            x0 + i * cell_m, y0 + bar_h * 1.6,
-            label, ha='center', va='bottom', fontsize=7, zorder=7,
+            x0 + i * cell_frac, y0 + bar_h * 1.6,
+            label, ha='center', va='bottom', fontsize=7,
+            transform=ax.transAxes, zorder=7,
         )
 
 
@@ -3582,6 +3602,8 @@ def plot_speed_map(
     def _plot_segs(gdf, alpha):
         if gdf is None or gdf.empty:
             return
+        gdf = gdf.copy()
+        gdf['Predominant_Speed'] = pd.to_numeric(gdf['Predominant_Speed'], errors='coerce')
         no_data = gdf['Predominant_Speed'].isna()
         if no_data.any():
             gdf[no_data].plot(ax=ax, color=SPEED_NO_DATA_COLOR, linewidth=2, alpha=alpha)
@@ -3659,18 +3681,24 @@ if __name__ == "__main__":
     print("[Step 0 / Q1]  Which network version to build?")
     print("─" * 60)
 
+    _NEW_BASE = '[New Base]'
+
     if not _any_base_ready:
         print("\n  Note: No Base network exists yet.")
         print("  Build Base first before creating or analysing named versions.")
-        _versions_avail: List[str] = ['Base']
+        _versions_avail: List[str] = [_NEW_BASE]
     else:
         _versions_avail = list_versions()
-        if not _versions_avail:
-            _versions_avail = ['Base']
+        _versions_avail.append(_NEW_BASE)
 
     print("\n  Available:")
     for _i, _v in enumerate(_versions_avail, 1):
-        _tag = "  [base]" if _v == 'Base' else ""
+        if _v == _NEW_BASE:
+            _tag = "  [build from Raw]"
+        elif _v == 'Base':
+            _tag = "  [base]"
+        else:
+            _tag = ""
         print(f"    {_i}) {_v}{_tag}")
 
     while True:
@@ -3798,7 +3826,45 @@ if __name__ == "__main__":
     print("[Step 1]  Network building")
     print("─" * 60)
 
-    if _chosen.startswith('Base'):
+    if _chosen == _NEW_BASE:
+        if len(_raw_dirs) == 1:
+            _chosen_raw = _raw_dirs[0]
+            print(f"\n  Using Raw folder: {_chosen_raw}")
+        else:
+            print("\n  Available Raw folders:")
+            for _ri, _rn in enumerate(_raw_dirs, 1):
+                print(f"    {_ri}) {_rn}")
+            while True:
+                _rsel = input("\n  Select Raw folder [1]: ").strip() or "1"
+                if _rsel.isdigit() and 1 <= int(_rsel) <= len(_raw_dirs):
+                    _chosen_raw = _raw_dirs[int(_rsel) - 1]
+                    break
+                elif _rsel in _raw_dirs:
+                    _chosen_raw = _rsel
+                    break
+                print(f"  Invalid — enter 1–{len(_raw_dirs)} or an exact name.")
+
+        _raw_suffix       = _chosen_raw[3:]
+        _out_folder       = 'Base' + _raw_suffix
+        _chosen_base_path = _infra_root / _out_folder
+        _chosen           = _out_folder
+
+        if (_chosen_base_path / 'nodes.gpkg').exists():
+            _overwrite = input(
+                f"\n  {_out_folder} already exists. Overwrite? (y/n) [n]: "
+            ).strip().lower() or "n"
+            if _overwrite != 'y':
+                print("  Aborted.")
+                raise SystemExit(0)
+
+        _nodes, _segments, _composition = run_build_base(
+            raw_dir=str(_infra_root / _chosen_raw),
+            output_dir=str(_chosen_base_path),
+        )
+        _version_dir = _chosen_base_path
+        _base_path   = _chosen_base_path
+
+    elif _chosen.startswith('Base'):
         _chosen_base_path = _infra_root / _chosen
         _chosen_base_ready = (
             (_chosen_base_path / 'nodes.gpkg').exists() and

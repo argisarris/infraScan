@@ -89,13 +89,8 @@ _FEEDER_LAYER_MODE: Dict[str, str] = {
 # =============================================================================
 
 def _round_half_min(x: float) -> float:
-    """Round to nearest 0.5 minutes, floor 0.1 min.
-
-    Floor of 0.1 (was 0.5) preserves short-segment fidelity. The 0.5 step is
-    kept because GTFS source resolution is typically 1 min — finer steps
-    would imply false precision.
-    """
-    return max(0.1, round(x * 2) / 2)
+    """Round to nearest 0.1 minutes, floor 0.1 min."""
+    return max(0.1, round(x * 10) / 10)
 
 
 def _seg_expected_tt(seg_row: pd.Series) -> float:

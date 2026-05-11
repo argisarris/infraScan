@@ -122,6 +122,35 @@ def _owner_options(segments: gpd.GeoDataFrame) -> List[str]:
     return sorted(segments['Route_Owner'].dropna().astype(str).unique().tolist())
 
 
+def _parse_selection(ans: str, max_count: int) -> List[int]:
+    """Parse a diff-selection string into a sorted list of 0-based indices.
+
+    Accepts 'all', individual numbers, ranges (e.g. '21-25'), and any
+    comma-separated combination (e.g. '1,3,21-25,30').
+    Out-of-range entries are silently ignored.
+    """
+    if ans.strip().lower() == 'all':
+        return list(range(max_count))
+    indices: List[int] = []
+    for part in ans.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            bounds = part.split('-', 1)
+            if bounds[0].isdigit() and bounds[1].isdigit():
+                lo = int(bounds[0]) - 1
+                hi = int(bounds[1]) - 1
+                for i in range(min(lo, hi), max(lo, hi) + 1):
+                    if 0 <= i < max_count:
+                        indices.append(i)
+        elif part.isdigit():
+            val = int(part) - 1
+            if 0 <= val < max_count:
+                indices.append(val)
+    return indices
+
+
 def _prompt_composition_pieces(
     seg_id: str,
     from_name: str,
@@ -331,7 +360,7 @@ def _run_phase0() -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame,
 
         # Q3 — name for the new version
         while True:
-            name = input("\n  Name for the new version (e.g. AK_2035): ").strip()
+            name = input("\n  Name for the new version (e.g. AS_2035): ").strip()
             if not name:
                 print("  Name cannot be empty.")
                 continue
@@ -1416,20 +1445,11 @@ def _import_nodes(
     for j, (_, status, _, desc) in enumerate(diff_items, 1):
         print(f"    {j}) [{status}] {desc}")
 
-    ans = input("\n  Enter numbers to apply (comma-separated), 'all', or Enter to cancel: ").strip().lower()
+    ans = input("\n  Enter numbers to apply (e.g. 1,3,21-25), 'all', or Enter to cancel: ").strip()
     if not ans:
         return current_nodes
 
-    selected_indices = []
-    if ans == 'all':
-        selected_indices = list(range(len(diff_items)))
-    else:
-        for part in ans.split(','):
-            part = part.strip()
-            if part.isdigit():
-                val = int(part) - 1
-                if 0 <= val < len(diff_items):
-                    selected_indices.append(val)
+    selected_indices = _parse_selection(ans, len(diff_items))
 
     if not selected_indices:
         print("  No valid choices selected.")
@@ -1557,20 +1577,11 @@ def _import_segments(
     for j, (_, status, _, desc) in enumerate(diff_items, 1):
         print(f"    {j}) [{status}] {desc}")
 
-    ans = input("\n  Enter numbers to apply (comma-separated), 'all', or Enter to cancel: ").strip().lower()
+    ans = input("\n  Enter numbers to apply (e.g. 1,3,21-25), 'all', or Enter to cancel: ").strip()
     if not ans:
         return current_segs, current_comp
 
-    selected_indices = []
-    if ans == 'all':
-        selected_indices = list(range(len(diff_items)))
-    else:
-        for part in ans.split(','):
-            part = part.strip()
-            if part.isdigit():
-                val = int(part) - 1
-                if 0 <= val < len(diff_items):
-                    selected_indices.append(val)
+    selected_indices = _parse_selection(ans, len(diff_items))
 
     if not selected_indices:
         print("  No valid choices selected.")
