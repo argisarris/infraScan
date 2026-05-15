@@ -15,7 +15,8 @@ DEVELOPMENT_DIRECTORY = r"data\Network\processed\developments"
 RAIL_NODES_PATH = r"data\Network\Rail_Node.csv"
 RAIL_POINTS_PATH = r"data\Network\processed\points.gpkg"
 OD_KT_ZH_PATH = r'data/traffic_flow/od/original/KTZH_00001982_00003903.xlsx'
-OD_STATIONS_KT_ZH_PATH = r'data/traffic_flow/od/rail/ktzh/od_matrix_stations_ktzh_20.csv'
+OD_STATIONS_KT_ZH_PATH      = r'data/traffic_flow/od/rail/ktzh/od_matrix_stations_ktzh_20.csv'
+OD_STATIONS_KT_ZH_2040_PATH = r'data/traffic_flow/od/rail/ktzh/od_matrix_stations_ktzh_2040.csv'
 # Station-pair OD matrices (W3): two methods × three time windows.
 OD_STATIONS_PT_FEEDER_AM_PEAK_PATH  = r'data/traffic_flow/od/rail/pt_feeder/od_matrix_stations_pt_feeder_am_peak.csv'
 OD_STATIONS_PT_FEEDER_OFF_PEAK_PATH = r'data/traffic_flow/od/rail/pt_feeder/od_matrix_stations_pt_feeder_off_peak.csv'
@@ -49,6 +50,57 @@ TLMREGIO_RAILWAY_SHP = r"data/Spatial_Data/Land_Use/Transportation/swissTLMRegio
 NETWORK_INFRASTRUCTURE_DIR  = r"data/Infrastructure"
 # Raw/  : spatial-filtered BAV output (infrabuild_filter_network.py stage 1)
 NETWORK_INFRASTRUCTURE_RAW  = r"data/Infrastructure/Raw"
+
+def get_infra_version_dir(version: str) -> str:
+    """Return absolute path to the named infrastructure version directory."""
+    return os.path.join(MAIN, NETWORK_INFRASTRUCTURE_DIR, version)
+
+def get_infra_raw_dir(version: str) -> str:
+    """Return absolute path to the named infrastructure raw directory.
+
+    Args:
+        version: Raw folder name from settings.INFRA_RAW_VERSION, e.g. 'Raw_ZH'.
+    """
+    return os.path.join(MAIN, NETWORK_INFRASTRUCTURE_DIR, version)
+
+def infra_version_exists(version: str) -> bool:
+    """True if nodes.gpkg, segments.gpkg and segments_composition.gpkg all exist."""
+    d = get_infra_version_dir(version)
+    return all(
+        os.path.isfile(os.path.join(d, f))
+        for f in ('nodes.gpkg', 'segments.gpkg', 'segments_composition.gpkg')
+    )
+
+def get_projected_services_path(svc_version: str, infra_version: str) -> str:
+    """Return absolute path to projected rail edges for a svc/infra version pair."""
+    return os.path.join(MAIN, RAIL_LINES_DIR, svc_version + '_network', infra_version, 'edges_all.gpkg')
+
+def svc_version_exists(svc_version: str) -> bool:
+    """True if the svc_version network folder has a complete Unprojected rail base."""
+    d = os.path.join(MAIN, RAIL_LINES_DIR, svc_version + '_network', SERVICES_UNPROJECTED_SUBDIR)
+    return all(
+        os.path.isfile(os.path.join(d, f))
+        for f in ('rail_lines.gpkg', 'rail_segments.gpkg', 'rail_stops.gpkg')
+    )
+
+def svc_feeder_exists(svc_version: str) -> bool:
+    """True if the svc_version network folder has a complete Unprojected PT-feeder base."""
+    d = os.path.join(MAIN, FEEDER_LINES_DIR, svc_version + '_network', SERVICES_UNPROJECTED_SUBDIR)
+    return all(
+        os.path.isfile(os.path.join(d, f))
+        for f in ('pt_feeder_lines.gpkg', 'pt_feeder_segments.gpkg', 'pt_feeder_stops.gpkg')
+    )
+
+def svc_named_version_exists(svc_version: str, named_version: str) -> bool:
+    """True if the named service sub-version exists under Versions/."""
+    return os.path.isfile(
+        os.path.join(MAIN, RAIL_LINES_DIR, svc_version + '_network', SERVICES_VERSIONS_SUBDIR,
+                     named_version, 'rail_segments.gpkg')
+    )
+
+def svc_projected_exists(svc_version: str, infra_version: str) -> bool:
+    """True if the service version has been projected to the given infra version."""
+    return os.path.isfile(get_projected_services_path(svc_version, infra_version))
 NETWORK_INFRASTRUCTURE_RAW_NODES                = r"data/Infrastructure/Raw/nodes.gpkg"
 NETWORK_INFRASTRUCTURE_RAW_SEGMENTS             = r"data/Infrastructure/Raw/segments.gpkg"
 NETWORK_INFRASTRUCTURE_RAW_SEGMENTS_COMPOSITION = r"data/Infrastructure/Raw/segments_composition.gpkg"
@@ -71,7 +123,8 @@ POPULATION_SCENARIO_CH_BFS_2055 = r"data\Scenario\pop_scenario_switzerland_2055.
 POPULATION_SCENARIO_CH_EUROSTAT_2100 = r"data\Scenario\Eurostat_population_CH_2100.xlsx"
 POPULATION_PER_COMMUNE_ZH_2018 = r"data\Scenario\population_by_gemeinde_2018.csv"
 RANDOM_SCENARIO_CACHE_PATH = r"data\Scenario\cache"
-DISTRICT_PATH = r"data\_basic_data\Gemeindegrenzen\UP_BEZIRKE_F.shp"
+DISTRICT_PATH     = r"data/Spatial_Data/Boundaries/SwissBoundaries_Bezirke_2026_CH.gpkg"
+COMMUNE_RASTER_TIF = r"data/Spatial_Data/Land_Use/Boundaries/gemeinde_zh.tif"
 CANTON_BOUNDARIES_GPKG = r"data/Spatial_Data/Boundaries/Swissboundaries_Cantons_2026_CH.gpkg"
 BEZIRKE_BOUNDARIES_GPKG = r"data/Spatial_Data/Boundaries/SwissBoundaries_Bezirke_2026_CH.gpkg"
 MUNICIPAL_BOUNDARIES_GPKG = r"data/Spatial_Data/Boundaries/SwissBoundaries_Municipalities_2026_CH.gpkg"
@@ -87,16 +140,21 @@ SERVICES_VERSIONS_SUBDIR    = "Versions"
 RAIL_PROCESSED_DIR = r"data/Network/processed"
 EDGES_IN_CORRIDOR_GPKG = r"data/Network/processed/edges_in_corridor.gpkg"
 
-STUDY_AREA_DIR           = r"data/Study_Area"
-STUDY_AREA_BOUNDARY_GPKG = r"data/Study_Area/study_area_boundary.gpkg"
-STUDY_AREA_BUFFER_GPKG   = r"data/Study_Area/study_area_buffer.gpkg"
+STUDY_AREA_DIR           = r"data/Catchment_Area/Boundaries"
+STUDY_AREA_BOUNDARY_GPKG = r"data/Catchment_Area/Boundaries/study_area_boundary.gpkg"
+STUDY_AREA_BUFFER_GPKG   = r"data/Catchment_Area/Boundaries/study_area_buffer.gpkg"
 
 CATCHMENT_AREA_DIR           = r"data/Catchment_Area"
-CATCHMENT_AREA_BOUNDARY_GPKG = r"data/Catchment_Area/catchment_area_boundary.gpkg"
-CATCHMENT_AREA_BUFFER_GPKG   = r"data/Catchment_Area/catchment_area_buffer.gpkg"
+CATCHMENT_AREA_BOUNDARY_GPKG = r"data/Catchment_Area/Boundaries/catchment_area_boundary.gpkg"
+CATCHMENT_AREA_BUFFER_GPKG   = r"data/Catchment_Area/Boundaries/catchment_area_buffer.gpkg"
 POPULATION_CSV_2023 = r"data/Spatial_Data/Land_Use/Population/Inhabitants_2023_CH.csv"
 EMPLOYMENT_CSV_2023 = r"data/Spatial_Data/Land_Use/Employment/Employment_FTE_2023_CH.csv"
-LAKES_SHP          = r"data/Spatial_Data/Land_Use/Hydrography/swissTLMRegio_Lake.shp"
+# Canton Zurich commune-level actuals (population 1962-2025, employment 2011-2023)
+POPULATION_CANTON_ZH_XLSX = r"data/Spatial_Data/Land_Use/Population/Canton_Zurich/KTZH_00000127_00001245.xlsx"
+EMPLOYMENT_CANTON_ZH_CSV  = r"data/Spatial_Data/Land_Use/Employment/Canton_Zurich/ZGZ_Daten_Komplett_vzae_sektor_2026-05-15_144034.csv"
+LAKES_SHP    = r"data/Spatial_Data/Land_Use/Hydrography/swissTLMRegio_Lake.shp"
+LAKES_CA_GPKG = r"data/Spatial_Data/Land_Use/Hydrography/lakes_ca.gpkg"
+LAKES_SA_GPKG = r"data/Spatial_Data/Land_Use/Hydrography/lakes_sa.gpkg"
 
 CONSTRUCTION_COSTS =  r"data/costs/construction_cost.csv"
 TOTAL_COST_WITH_GEOMETRY = r"data/costs/total_costs_with_geometry.csv"
@@ -109,17 +167,22 @@ TTS_CACHE = r"data/Network/travel_time/cache/compute_tts_cache.pkl"
 PLOT_DIRECTORY = r"plots"
 PLOT_SCENARIOS = r"plots/scenarios"
 
-def get_rail_services_path(rail_network_settings):
+def get_rail_services_path(version: str) -> str:
+    """Return the rail services path for legacy version names.
+
+    Legacy names (used by main.py and main_cap.py) are mapped to their fixed
+    file paths.  New versioned names (e.g. 'AK_2035' paired with an infra
+    version) must use get_projected_services_path(svc_version, infra_version).
     """
-    Returns the path to the rail services file based on the rail network settings.
-    """
-    if rail_network_settings == 'AK_2035':
-        return RAIL_SERVICES_AK2035_PATH
-    elif rail_network_settings == 'AK_2035_extended':
-        return RAIL_SERVICES_AK2035_EXTENDED_PATH
-    elif rail_network_settings == 'current':
-        return RAIL_SERVICES_2024_PATH
-    elif rail_network_settings == '2024_extended':
-        return RAIL_SERVICES_AK2024_EXTENDED_PATH
-    else:
-        raise ValueError("Invalid rail network settings provided.")
+    _legacy = {
+        'AK_2035':          RAIL_SERVICES_AK2035_PATH,
+        'AK_2035_extended': RAIL_SERVICES_AK2035_EXTENDED_PATH,
+        'current':          RAIL_SERVICES_2024_PATH,
+        '2024_extended':    RAIL_SERVICES_AK2024_EXTENDED_PATH,
+    }
+    if version in _legacy:
+        return _legacy[version]
+    raise ValueError(
+        f"Rail services path for '{version}' must be resolved via "
+        f"get_projected_services_path(svc_version, infra_version)."
+    )
