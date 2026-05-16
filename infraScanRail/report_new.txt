@@ -3,48 +3,35 @@ INFRASCANRAIL NEW PIPELINE - RUN LOG
 ================================================================================
   RUN CONFIGURATION
 ================================================================================
-  Infrastructure   : AS_2026_ZH
+  Infrastructure   : Build_New  -->  build as 'AS_2035_ZH'
   Raw version      : Raw_ZH
-  Services         : SVC2026_ZH_S18
+  Services         : AK_2026_S18  [needs projection]
   GTFS version     : GTFS_SVC2026_ZH_S18
   Canton           : ZH
   Catchment method : PT_Feeder  (OD: feeder_weighted)
   Capacity mode    : Dynamic
-  OD type          : canton_ZH  (base year 2018)
-  Population base  : 2018
+  OD type          : canton_ZH  (base year 2023)
+  Population base  : 2023
   Scenarios        : 100 x [2018-2100]
   Visualisation    : manual
 --------------------------------------------------------------------------------
 
 
---- Grid Scaling (Step 2.2) ---
-
-  Grid scaling 2023 → 2018 by Bezirk:
-  Bezirk       | Population | Employment
-  -------------+------------+-----------
-  Affoltern    |     0.9471 |     0.9619
-  Andelfingen  |     0.9586 |     0.9285
-  Bülach       |     0.9231 |     0.8960
-  Dielsdorf    |     0.9509 |     0.9619
-  Dietikon     |     0.9321 |     0.9072
-  Hinwil       |     0.9485 |     0.9628
-  Horgen       |     0.9504 |     0.9687
-  Meilen       |     0.9591 |     0.9497
-  Pfäffikon    |     0.9583 |     0.9478
-  Uster        |     0.9406 |     0.9845
-  Winterthur   |     0.9405 |     0.9266
-  Zürich       |     0.9569 |     0.9049
-  -------------+------------+-----------
-  Mean         |     0.9472 |     0.9417
-
-  Total population  :    1,609,779 (2023) →    1,524,745 (2018)
-  Total employment  :      914,349 (2023) →      843,424 (2018)
+--- Enhancement Stats: AS_2035_ZH_enhanced ---
+  Total segments       : 694
+  TT_Stopping filled   : 661 (95.2%)
+  speed_source = GTFS  : 0
+  speed_source = OSM   : 2
+  speed_source = infra : 31
+  Feeder-derived segs  : 27
 PHASE RUNTIMES
 ================================================================================
 
-Phase 1: Initialisation..................................... 0m 0s (0.29s)
-Phase 2: Data Preparation................................... 0m 6s (6.48s)
+Phase 1: Initialisation..................................... 0m 3s (3.97s)
+Phase 2: Data Preparation................................... 0m 52s (52.81s)
+Phase 3A: Infrastructure Network Build...................... 3m 48s (228.31s)
+Phase 3B: Services Network Build............................ 4m 40s (280.45s)
 
 ================================================================================
-TOTAL TIME.................................................. 0m 6s (6.77s)
+TOTAL TIME.................................................. 9m 25s (565.54s)
 ================================================================================

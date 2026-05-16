@@ -77,7 +77,7 @@ MODE_COLOURS = {
 }
 
 # Feeder background colours for the gazette-with-feeders plot
-_BUS_COLOUR  = "#3C94FA"   # blue
+_BUS_COLOUR  = "#0274F7"   # blue
 _SHIP_COLOUR = "#0f0202"   # black
 _FEEDER_BG_COLOURS: Dict[str, str] = {
     "bus": _BUS_COLOUR, "express_bus": _BUS_COLOUR, "ondemand_bus": _BUS_COLOUR,
@@ -262,6 +262,8 @@ class ProjectionConfig:
     rail_output_dir: Path    # data/Network/Rail_Lines/<svc>/<infra>/
     feeder_output_dir: Path  # data/Network/Feeder_Lines/<svc>/<infra>/
     raw_infra_dir: Path      # data/Infrastructure/Raw/
+    auto_mode: bool = False             # when True, skip all interactive prompts
+    include_feeder_plots: bool = True   # when False, skip _with_feeders plot variant
 
 
 # =============================================================================
@@ -1016,12 +1018,19 @@ def build_infra_graph(
         # Cruise speed in m/s. Cascade: Average_Speed (length-weighted OSM mean,
         # the harmonically-correct measure for traversal time) → Predominant_Speed
         # (most-common bin, less accurate for time) → mode default → 50 km/h.
-        spd = seg.get("Average_Speed")
-        if pd.isna(spd) or float(spd) <= 0:
-            spd = seg.get("Predominant_Speed")
-        if pd.isna(spd) or float(spd) <= 0:
-            spd = _default_speed(seg.get("Transport_Mode"), seg.get("Gauge"))
-        if spd is None or float(spd) <= 0:
+        def _to_float(v):
+            try:
+                f = float(v)
+                return f if not pd.isna(f) else None
+            except (TypeError, ValueError):
+                return None
+
+        spd = _to_float(seg.get("Average_Speed"))
+        if not spd or spd <= 0:
+            spd = _to_float(seg.get("Predominant_Speed"))
+        if not spd or spd <= 0:
+            spd = _to_float(_default_speed(seg.get("Transport_Mode"), seg.get("Gauge")))
+        if not spd or spd <= 0:
             spd = RAIL_DEFAULT_SPEED_KMH
         cruise_speed_ms = float(spd) / 3.6
 
@@ -3331,17 +3340,9 @@ def _list_svc_versions() -> List[str]:
 
 
 def _list_source_options(svc_version: str) -> List[Tuple[str, Path]]:
-    """Return (label, path) pairs for Unprojected/ and any named Versions/."""
+    """Return (label, path) pairs for Unprojected/ source."""
     root = Path(paths.MAIN) / paths.FEEDER_LINES_DIR / svc_version
-    options: List[Tuple[str, Path]] = [
-        ("Unprojected (canonical base)", root / paths.SERVICES_UNPROJECTED_SUBDIR)
-    ]
-    versions_dir = root / paths.SERVICES_VERSIONS_SUBDIR
-    if versions_dir.exists():
-        for d in sorted(versions_dir.iterdir()):
-            if d.is_dir() and (d / "pt_feeder_segments.gpkg").exists():
-                options.append((f"Version: {d.name}", d))
-    return options
+    return [("Unprojected (canonical base)", root / paths.SERVICES_UNPROJECTED_SUBDIR)]
 
 
 def _list_projection_outputs() -> List[Tuple[str, str]]:
@@ -4324,9 +4325,7 @@ def _save_phase2_outputs(
         else:
             print(f"  {area_label} segments — no features within boundary.")
 
-    study_path = main / paths.CATCHMENT_AREA_DIR / "study_area_boundary.gpkg"
-    if not study_path.exists():
-        study_path = main / paths.STUDY_AREA_BOUNDARY_GPKG
+    study_path = main / paths.STUDY_AREA_BOUNDARY_GPKG
     _clip_and_save(
         study_path,
         config.feeder_output_dir / "projected_segments_study.gpkg",
@@ -4515,6 +4514,9 @@ def _run_phase2(
     _save_phase2_outputs(config, rail_enriched, tram_enriched, func_enriched)
 
     print("\n  Open the .qgz files in QGIS to inspect routing and identify any errors before making corrections.")
+    if config.auto_mode:
+        print("  Auto mode — skipping reroute step.")
+        return rail_enriched, tram_enriched, func_enriched
     ans = input("\n  Do you want to reroute any service? (y/n) [n]: ").strip().lower() or "n"
     if ans != "y":
         print("  No corrections made.")
@@ -5191,7 +5193,8 @@ def _plot_gazette_style(
     _add_scale_bar(ax, location=(0.755, 0.012))
     plt.tight_layout()
 
-    out_dir = (main / paths.NETWORK_PLOTS_DIR / "Rail_Lines"
+    _lines_subdir = "Feeder_Lines" if feeder_bg_gdfs else "Rail_Lines"
+    out_dir = (main / paths.NETWORK_PLOTS_DIR / _lines_subdir
                / config.svc_version / config.infra_version)
     out_dir.mkdir(parents=True, exist_ok=True)
     _fsuffix = "_with_feeders" if feeder_bg_gdfs else ""
@@ -5613,7 +5616,7 @@ def _run_phase3(
             config, rail_enriched, tram_enriched, func_enriched,
             boundary_path, label,
         )
-        if _feeder_bg:
+        if _feeder_bg and config.include_feeder_plots:
             _plot_gazette_style(
                 config, rail_enriched, tram_enriched, func_enriched,
                 boundary_path, label,
@@ -5629,14 +5632,94 @@ def _run_phase3(
 # Main
 # =============================================================================
 
+def _run_phase0_auto(svc_version: str, infra_version: str, include_feeder_plots: bool = True) -> Optional[Tuple[ProjectionConfig, str]]:
+    """Non-interactive Phase 0: mode=map, source=Unprojected.
+
+    Args:
+        svc_version:           Service version name WITHOUT '_network' suffix.
+        include_feeder_plots:  When False, skip the _with_feeders plot variant.
+        infra_version: Infrastructure version name (e.g. 'AS_2026_ZH').
+    """
+    main = Path(paths.MAIN)
+    svc_folder = svc_version + '_network'
+
+    raw_dirs = _list_raw_dirs()
+    if not raw_dirs:
+        print("  ERROR: No Raw folder found in data/Infrastructure/.")
+        return None
+    chosen_raw = raw_dirs[0]
+    raw_infra_dir = main / paths.NETWORK_INFRASTRUCTURE_DIR / chosen_raw
+
+    available_svc = _list_svc_versions()
+    if svc_folder not in available_svc:
+        print(f"  ERROR: Service version '{svc_folder}' not found in {paths.FEEDER_LINES_DIR}.")
+        print(f"  Available: {available_svc}")
+        return None
+
+    available_infra = _list_infra_versions()
+    if infra_version not in available_infra:
+        print(f"  ERROR: Infrastructure version '{infra_version}' not found.")
+        print(f"  Available: {available_infra}")
+        return None
+
+    source_feeder_path = main / paths.FEEDER_LINES_DIR / svc_folder / paths.SERVICES_UNPROJECTED_SUBDIR
+    source_rail_path   = main / paths.RAIL_LINES_DIR   / svc_folder / paths.SERVICES_UNPROJECTED_SUBDIR
+
+    rail_output_dir   = main / paths.RAIL_LINES_DIR   / svc_folder / infra_version
+    feeder_output_dir = main / paths.FEEDER_LINES_DIR / svc_folder / infra_version
+    rail_output_dir.mkdir(parents=True, exist_ok=True)
+    feeder_output_dir.mkdir(parents=True, exist_ok=True)
+
+    _include_feeder_plots = include_feeder_plots
+
+    config = ProjectionConfig(
+        infra_version=infra_version,
+        svc_version=svc_folder,
+        infra_dir=main / paths.NETWORK_INFRASTRUCTURE_DIR / infra_version,
+        svc_dir=source_feeder_path,
+        rail_input=source_rail_path / "rail_segments.gpkg",
+        rail_output_dir=rail_output_dir,
+        feeder_output_dir=feeder_output_dir,
+        raw_infra_dir=raw_infra_dir,
+        auto_mode=True,
+        include_feeder_plots=_include_feeder_plots,
+    )
+
+    print(f"\n  Auto-config (non-interactive):")
+    print(f"  Service version : {svc_folder}")
+    print(f"  Source          : Unprojected")
+    print(f"  Infrastructure  : {infra_version}")
+    print(f"  Rail output     : {rail_output_dir}")
+    print(f"  Feeder output   : {feeder_output_dir}")
+    return config, "map"
+
+
 def main() -> None:
-    """Interactive entry point for the service projection pipeline."""
+    """Entry point for the service projection pipeline."""
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--svc-version',      default=None,
+                        help='Service version name (without _network suffix)')
+    parser.add_argument('--infra-version',    default=None,
+                        help='Infrastructure version name')
+    parser.add_argument('--no-feeder-plots',  action='store_true', default=False,
+                        help='Skip the _with_feeders plot variant')
+    args, _ = parser.parse_known_args()
+
     if not _check_prerequisites():
         raise SystemExit(1)
 
-    result = _run_phase0()
-    if result is None:
-        raise SystemExit(0)
+    if args.svc_version and args.infra_version:
+        result = _run_phase0_auto(
+            args.svc_version, args.infra_version,
+            include_feeder_plots=not args.no_feeder_plots,
+        )
+        if result is None:
+            raise SystemExit(1)
+    else:
+        result = _run_phase0()
+        if result is None:
+            raise SystemExit(0)
 
     config, mode = result
 

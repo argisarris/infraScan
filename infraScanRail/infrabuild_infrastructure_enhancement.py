@@ -43,6 +43,7 @@ from shapely.ops import linemerge
 
 sys.path.insert(0, str(Path(__file__).parent))
 import paths
+import settings
 from infrabuild_version_manager import list_versions, _pick_one
 
 
@@ -166,7 +167,6 @@ def _list_projection_sources(svc_version: str, infra_version: str) -> List[Tuple
     """
     _SKIP = {
         paths.SERVICES_UNPROJECTED_SUBDIR,
-        paths.SERVICES_VERSIONS_SUBDIR,
         paths.SERVICES_PROJECTED_SUBDIR,
     }
     feeder_root = Path(paths.MAIN) / paths.FEEDER_LINES_DIR / svc_version
@@ -633,13 +633,6 @@ def _run_phase0():
     # Detect extend mode from the _enhanced suffix.
     extend_mode = infra_version.lower().endswith('_enhanced')
     if extend_mode:
-        print("\n" + "─" * 60)
-        print("  This version already has calibrated TT and speed values.")
-        print("  Re-run will ONLY extend coverage to previously uncovered segments.")
-        print("  Existing calibrated values will not be changed (in-place update).")
-        ans = input("  Continue? (y/n) [n]: ").strip().lower() or 'n'
-        if ans != 'y':
-            raise SystemExit(0)
         enhanced_dir = infra_dir
 
     # Q2: svc_version
@@ -1159,6 +1152,7 @@ def compute_segment_stats(
     infra_dir: Path,
     enhanced_dir: Path,
     extend_mode: bool = False,
+    conflict_t1: str = 'service',
 ) -> Tuple[gpd.GeoDataFrame, Optional[gpd.GeoDataFrame]]:
     """
     Returns (enriched_base_segments, feeder_derived_segments).
@@ -1480,18 +1474,25 @@ def compute_segment_stats(
     print(f"  {len(stop_ids)} unique stop node IDs.")
 
     # ── 4. Decompose path_nodes and collect contributions ────────────────────
-    # tt_source provenance (optional column on service links, written by
-    # services_service_projection in the future-state workflow):
-    #   'gtfs'    → real GTFS measurement → distribute, eligible for calibration
-    #   'user'    → user-supplied estimate → distribute, NOT in calibration
-    #   'formula' → projection-computed via builder physics → SKIP entirely
-    #               (self-consistent with builder values already on segments;
-    #                redistributing them would just check formula-vs-formula)
-    # Absent column → default 'gtfs' (today's behaviour preserved).
-    print("\n[4] Distributing travel times across infrastructure segments...")
+    # Two-tier source system:
+    #   Infra  Tier 1: speed_source ∈ {'infra', 'GTFS', 'gtfs'} — real / calibrated data
+    #   Infra  Tier 2: speed_source == 'OSM'                     — map-derived approximation
+    #   Service Tier 1: tt_source ∈ {'gtfs', 'infra'}            — real / infra-calibrated
+    #   Service Tier 2: tt_source == 'formula'                   — physics approximation
+    #
+    # Rules:
+    #   T2 service (formula) → entire link skipped at outer loop
+    #   T1 infra vs T2 service → infra holds (never reached; formula already skipped)
+    #   T2 infra vs T1 service → service wins → contribute normally
+    #   T1 infra vs T1 service → conflict_t1 setting decides:
+    #       'service' → service contributes (updates infra TT/speed → speed_source='gtfs')
+    #       'infra'   → infra holds; service link TT back-calculated from infra
+    #                   (updates service TT → tt_source='infra')
+    print(f"\n[4] Distributing travel times across infrastructure segments "
+          f"(T1 conflict strategy: '{conflict_t1}')...")
     stopping_contributions: Dict[str, List[float]] = defaultdict(list)
     passing_contributions:  Dict[str, List[float]] = defaultdict(list)
-    seg_calibration_ineligible: set = set()  # touched by any non-'gtfs' source
+    infra_win_links: set = set()   # service_links_gdf indices where infra wins T1 vs T1
 
     # Per-segment speed_source lookup (built once for O(1) access in the loop).
     # GPKG round-trip may produce NULL/NaN/'' — treat those as 'OSM' (permissive default).
@@ -1499,7 +1500,7 @@ def compute_segment_stats(
         if v is None or (isinstance(v, float) and pd.isna(v)):
             return 'OSM'
         s = str(v).strip()
-        return s if s in ('OSM', 'GTFS', 'infra') else 'OSM'
+        return s if s in ('OSM', 'GTFS', 'gtfs', 'infra') else 'OSM'
 
     sid_to_speed_source: Dict[str, str] = {
         str(row['Segment_ID']): _parse_speed_source(row.get('speed_source'))
@@ -1518,11 +1519,10 @@ def compute_segment_stats(
     skipped_no_dist  = 0
     skipped_boundary = 0
     skipped_formula  = 0
-    skipped_speed_locked = 0
-    source_counts    = {'gtfs': 0, 'formula': 0, 'other': 0}
+    source_counts    = {'gtfs': 0, 'infra': 0, 'formula': 0, 'other': 0}
     used_links = 0
 
-    for _, row in service_links_gdf.iterrows():
+    for link_row_idx, row in service_links_gdf.iterrows():
         # Provenance: classify and skip 'formula'-sourced links (their TT is
         # already on segments via the builder; redistribution would be a
         # no-op against the builder formula).
@@ -1619,84 +1619,139 @@ def compute_segment_stats(
                 continue
             prop_tt = _round_half_min(travel_time * exp_tt / total_expected)
 
-            seg_ss = sid_to_speed_source.get(sid, 'OSM')
-            if seg_ss == 'GTFS':
-                # Already calibrated — skip unconditionally.
-                skipped_speed_locked += 1
-                continue
-            if seg_ss == 'infra':
-                if tt_source == 'gtfs':
-                    # Collect for batch conflict report; contribution held pending user decision.
-                    length_m = float(segments.loc[
-                        segments['Segment_ID'] == sid, 'Length'
-                    ].iloc[0]) if (segments['Segment_ID'] == sid).any() else 0.0
-                    if length_m > 0 and prop_tt > 0:
-                        implied_speed = length_m / (float(prop_tt) * 60.0) * 3.6
-                        infra_conflicts[sid].append(implied_speed)
-                        infra_conflict_tt[sid].append((prop_tt, is_passing_link))
-                # Always skip contribution for infra-sourced segments for now;
-                # user decisions in 4.3 may move entries to contributions.
-                skipped_speed_locked += 1
-                continue
-            if seg_ss == 'OSM' and tt_source == 'formula':
-                osm_formula_sids.add(sid)
-                continue
+            seg_ss      = sid_to_speed_source.get(sid, 'OSM')
+            tier1_infra = seg_ss in ('infra', 'GTFS', 'gtfs')
+            tier1_svc   = tt_source in ('gtfs', 'infra')
 
-            # OSM + gtfs (or unknown source): accept normally.
+            if tier1_infra:
+                if tier1_svc:
+                    # T1 vs T1 — governed by conflict_t1 setting.
+                    if conflict_t1 == 'infra':
+                        # Infra holds; mark service link for TT back-calculation.
+                        infra_win_links.add(link_row_idx)
+                        continue
+                    # else: conflict_t1 == 'service' → fall through and contribute.
+                else:
+                    # T1 infra vs T2 service (formula) — infra holds.
+                    # Formula links are filtered at the outer loop, so this is a
+                    # safety guard only.
+                    continue
+            else:
+                # OSM (T2 infra)
+                if not tier1_svc:
+                    # T2 vs T2 — formula links already skipped at outer loop; unreachable.
+                    continue
+                # T2 infra vs T1 service — service always wins; fall through.
+
+            # Accept contribution.
             if is_passing_link:
                 passing_contributions[sid].append(prop_tt)
             else:
                 stopping_contributions[sid].append(prop_tt)
-            if tt_source != 'gtfs':
-                seg_calibration_ineligible.add(sid)
 
     print(f"  Used {used_links} service links.")
-    print(f"  Sources: gtfs={source_counts['gtfs']}, "
+    print(f"  Sources: gtfs={source_counts['gtfs']}, infra={source_counts['infra']}, "
           f"formula={source_counts['formula']}, other={source_counts['other']}")
     print(f"  Skipped: {skipped_no_path} (no path), {skipped_no_tt} (no travel time), "
           f"{skipped_no_dist} (zero expected distance), "
           f"{skipped_boundary} (boundary-rerouted), "
-          f"{skipped_formula} (formula-sourced), "
-          f"{skipped_speed_locked} (speed_source locked).")
+          f"{skipped_formula} (formula-sourced).")
+    if infra_win_links:
+        print(f"  T1 conflict (infra wins): {len(infra_win_links)} service link(s) "
+              f"marked for TT back-calculation.")
 
-    # ── 4.3 Batch conflict report (infra speed_source vs GTFS) ───────────────
-    # Segments with speed_source='infra' that have GTFS coverage are presented
-    # once. User decides per segment; accepted ones are moved to contributions.
-    speed_source_overrides: Dict[str, str] = {}  # sid → 'GTFS' when user accepts override
+    # ── 4.5 Service TT back-calculation (when infra wins T1 vs T1) ───────────
+    # Build infra-derived TT for each service link where infra holds, then write
+    # back to edges_all.gpkg and pt_feeder_segments.gpkg in-place.
+    if infra_win_links and conflict_t1 == 'infra':
+        print(f"\n[4.5] Back-calculating service TT from infra for "
+              f"{len(infra_win_links)} link(s)...")
 
-    if osm_formula_sids:
-        print(f"\n[4] WARNING: {len(osm_formula_sids)} segment(s) with speed_source='OSM' "
-              f"have only formula-sourced service links. No real measurement exists — "
-              f"OSM formula values retained.")
+        seg_tt_stop: Dict[str, float] = {}
+        seg_tt_pass: Dict[str, float] = {}
+        for _, sr in segments.iterrows():
+            sid = str(sr.get('Segment_ID', ''))
+            if not sid:
+                continue
+            ts = sr.get('TT_Stopping')
+            tp = sr.get('TT_Passing')
+            if ts is not None and not (isinstance(ts, float) and pd.isna(ts)):
+                seg_tt_stop[sid] = float(ts)
+            if tp is not None and not (isinstance(tp, float) and pd.isna(tp)):
+                seg_tt_pass[sid] = float(tp)
 
-    if infra_conflicts:
-        seg_name_lookup: Dict[str, str] = {
-            str(r['Segment_ID']): f"{r.get('From_Name', '')} → {r.get('To_Name', '')}"
-            for _, r in segments.iterrows() if r.get('Segment_ID')
-        }
-        seg_speed_lookup: Dict[str, float] = {
-            str(r['Segment_ID']): float(r.get('Average_Speed', 0) or 0)
-            for _, r in segments.iterrows() if r.get('Segment_ID')
-        }
-        print(f"\n[4] Conflicts requiring resolution "
-              f"(speed_source='infra' vs GTFS measurement) — {len(infra_conflicts)} segment(s):")
-        for sid, implied_speeds in infra_conflicts.items():
-            seg_label   = seg_name_lookup.get(sid, sid)
-            design_spd  = seg_speed_lookup.get(sid, 0)
-            gtfs_spd    = sum(implied_speeds) / len(implied_speeds)
-            n_links     = len(implied_speeds)
-            print(f"  Segment '{seg_label}' (speed_source=infra, Avg={design_spd:.1f} km/h)")
-            print(f"    → {n_links} GTFS service link(s) imply {gtfs_spd:.1f} km/h effective speed")
-            ans = input(f"    Keep infra speed? (y/n) [y]: ").strip().lower() or 'y'
-            if ans != 'y':
-                # Accept GTFS: move held contributions into the main dicts.
-                for prop_tt, is_pass in infra_conflict_tt[sid]:
-                    if is_pass:
-                        passing_contributions[sid].append(prop_tt)
-                    else:
-                        stopping_contributions[sid].append(prop_tt)
-                speed_source_overrides[sid] = 'GTFS'
-                print(f"    Accepted — GTFS calibration will apply.")
+        # path_nodes → new_tt (links with same path get same infra-derived TT)
+        pn_to_new_tt: Dict[str, float] = {}
+        for link_idx in infra_win_links:
+            row = service_links_gdf.iloc[link_idx]
+            path_str = str(row.get('path_nodes', '')).strip()
+            if path_str in pn_to_new_tt:
+                continue  # already computed for this path
+            try:
+                node_ids = [int(n.strip()) for n in path_str.split(';') if n.strip()]
+            except (ValueError, TypeError):
+                continue
+            if len(node_ids) < 2:
+                continue
+            pairs = list(zip(node_ids[:-1], node_ids[1:]))
+            intermediate = node_ids[1:-1]
+            is_pass = any(n in stop_ids for n in intermediate)
+            new_tt = 0.0
+            for u, v in pairs:
+                s = seg_by_nodes.get((u, v)) or seg_by_nodes.get((v, u))
+                if s is None:
+                    continue
+                tt = seg_tt_pass.get(s) if is_pass else seg_tt_stop.get(s)
+                if tt is not None:
+                    new_tt += tt
+            if new_tt > 0:
+                pn_to_new_tt[path_str] = _round_half_min(new_tt)
+
+        n_updated = sum(
+            1 for idx in infra_win_links
+            if str(service_links_gdf.at[idx, 'path_nodes']) in pn_to_new_tt
+        )
+        print(f"  {n_updated} link(s) with computable infra TT.")
+
+        def _write_service_file_back(
+            gpkg_path: Path,
+            track_layers: Optional[set] = None,
+        ) -> None:
+            """Re-read gpkg, apply pn_to_new_tt updates, write all layers back."""
+            if not gpkg_path.exists():
+                return
+            all_layers = fiona.listlayers(str(gpkg_path))
+            first = True
+            for lname in all_layers:
+                gdf = gpd.read_file(str(gpkg_path), layer=lname)
+                if track_layers is not None and lname not in track_layers:
+                    gdf.to_file(str(gpkg_path), layer=lname, driver='GPKG',
+                                mode='w' if first else 'a')
+                    first = False
+                    continue
+                if 'path_nodes' in gdf.columns:
+                    tt_col = 'TT' if 'TT' in gdf.columns else 'travel_time_min'
+                    if 'tt_source' not in gdf.columns:
+                        gdf['tt_source'] = 'gtfs'
+                    n_upd = 0
+                    for idx, row in gdf.iterrows():
+                        pn = str(row.get('path_nodes', ''))
+                        if pn in pn_to_new_tt:
+                            gdf.at[idx, tt_col] = pn_to_new_tt[pn]
+                            gdf.at[idx, 'tt_source'] = 'infra'
+                            n_upd += 1
+                    if n_upd:
+                        print(f"    {gpkg_path.name} / '{lname}': {n_upd} link(s) → tt_source='infra'")
+                gdf.to_file(str(gpkg_path), layer=lname, driver='GPKG',
+                            mode='w' if first else 'a')
+                first = False
+
+        _write_service_file_back(rail_source_dir / "edges_all.gpkg")
+        _write_service_file_back(
+            feeder_source_dir / "pt_feeder_segments.gpkg",
+            track_layers=TRACK_BASED_FEEDER_LAYERS,
+        )
+        print(f"  Service files updated in-place.")
 
     # ── 5. Compute means ─────────────────────────────────────────────────────
     # Ensure TT columns exist — builder-produced Base versions carry them, but
@@ -1798,10 +1853,6 @@ def compute_segment_stats(
 
     print("\n[5c] TT approximation validation...")
     if extend_mode:
-        # Formula calibration is circular for locked segments: Average_Speed was
-        # back-calculated from TT_Stopping in the prior run, so GTFS/formula ≈
-        # 1/buffer by construction. Run the diagnostic only on newly-calibrated
-        # segments (NULL → value this run), which still carry raw OSM speeds.
         n_locked   = int((~null_before_stop).sum())
         n_extended = int(newly_calibrated_mask.sum())
         print(f"  Extend mode — formula calibration skipped for locked segments.")
@@ -1812,12 +1863,10 @@ def compute_segment_stats(
         else:
             _analyse_tt_approximation(
                 segments[newly_calibrated_mask], n_sta_endpoints, stop_counts, pass_counts,
-                ineligible_sids=seg_calibration_ineligible,
             )
     else:
         _analyse_tt_approximation(
             segments, n_sta_endpoints, stop_counts, pass_counts,
-            ineligible_sids=seg_calibration_ineligible,
         )
 
     # ── 5d. Correct Average_Speed from TT_Stopping ───────────────────────────
@@ -1849,29 +1898,21 @@ def compute_segment_stats(
             target.at[idx, 'Average_Speed'] = round(
                 length_m / (float(tt_stop) * 60.0) * 3.6, 1
             )
-            # Mark as GTFS-calibrated — this segment now has a timetable-derived speed.
-            # Segments with speed_source='infra' where user chose to keep infra speed
-            # are NOT corrected here (they were skip-gated in step [4]).
+            # Mark as gtfs-calibrated — speed is now derived from timetable TT.
+            # All segments reaching this point had service win the tier decision;
+            # infra-win segments are skip-gated in step 4 and never reach here.
             sid = row.get('Segment_ID')
             if sid and target is segments:
-                cur_ss = sid_to_speed_source.get(str(sid), 'OSM')
-                if cur_ss != 'infra':
-                    target.at[idx, 'speed_source'] = 'GTFS'
-                    sid_to_speed_source[str(sid)] = 'GTFS'
+                target.at[idx, 'speed_source'] = 'gtfs'
+                sid_to_speed_source[str(sid)] = 'gtfs'
             n_corrected += 1
-
-    # Apply GTFS override for segments where user accepted GTFS over infra design speed.
-    for sid in speed_source_overrides:
-        mask = segments['Segment_ID'].astype(str) == str(sid)
-        if mask.any():
-            segments.loc[mask, 'speed_source'] = 'GTFS'
 
     # Feeder-derived segments carry GTFS TT from birth — mark them accordingly.
     if derived is not None and not derived.empty:
         if 'speed_source' not in derived.columns:
-            derived['speed_source'] = 'GTFS'
+            derived['speed_source'] = 'gtfs'
         else:
-            derived['speed_source'] = derived['speed_source'].fillna('GTFS')
+            derived['speed_source'] = derived['speed_source'].fillna('gtfs')
 
     print(f"  Average_Speed corrected: {n_corrected} segment(s).")
 
@@ -1932,26 +1973,103 @@ def _save_enhanced_version(
 # Main
 # =============================================================================
 
+def _run_phase0_auto(
+    infra_version: str,
+    svc_version:   str,
+    enhanced_name: str,
+):
+    """Non-interactive Phase 0 for pipeline invocation.
+
+    Args:
+        infra_version: e.g. 'AS_2026_ZH' (base, not yet enhanced).
+        svc_version:   e.g. 'SVC2026_ZH_S18_network'.
+        enhanced_name: e.g. 'AS_2026_ZH_enhanced'.
+    """
+    infra_root = Path(paths.MAIN) / paths.NETWORK_INFRASTRUCTURE_DIR
+    infra_dir  = infra_root / infra_version
+
+    if not infra_dir.exists():
+        print(f"  ERROR: Infrastructure version '{infra_version}' not found at {infra_dir}.")
+        raise SystemExit(1)
+
+    # Validate svc_version
+    all_svc = list_svc_versions()
+    if svc_version not in all_svc:
+        print(f"  ERROR: Service version '{svc_version}' not found. Available: {all_svc}")
+        raise SystemExit(1)
+
+    # Find projection source
+    sources = _list_projection_sources(svc_version, infra_version)
+    matching_idx = next(
+        (i for i, (label, _, _) in enumerate(sources) if label == infra_version),
+        None,
+    )
+    if matching_idx is None:
+        print(f"  ERROR: No projected source for infra='{infra_version}', svc='{svc_version}'.")
+        print(f"  Run services_service_projection.py first.")
+        raise SystemExit(1)
+
+    _, feeder_source_dir, rail_source_dir = sources[matching_idx]
+
+    extend_mode = infra_version.lower().endswith('_enhanced')
+    enhanced_dir = infra_dir if extend_mode else infra_root / enhanced_name
+    if not extend_mode:
+        _create_enhanced_dir(enhanced_dir)
+
+    print(f"  Auto-config (non-interactive):")
+    print(f"  Infrastructure : {infra_version}")
+    print(f"  Service version: {svc_version}")
+    print(f"  Enhanced output: {enhanced_dir}")
+    return (infra_version, svc_version,
+            feeder_source_dir, rail_source_dir,
+            infra_dir, enhanced_dir, extend_mode)
+
+
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--infra-version',  default=None,
+                        help='Infrastructure version to enhance (without _enhanced suffix)')
+    parser.add_argument('--svc-version',    default=None,
+                        help='Service version name (with _network suffix)')
+    parser.add_argument('--enhanced-name',  default=None,
+                        help='Name for the enhanced output version')
+    args, _ = parser.parse_known_args()
+
     try:
-        (infra_version, svc_version,
-         feeder_source_dir, rail_source_dir,
-         infra_dir, enhanced_dir, extend_mode) = _run_phase0()
+        if args.infra_version and args.svc_version and args.enhanced_name:
+            result = _run_phase0_auto(
+                args.infra_version,
+                args.svc_version,
+                args.enhanced_name,
+            )
+        else:
+            result = _run_phase0()
     except SystemExit:
         return
 
+    (infra_version, svc_version,
+     feeder_source_dir, rail_source_dir,
+     infra_dir, enhanced_dir, extend_mode) = result
+
     print(f"\n  Infrastructure : {infra_version}")
     print(f"  Service version: {svc_version}")
+
     print(f"  Feeder source  : {feeder_source_dir}")
     print(f"  Rail source    : {rail_source_dir}")
     mode_str = "extend (in-place)" if extend_mode else "initial"
     print(f"  Enhanced output: {enhanced_dir}  [{mode_str}]")
+
+    conflict_t1 = getattr(settings, 'ENHANCEMENT_CONFLICT_T1', 'service')
+    print(f"  T1 conflict strategy: '{conflict_t1}' "
+          f"({'service updates infra' if conflict_t1 == 'service' else 'infra updates service'})")
 
     base_segments, derived = compute_segment_stats(
         infra_version, svc_version,
         feeder_source_dir, rail_source_dir,
         infra_dir, enhanced_dir,
         extend_mode=extend_mode,
+        conflict_t1=conflict_t1,
     )
 
     print("\n[6] Saving enhanced version...")

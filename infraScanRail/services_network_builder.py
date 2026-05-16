@@ -1445,7 +1445,7 @@ rl_stops_offpeak_path    = os.path.join(_rail_offpeak_dir, RAIL_STOPS_OFFPEAK_FI
 print("=" * 70)
 print("services_network_builder.py")
 print(f"  CATCHMENT_METHOD : {settings.CATCHMENT_METHOD}")
-print(f"  CATCHMENT_CANTON : {settings.CATCHMENT_CANTON}")
+print(f"  CATCHMENT_CANTON : {settings.CATCHMENT_CANTON_ABBREV}")
 print(f"  GTFS source      : {os.path.join(paths.GTFS_TRANSIT_DIR, GTFS_INPUT_FOLDER)}")
 print(f"  PT-Feeder output : {_pt_out_dir}")
 print(f"  Rail output      : {_rail_out_dir}")

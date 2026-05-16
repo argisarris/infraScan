@@ -1642,8 +1642,9 @@ def _build_infra_qgz(qgz_path: str, version_dir: Path) -> None:
     sa_id   = f'sa_{uuid.uuid4().hex[:8]}'
 
     # Relative paths from the version directory to boundary files
-    ca_relpath = '../../Catchment_Area/catchment_area_boundary.gpkg'
-    sa_relpath = '../../Catchment_Area/study_area_boundary.gpkg'
+    # data/Infrastructure/<version>/ → ../../Catchment_Area/Boundaries/
+    ca_relpath = '../../Catchment_Area/Boundaries/catchment_area_boundary.gpkg'
+    sa_relpath = '../../Catchment_Area/Boundaries/study_area_boundary.gpkg'
 
     seg_block = _segments_maplayer_xml(seg_id, 'segments.gpkg',
                                         f'Segments — {version}')
@@ -3976,7 +3977,7 @@ if __name__ == "__main__":
     # (diff), so resolved unconditionally here rather than inside either block.
     _ca_boundary, _sa_boundary = None, None
     _ca_bdry_path = Path(paths.MAIN) / paths.CATCHMENT_AREA_BOUNDARY_GPKG
-    _sa_bdry_path = Path(paths.MAIN) / "data/Catchment_Area/study_area_boundary.gpkg"
+    _sa_bdry_path = Path(paths.MAIN) / paths.STUDY_AREA_BOUNDARY_GPKG
     if _ca_bdry_path.exists():
         _ca_boundary = gpd.read_file(_ca_bdry_path)
     if _sa_bdry_path.exists():

@@ -67,7 +67,7 @@ CYCLE_MAX_RADIUS_M = 2500  # network distance cap (author choice)
 
 # --- Transfer penalty ---
 # Axhausen (2014): raw lump-sum 7.1 min × W_TRANSFER 1.7 = 12.1 min eq. IVT.
-# Used as-is in the 'axhausen' model; in the 'explicit' model
+# Used as-is in the 'fixed_value' model; in the 'explicit' model
 #   π_transfer = W_TRANSFER × (TRANSFER_WALK_MIN + t_wait(h_connecting)).
 PI_TRANSFER_MIN  = 12.1   # eq. IVT min, Axhausen model (already weighted at 1.7)
 TRANSFER_WALK_MIN = 4.0   # raw platform-walk time at transfer (min), explicit model only

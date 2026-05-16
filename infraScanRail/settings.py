@@ -63,7 +63,7 @@ INFRA_RAW_VERSION   = 'Raw_ZH'
 # 'AS_2026_ZH_enhanced' — AS_2026_ZH enriched with projected service travel times and corrections from the svc projections
 # 'AS_2035_ZH'          — BAV network as-is for 2035 (must already exist on disk)
 # 'AS_2035_ZH_enhanced' — AS_2035_ZH enriched with projected service travel times and corrections from the svc projections
-INFRA_VERSION = 'AS_2026_ZH'
+INFRA_VERSION = 'AS_2035_ZH'
 
 # Name for the new version to create — used only when INFRA_VERSION = 'Build_New'
 INFRA_BUILD_NEW_NAME = 'AS_2035_ZH'
@@ -80,10 +80,17 @@ GTFS_FILTER_VERSION = 'GTFS_SVC2026_ZH_S18'
 # 'AK_2026_S18' — AK_2026 with S18 line included
 # 'AK_2035'     — scheduled services as of 2035 timetable
 # 'AK_2035_S18' — AK_2035 with S18 line included
-SVC_VERSION = 'SVC2026_ZH_S18'
+SVC_VERSION = 'AK_2026_S18'
 
 # Name for the new version to create — used only when SVC_VERSION = 'Build_New'
-SVC_BUILD_NEW_NAME = 'AK_2035'
+SVC_BUILD_NEW_NAME = 'AK_2026_S18'
+
+# ── Enhancement conflict resolution ─────────────────────────────────────────
+# When both infra and service data are Tier 1 (real data: infra/gtfs vs
+# gtfs/infra), this setting decides which side is the source of truth.
+# 'service' — GTFS service recalibrates infra TT/speed → speed_source='gtfs'
+# 'infra'   — infra speeds recalibrate service TT     → tt_source='infra'
+ENHANCEMENT_CONFLICT_T1 = 'service'
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 5. CAPACITY
@@ -132,7 +139,7 @@ only_demand_from_to_perimeter = True
 OD_TYPE = 'canton_ZH'
 
 # Base year for the population/employment grids, OD matrices, and scenario scaling
-POPULATION_BASE_YEAR = 2018
+POPULATION_BASE_YEAR = 2023
 
 # OD scaling weights — control how population and employment growth are blended
 # when computing per-commune OD growth factors.
@@ -176,7 +183,7 @@ CAPACITY_GROUPING_STRATEGY = 'manual'
 
 # Per-pipeline plot toggles — set False to suppress all plots for that pipeline area
 # without changing the global VISUALIZATION_MODE for interactive decisions elsewhere
-PLOT_CATCHMENT = False   # catchment_base population/employment maps (Phase 2)
+PLOT_CATCHMENT = True   # catchment_base population/employment maps (Phase 2)
 PLOT_INFRA     = True   # infrabuild network plots (Phase 3A)
 PLOT_SERVICES  = True   # services pipeline plots (Phase 3B)
 PLOT_CAPACITY  = True   # capacity analysis plots (Phase 3C)

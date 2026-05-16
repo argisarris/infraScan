@@ -1272,7 +1272,7 @@ def _load_map_overlays() -> Tuple[Optional["GeoDataFrame"], Dict[Tuple[int, int]
 
     base_dir = Path(paths.MAIN)
     lakes_path = base_dir / "data" / "landuse_landcover" / "landcover" / "lake" / "WB_STEHGEWAESSER_F.shp"
-    boundary_path = base_dir / "data" / "_basic_data" / "outerboundary.shp"
+    boundary_path = base_dir / paths.STUDY_AREA_BUFFER_GPKG
 
     # Load lakes for background water features
     lakes = None

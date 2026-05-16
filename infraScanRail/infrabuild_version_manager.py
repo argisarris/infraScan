@@ -40,7 +40,7 @@ GAUGE_OPTIONS           = ['1435', '1000']
 ELECTRIFICATION_OPTIONS = ['AC_16.7Hz', 'DC', 'non_electrified']
 NODE_CLASS_OPTIONS      = ['station', 'junction', 'abandoned_station']
 CONSTRUCT_TYPE_OPTIONS  = ['bridge', 'normal', 'tunnel']
-SPEED_SOURCE_OPTIONS    = ['OSM', 'GTFS', 'infra']
+SPEED_SOURCE_OPTIONS    = ['OSM', 'gtfs', 'infra']
 TRACK_MODE_OPTIONS      = ['train', 'tram', 'cog_railway', 'train / tram']
 _EDGE_LEVEL_BY_CT       = {'bridge': ['2', '3'], 'normal': ['1'], 'tunnel': ['-1', '-2']}
 
@@ -1638,15 +1638,15 @@ def _adjust_network_speed_source(
 
     counts = segments['speed_source'].value_counts().to_dict()
     print(f"\n  Current speed_source distribution:")
-    for val in ('OSM', 'GTFS', 'infra'):
+    for val in ('OSM', 'gtfs', 'infra'):
         print(f"    {val}: {counts.get(val, 0)} segment(s)")
 
     print("\n  Set speed_source to:")
-    print("    1) OSM   — derived from OSM speeds; open to GTFS calibration")
-    print("    2) GTFS  — timetable-calibrated; locked until reset")
+    print("    1) OSM   — derived from OSM speeds; open to gtfs calibration")
+    print("    2) gtfs  — timetable-calibrated; locked until reset")
     print("    3) infra — designer-set speed; locked unconditionally")
     src_choice = input("  Select (1/2/3): ").strip()
-    target_map = {'1': 'OSM', '2': 'GTFS', '3': 'infra'}
+    target_map = {'1': 'OSM', '2': 'gtfs', '3': 'infra'}
     if src_choice not in target_map:
         print("  Cancelled.")
         return segments

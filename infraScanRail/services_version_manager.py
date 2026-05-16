@@ -203,18 +203,9 @@ def list_svc_versions() -> List[str]:
     ]
 
 
-def list_named_versions(svc_version: str) -> List[str]:
-    """Return named versions under Rail_Lines/<svc>/Versions/."""
-    versions_dir = (
-        Path(paths.MAIN) / paths.RAIL_LINES_DIR
-        / svc_version / paths.SERVICES_VERSIONS_SUBDIR
-    )
-    if not versions_dir.exists():
-        return []
-    return [
-        d.name for d in sorted(versions_dir.iterdir())
-        if d.is_dir() and (d / RAIL_SEG_GPKG).exists()
-    ]
+def list_all_networks() -> List[str]:
+    """Return all *_network folder names in Rail_Lines/ that have a complete Unprojected/ base."""
+    return list_svc_versions()
 
 
 # =============================================================================
@@ -395,7 +386,7 @@ def _load_station_catalog(infra_version: str) -> gpd.GeoDataFrame:
 # Phase 0 — version selection
 # =============================================================================
 
-def _run_phase0() -> Tuple[
+def _run_phase0(auto_infra_version: Optional[str] = None) -> Tuple[
     Dict[str, gpd.GeoDataFrame], Dict[str, gpd.GeoDataFrame],
     Dict[str, gpd.GeoDataFrame], Dict[str, gpd.GeoDataFrame],
     gpd.GeoDataFrame, str, str, str,
@@ -406,29 +397,27 @@ def _run_phase0() -> Tuple[
     Returns
     -------
     rail_seg, rail_line, feed_seg, feed_line,
-    station_catalog, svc_version, version_name, mode
+    orig_rail_seg, orig_rail_line,
+    station_catalog, version_name, out_rail_dir, out_feeder_dir, mode
     mode is 'new' or 'adjust'.
+    orig_rail_seg / orig_rail_line are deep copies taken before editing for
+    propagation diffing in Phase 3.
     """
-    svc_versions = list_svc_versions()
-    if not svc_versions:
-        print("\n  ERROR: No svc_versions with Unprojected/ base found.")
+    import copy as _copy
+
+    all_networks = list_all_networks()
+    if not all_networks:
+        print("\n  ERROR: No network found in Rail_Lines/.")
         print("  Run services_network_builder.py first.")
         raise SystemExit(1)
 
-    print("\n" + "-" * 60)
-    print("  Choose service version (svc_version):")
-    idx = _pick_one(svc_versions, "svc_version")
-    if idx is None:
-        raise SystemExit(0)
-    svc_version = svc_versions[idx]
-
-    rail_root   = Path(paths.MAIN) / paths.RAIL_LINES_DIR   / svc_version
-    feeder_root = Path(paths.MAIN) / paths.FEEDER_LINES_DIR / svc_version
+    rail_base   = Path(paths.MAIN) / paths.RAIL_LINES_DIR
+    feeder_base = Path(paths.MAIN) / paths.FEEDER_LINES_DIR
 
     print("\n" + "-" * 60)
     print("  What do you want to do?")
-    print("    1) Create a new version")
-    print("    2) Adjust an existing version")
+    print("    1) Create a new network version (copy from an existing one)")
+    print("    2) Adjust an existing network")
     while True:
         choice = input("  Select (1/2): ").strip()
         if choice in ('1', '2'):
@@ -438,77 +427,68 @@ def _run_phase0() -> Tuple[
     if choice == '1':
         mode = 'new'
 
-        named = list_named_versions(svc_version)
-        source_options = (
-            ["Unprojected (canonical base)"]
-            + [f"Version: {n}" for n in named]
-            + ["Future-scenario template (all TTs set to formula/sentinel)"]
-        )
-        print("\n  Choose source for the new version:")
-        src_idx = _pick_one(source_options, "Source")
+        print("\n  Choose source network to copy from:")
+        src_idx = _pick_one(all_networks, "Source network")
         if src_idx is None:
             raise SystemExit(0)
-
-        future_template = (src_idx == len(source_options) - 1)
-
-        if src_idx == 0 or future_template:
-            src_rail_dir   = rail_root   / paths.SERVICES_UNPROJECTED_SUBDIR
-            src_feeder_dir = feeder_root / paths.SERVICES_UNPROJECTED_SUBDIR
-        else:
-            src_name       = named[src_idx - 1]
-            src_rail_dir   = rail_root   / paths.SERVICES_VERSIONS_SUBDIR / src_name
-            src_feeder_dir = feeder_root / paths.SERVICES_VERSIONS_SUBDIR / src_name
+        src_name = all_networks[src_idx]
 
         while True:
-            name = input("\n  Name for the new version (e.g. no_trams): ").strip()
-            if not name:
+            raw_name = input("\n  Name for the new network (without '_network' suffix): ").strip()
+            if not raw_name:
                 print("  Name cannot be empty.")
                 continue
-            out_rail_dir   = rail_root   / paths.SERVICES_VERSIONS_SUBDIR / name
-            out_feeder_dir = feeder_root / paths.SERVICES_VERSIONS_SUBDIR / name
+            version_name   = raw_name if raw_name.endswith('_network') else raw_name + '_network'
+            out_rail_dir   = rail_base   / version_name / paths.SERVICES_UNPROJECTED_SUBDIR
+            out_feeder_dir = feeder_base / version_name / paths.SERVICES_UNPROJECTED_SUBDIR
             if out_rail_dir.exists() and (out_rail_dir / RAIL_SEG_GPKG).exists():
-                print(f"  Version '{name}' already exists.")
+                print(f"  '{version_name}' already exists.")
                 overwrite = input("  Overwrite? (y/n) [n]: ").strip().lower() or 'n'
                 if overwrite != 'y':
                     continue
+                shutil.rmtree(out_rail_dir,   ignore_errors=True)
+                shutil.rmtree(out_feeder_dir, ignore_errors=True)
             break
 
-        out_rail_dir.mkdir(parents=True, exist_ok=True)
-        out_feeder_dir.mkdir(parents=True, exist_ok=True)
+        # Copy entire Unprojected/ tree (gpkgs, subfolders, QGIS projects)
+        src_rail_unproj   = rail_base   / src_name / paths.SERVICES_UNPROJECTED_SUBDIR
+        src_feeder_unproj = feeder_base / src_name / paths.SERVICES_UNPROJECTED_SUBDIR
+        print(f"\n  Copying Unprojected/ from '{src_name}' → '{version_name}' ...")
+        if src_rail_unproj.exists():
+            shutil.copytree(str(src_rail_unproj), str(out_rail_dir))
+            print(f"  Rail Unprojected/ copied.")
+        else:
+            print(f"  WARNING: Source rail Unprojected/ not found: {src_rail_unproj}")
+            out_rail_dir.mkdir(parents=True, exist_ok=True)
 
-        for src_dir, out_dir, gpkg in [
-            (src_rail_dir,   out_rail_dir,   RAIL_SEG_GPKG),
-            (src_rail_dir,   out_rail_dir,   RAIL_LINES_GPKG),
-            (src_feeder_dir, out_feeder_dir, FEEDER_SEG_GPKG),
-            (src_feeder_dir, out_feeder_dir, FEEDER_LINES_GPKG),
-        ]:
-            src = src_dir / gpkg
-            if src.exists():
-                shutil.copy2(src, out_dir / gpkg)
-                print(f"  Copied {gpkg}")
-            else:
-                print(f"  WARNING: Source not found: {src}")
+        if src_feeder_unproj.exists():
+            shutil.copytree(str(src_feeder_unproj), str(out_feeder_dir))
+            print(f"  Feeder Unprojected/ copied.")
+        else:
+            out_feeder_dir.mkdir(parents=True, exist_ok=True)
+
+        future_template = input(
+            "\n  Apply future-scenario template (set all TTs to formula)? (y/n) [n]: "
+        ).strip().lower() == 'y'
 
     else:
-        mode = 'new'  # will be overwritten below
+        mode = 'adjust'
         future_template = False
-        named = list_named_versions(svc_version)
-        if not named:
-            print(f"\n  No named versions found under {rail_root / paths.SERVICES_VERSIONS_SUBDIR}.")
-            raise SystemExit(1)
-        print("\n  Choose version to adjust:")
-        idx2 = _pick_one(named, "Version")
+        print("\n  Choose network to adjust:")
+        idx2 = _pick_one(all_networks, "Network")
         if idx2 is None:
             raise SystemExit(0)
-        name = named[idx2]
-        mode = 'adjust'
-        out_rail_dir   = rail_root   / paths.SERVICES_VERSIONS_SUBDIR / name
-        out_feeder_dir = feeder_root / paths.SERVICES_VERSIONS_SUBDIR / name
+        version_name   = all_networks[idx2]
+        out_rail_dir   = rail_base   / version_name / paths.SERVICES_UNPROJECTED_SUBDIR
+        out_feeder_dir = feeder_base / version_name / paths.SERVICES_UNPROJECTED_SUBDIR
 
     # -- Infra version for station catalog ------------------------------------
     infra_versions = list_infra_versions()
     station_catalog: gpd.GeoDataFrame = gpd.GeoDataFrame()
-    if infra_versions:
+    if auto_infra_version and auto_infra_version in infra_versions:
+        print(f"\n  Station catalog: auto-selected infra version '{auto_infra_version}'.")
+        station_catalog = _load_station_catalog(auto_infra_version)
+    elif infra_versions:
         print("\n" + "-" * 60)
         print("  Choose infra version for station catalog:")
         iv_idx = _pick_one(infra_versions, "Infra version")
@@ -517,11 +497,11 @@ def _run_phase0() -> Tuple[
     else:
         print("  WARNING: No infra versions found — station search disabled.")
 
-    # -- Load all four dicts ---------------------------------------------------
-    print(f"\n  Loading '{name}'...")
+    # -- Load all four dicts --------------------------------------------------
+    print(f"\n  Loading '{version_name}/Unprojected/' ...")
     rail_seg, rail_line, feed_seg, feed_line = _load_svc_data(out_rail_dir, out_feeder_dir)
 
-    if mode == 'new' and future_template:
+    if future_template:
         for layers in (rail_seg, feed_seg):
             for gdf in layers.values():
                 gdf['tt_source'] = 'formula'
@@ -529,16 +509,21 @@ def _run_phase0() -> Tuple[
                     gdf[SEG_TT_COL] = pd.NA
         print("  Future-scenario template: all TTs set to formula/sentinel.")
 
-    n_rail_seg   = sum(len(g) for g in rail_seg.values())
-    n_rail_line  = sum(len(g) for g in rail_line.values())
-    n_feed_seg   = sum(len(g) for g in feed_seg.values())
-    n_feed_line  = sum(len(g) for g in feed_line.values())
+    orig_rail_seg  = {k: v.copy() for k, v in rail_seg.items()}
+    orig_rail_line = {k: v.copy() for k, v in rail_line.items()}
+
+    n_rail_seg  = sum(len(g) for g in rail_seg.values())
+    n_rail_line = sum(len(g) for g in rail_line.values())
+    n_feed_seg  = sum(len(g) for g in feed_seg.values())
+    n_feed_line = sum(len(g) for g in feed_line.values())
     print(f"  Rail  : {len(rail_seg)} seg layer(s), {n_rail_seg} segments"
           f" / {len(rail_line)} line layer(s), {n_rail_line} lines")
     print(f"  Feeder: {len(feed_seg)} seg layer(s), {n_feed_seg} segments"
           f" / {len(feed_line)} line layer(s), {n_feed_line} lines")
 
-    return rail_seg, rail_line, feed_seg, feed_line, station_catalog, svc_version, name, mode
+    return (rail_seg, rail_line, feed_seg, feed_line,
+            orig_rail_seg, orig_rail_line,
+            station_catalog, version_name, out_rail_dir, out_feeder_dir, mode)
 
 
 # =============================================================================
@@ -1783,28 +1768,30 @@ def _mark_tt_source_bulk(
 
 
 def _import_from_version(
-    seg_layers:  Dict[str, gpd.GeoDataFrame],
-    line_layers: Dict[str, gpd.GeoDataFrame],
-    is_rail:     bool,
-    svc_version: str,
+    seg_layers:   Dict[str, gpd.GeoDataFrame],
+    line_layers:  Dict[str, gpd.GeoDataFrame],
+    is_rail:      bool,
+    version_name: str,
 ) -> Tuple[Dict[str, gpd.GeoDataFrame], Dict[str, gpd.GeoDataFrame]]:
-    """Import routes from another version, diffing at (GTFS_ID, direction_id, variant_rank).
+    """Import routes from another network's Unprojected/, diffing at (GTFS_ID, direction_id, variant_rank).
 
-    Updates both segment and line layers.
+    Lists all available *_network folders as import sources (excluding the current one).
     """
-    root = Path(paths.MAIN) / (paths.RAIL_LINES_DIR if is_rail else paths.FEEDER_LINES_DIR) / svc_version
+    base_dir  = Path(paths.MAIN) / (paths.RAIL_LINES_DIR if is_rail else paths.FEEDER_LINES_DIR)
     seg_gpkg  = RAIL_SEG_GPKG   if is_rail else FEEDER_SEG_GPKG
     line_gpkg = RAIL_LINES_GPKG if is_rail else FEEDER_LINES_GPKG
 
-    named = list_named_versions(svc_version)
-    source_options = ["Unprojected (canonical base)"] + ["Version: %s" % n for n in named]
-    print("\n  Import from:")
-    src_idx = _pick_one(source_options, "Source")
+    all_nets = [n for n in list_all_networks() if n != version_name]
+    if not all_nets:
+        print("  No other networks available to import from.")
+        return seg_layers, line_layers
+
+    print("\n  Import from network:")
+    src_idx = _pick_one(all_nets, "Source network")
     if src_idx is None:
         return seg_layers, line_layers
 
-    src_dir = (root / paths.SERVICES_UNPROJECTED_SUBDIR) if src_idx == 0 \
-              else (root / paths.SERVICES_VERSIONS_SUBDIR / named[src_idx - 1])
+    src_dir = base_dir / all_nets[src_idx] / paths.SERVICES_UNPROJECTED_SUBDIR
 
     if not (src_dir / seg_gpkg).exists():
         print("  Source segments not found: %s" % (src_dir / seg_gpkg))
@@ -2124,21 +2111,190 @@ def _editing_loop(
 
 
 # =============================================================================
+# Period-subfolder propagation
+# =============================================================================
+
+_ALLDAY_PERIODS  = {'all_day'}
+_PEAK_PERIODS    = {'all_day', 'peak_only'}
+_OFFPEAK_PERIODS = {'all_day', 'offpeak_only'}
+
+_PERIOD_SUBDIR_MAP = {
+    'All_Day':  _ALLDAY_PERIODS,
+    'Peak':     _PEAK_PERIODS,
+    'Off_Peak': _OFFPEAK_PERIODS,
+}
+
+_SEG_KEY_COLS  = ('GTFS_ID', 'from_stop_nr', 'to_stop_nr')
+_LINE_KEY_COL  = 'route_id'
+
+_PERIOD_SEG_FILES = {
+    'All_Day':  'rail_segments_allday.gpkg',
+    'Peak':     'rail_segments_peak.gpkg',
+    'Off_Peak': 'rail_segments_offpeak.gpkg',
+}
+_PERIOD_LINE_FILES = {
+    'All_Day':  'rail_lines_allday.gpkg',
+    'Peak':     'rail_lines_peak.gpkg',
+    'Off_Peak': 'rail_lines_offpeak.gpkg',
+}
+
+
+def _propagate_to_period_folders(
+    orig_rail_seg:  Dict[str, gpd.GeoDataFrame],
+    new_rail_seg:   Dict[str, gpd.GeoDataFrame],
+    orig_rail_line: Dict[str, gpd.GeoDataFrame],
+    new_rail_line:  Dict[str, gpd.GeoDataFrame],
+    unprojected_dir: Path,
+) -> None:
+    """Sync rail_segments and rail_lines edits into All_Day / Peak / Off_Peak subfolders.
+
+    For each route_id that was removed or modified, rows are deleted from the
+    period files that included that service period, then re-inserted from the
+    updated data for modified routes.
+    """
+    network_dir = unprojected_dir.parent
+
+    def _all_rows(layers: Dict[str, gpd.GeoDataFrame]) -> gpd.GeoDataFrame:
+        parts = [g for g in layers.values() if not g.empty]
+        return pd.concat(parts, ignore_index=True) if parts else gpd.GeoDataFrame()
+
+    orig_segs = _all_rows(orig_rail_seg)
+    new_segs  = _all_rows(new_rail_seg)
+    orig_lines = _all_rows(orig_rail_line)
+    new_lines  = _all_rows(new_rail_line)
+
+    if orig_segs.empty and new_segs.empty:
+        return
+
+    id_col = SEG_ID_COL  # 'GTFS_ID'
+
+    orig_ids = set(orig_segs[id_col].dropna().astype(str)) if id_col in orig_segs.columns else set()
+    new_ids  = set(new_segs[id_col].dropna().astype(str))  if id_col in new_segs.columns  else set()
+
+    removed_ids  = orig_ids - new_ids
+    modified_ids = set()
+    for rid in orig_ids & new_ids:
+        o = orig_segs[orig_segs[id_col].astype(str) == rid]
+        n = new_segs[new_segs[id_col].astype(str) == rid]
+        if len(o) != len(n) or not o[list(_SEG_KEY_COLS)].reset_index(drop=True).equals(
+                n[list(_SEG_KEY_COLS)].reset_index(drop=True)):
+            modified_ids.add(rid)
+        elif not o.drop(columns=['geometry'], errors='ignore').reset_index(drop=True).equals(
+                 n.drop(columns=['geometry'], errors='ignore').reset_index(drop=True)):
+            modified_ids.add(rid)
+    added_ids = new_ids - orig_ids
+
+    changed_ids = removed_ids | modified_ids
+
+    if not changed_ids and not added_ids:
+        print("  Period folders: no changes to propagate.")
+        return
+
+    print(f"  Propagating to period folders: "
+          f"{len(removed_ids)} removed, {len(modified_ids)} modified, {len(added_ids)} added.")
+
+    for subdir_name, period_set in _PERIOD_SUBDIR_MAP.items():
+        period_dir = network_dir / subdir_name
+        if not period_dir.exists():
+            continue
+
+        # -- Segments ----------------------------------------------------------
+        seg_file = period_dir / _PERIOD_SEG_FILES[subdir_name]
+        if seg_file.exists():
+            try:
+                p_seg = gpd.read_file(seg_file)
+                if id_col in p_seg.columns:
+                    p_seg_ids = p_seg[id_col].astype(str)
+                    # Remove changed or removed routes
+                    keep = ~p_seg_ids.isin(changed_ids)
+                    p_seg = p_seg[keep].copy()
+                    # Re-insert modified routes that belong to this period
+                    if modified_ids and not new_segs.empty:
+                        rows_to_add = new_segs[
+                            new_segs[id_col].astype(str).isin(modified_ids) &
+                            new_segs.get('service_period', pd.Series('all_day', index=new_segs.index))
+                            .isin(period_set)
+                        ]
+                        if not rows_to_add.empty:
+                            p_seg = pd.concat([p_seg, rows_to_add], ignore_index=True)
+                    # Insert genuinely new routes that belong to this period
+                    if added_ids and not new_segs.empty:
+                        rows_to_add = new_segs[
+                            new_segs[id_col].astype(str).isin(added_ids) &
+                            new_segs.get('service_period', pd.Series('all_day', index=new_segs.index))
+                            .isin(period_set)
+                        ]
+                        if not rows_to_add.empty:
+                            p_seg = pd.concat([p_seg, rows_to_add], ignore_index=True)
+                    if isinstance(p_seg, gpd.GeoDataFrame):
+                        p_seg.to_file(str(seg_file), driver='GPKG')
+                    else:
+                        gpd.GeoDataFrame(p_seg).to_file(str(seg_file), driver='GPKG')
+            except Exception as exc:
+                print(f"  WARNING: Could not update {seg_file.name}: {exc}")
+
+        # -- Lines -------------------------------------------------------------
+        line_file = period_dir / _PERIOD_LINE_FILES[subdir_name]
+        if line_file.exists() and not orig_lines.empty:
+            try:
+                p_line = gpd.read_file(line_file)
+                lcol = _LINE_KEY_COL
+                if lcol in p_line.columns:
+                    orig_line_ids = set(orig_lines[lcol].dropna().astype(str)) \
+                                    if lcol in orig_lines.columns else set()
+                    new_line_ids  = set(new_lines[lcol].dropna().astype(str)) \
+                                    if lcol in new_lines.columns else set()
+                    changed_line_ids = (orig_line_ids - new_line_ids) | \
+                                       {r for r in orig_line_ids & new_line_ids
+                                        if not orig_lines[orig_lines[lcol].astype(str) == r]
+                                        .reset_index(drop=True).equals(
+                                            new_lines[new_lines[lcol].astype(str) == r]
+                                            .reset_index(drop=True))}
+                    added_line_ids = new_line_ids - orig_line_ids
+
+                    keep = ~p_line[lcol].astype(str).isin(changed_line_ids)
+                    p_line = p_line[keep].copy()
+
+                    reinsert_ids = {r for r in changed_line_ids if r in new_line_ids} | added_line_ids
+                    if reinsert_ids and not new_lines.empty:
+                        rows_to_add = new_lines[new_lines[lcol].astype(str).isin(reinsert_ids)]
+                        if not rows_to_add.empty:
+                            p_line = pd.concat([p_line, rows_to_add], ignore_index=True)
+
+                    if isinstance(p_line, gpd.GeoDataFrame):
+                        p_line.to_file(str(line_file), driver='GPKG')
+                    else:
+                        gpd.GeoDataFrame(p_line).to_file(str(line_file), driver='GPKG')
+            except Exception as exc:
+                print(f"  WARNING: Could not update {line_file.name}: {exc}")
+
+    print("  Period folders updated.")
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--infra-version', default=None,
+                        help='Infrastructure version to use for station catalog (auto-select, no prompt)')
+    args, _ = parser.parse_known_args()
+
     try:
         (rail_seg, rail_line, feed_seg, feed_line,
-         station_catalog, svc_version, version_name, _) = _run_phase0()
+         orig_rail_seg, orig_rail_line,
+         station_catalog, version_name,
+         out_rail_dir, out_feeder_dir, _) = _run_phase0(auto_infra_version=args.infra_version)
     except SystemExit:
         return
 
     # Phase 1 — Rail services editing
     print("\n" + "=" * 60)
-    print("  RAIL SERVICES  —  version: %s / %s" % (svc_version, version_name))
+    print("  RAIL SERVICES  —  network: %s" % version_name)
     rail_seg, rail_line = _editing_loop(
-        rail_seg, rail_line, station_catalog, svc_version,
+        rail_seg, rail_line, station_catalog, version_name,
         "Rail services", is_rail=True,
     )
 
@@ -2152,7 +2308,7 @@ def main():
             feed_seg_tb  = {k: v for k, v in feed_seg.items()  if k in TRACK_BASED_FEEDER_LAYERS}
             feed_line_tb = {k: v for k, v in feed_line.items() if k in TRACK_BASED_FEEDER_LAYERS}
             feed_seg_tb, feed_line_tb = _editing_loop(
-                feed_seg_tb, feed_line_tb, station_catalog, svc_version,
+                feed_seg_tb, feed_line_tb, station_catalog, version_name,
                 "Track-based feeder", is_rail=False,
                 layer_filter=TRACK_BASED_FEEDER_LAYERS,
             )
@@ -2163,12 +2319,15 @@ def main():
 
     # Phase 3 — Save
     print("\n" + "=" * 60)
-    print("  Saving version '%s'..." % version_name)
-    rail_root   = Path(paths.MAIN) / paths.RAIL_LINES_DIR   / svc_version
-    feeder_root = Path(paths.MAIN) / paths.FEEDER_LINES_DIR / svc_version
-    out_rail_dir   = rail_root   / paths.SERVICES_VERSIONS_SUBDIR / version_name
-    out_feeder_dir = feeder_root / paths.SERVICES_VERSIONS_SUBDIR / version_name
+    print("  Saving '%s/Unprojected/' ..." % version_name)
     _save_svc_data(rail_seg, rail_line, feed_seg, feed_line, out_rail_dir, out_feeder_dir)
+
+    # Propagate rail edits to All_Day / Peak / Off_Peak subfolders
+    _propagate_to_period_folders(
+        orig_rail_seg, rail_seg,
+        orig_rail_line, rail_line,
+        out_rail_dir,
+    )
     print("  Done.")
 
 

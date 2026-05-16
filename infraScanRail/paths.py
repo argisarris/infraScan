@@ -91,12 +91,31 @@ def svc_feeder_exists(svc_version: str) -> bool:
         for f in ('pt_feeder_lines.gpkg', 'pt_feeder_segments.gpkg', 'pt_feeder_stops.gpkg')
     )
 
-def svc_named_version_exists(svc_version: str, named_version: str) -> bool:
-    """True if the named service sub-version exists under Versions/."""
-    return os.path.isfile(
-        os.path.join(MAIN, RAIL_LINES_DIR, svc_version + '_network', SERVICES_VERSIONS_SUBDIR,
-                     named_version, 'rail_segments.gpkg')
-    )
+def any_svc_rail_exists() -> bool:
+    """True if at least one complete Unprojected rail network exists in Rail_Lines."""
+    base = os.path.join(MAIN, RAIL_LINES_DIR)
+    if not os.path.isdir(base):
+        return False
+    for entry in os.scandir(base):
+        if entry.is_dir() and entry.name.endswith('_network'):
+            d = os.path.join(entry.path, SERVICES_UNPROJECTED_SUBDIR)
+            if all(os.path.isfile(os.path.join(d, f))
+                   for f in ('rail_lines.gpkg', 'rail_segments.gpkg', 'rail_stops.gpkg')):
+                return True
+    return False
+
+def any_svc_feeder_exists() -> bool:
+    """True if at least one complete Unprojected PT-feeder network exists in Feeder_Lines."""
+    base = os.path.join(MAIN, FEEDER_LINES_DIR)
+    if not os.path.isdir(base):
+        return False
+    for entry in os.scandir(base):
+        if entry.is_dir() and entry.name.endswith('_network'):
+            d = os.path.join(entry.path, SERVICES_UNPROJECTED_SUBDIR)
+            if all(os.path.isfile(os.path.join(d, f))
+                   for f in ('pt_feeder_lines.gpkg', 'pt_feeder_segments.gpkg', 'pt_feeder_stops.gpkg')):
+                return True
+    return False
 
 def svc_projected_exists(svc_version: str, infra_version: str) -> bool:
     """True if the service version has been projected to the given infra version."""
@@ -136,7 +155,6 @@ RAIL_LINES_DIR = r"data/Network/Rail_Lines"
 # Services subfolder hierarchy (used by services_* scripts)
 SERVICES_UNPROJECTED_SUBDIR = "Unprojected"
 SERVICES_PROJECTED_SUBDIR   = "Projected"
-SERVICES_VERSIONS_SUBDIR    = "Versions"
 RAIL_PROCESSED_DIR = r"data/Network/processed"
 EDGES_IN_CORRIDOR_GPKG = r"data/Network/processed/edges_in_corridor.gpkg"
 
