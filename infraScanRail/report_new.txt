@@ -3,10 +3,10 @@ INFRASCANRAIL NEW PIPELINE - RUN LOG
 ================================================================================
   RUN CONFIGURATION
 ================================================================================
-  Infrastructure   : Build_New  -->  build as 'AS_2035_ZH'
+  Infrastructure   : AS_2026_ZH
   Raw version      : Raw_ZH
-  Services         : AK_2026_S18  [needs projection]
-  GTFS version     : GTFS_SVC2026_ZH_S18
+  Services         : Build_New  [needs projection]
+  GTFS version     : GTFS_SVC2026_ZH
   Canton           : ZH
   Catchment method : PT_Feeder  (OD: feeder_weighted)
   Capacity mode    : Dynamic
@@ -17,21 +17,22 @@ INFRASCANRAIL NEW PIPELINE - RUN LOG
 --------------------------------------------------------------------------------
 
 
---- Enhancement Stats: AS_2035_ZH_enhanced ---
-  Total segments       : 694
-  TT_Stopping filled   : 661 (95.2%)
-  speed_source = GTFS  : 0
-  speed_source = OSM   : 2
-  speed_source = infra : 31
-  Feeder-derived segs  : 27
+--- Enhancement Stats: AS_2026_ZH_enhanced ---
+  Total segments         : 692
+  TT_Stopping filled     : 665 (96.1%)
+  speed_source = gtfs    : 692
+  speed_source = formula : 0
+  speed_source = estimate: 0
+  speed_source = design  : 0
+  Feeder-derived segs    : 27
 PHASE RUNTIMES
 ================================================================================
 
-Phase 1: Initialisation..................................... 0m 3s (3.97s)
-Phase 2: Data Preparation................................... 0m 52s (52.81s)
-Phase 3A: Infrastructure Network Build...................... 3m 48s (228.31s)
-Phase 3B: Services Network Build............................ 4m 40s (280.45s)
+Phase 1: Initialisation..................................... 0m 3s (3.37s)
+Phase 2: Data Preparation................................... 0m 5s (5.69s)
+Phase 3A: Infrastructure Network Build...................... 0m 0s (0.16s)
+Phase 3B: Services Network Build............................ 7m 19s (439.42s)
 
 ================================================================================
-TOTAL TIME.................................................. 9m 25s (565.54s)
+TOTAL TIME.................................................. 7m 28s (448.66s)
 ================================================================================

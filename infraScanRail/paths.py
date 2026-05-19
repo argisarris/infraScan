@@ -73,7 +73,7 @@ def infra_version_exists(version: str) -> bool:
 
 def get_projected_services_path(svc_version: str, infra_version: str) -> str:
     """Return absolute path to projected rail edges for a svc/infra version pair."""
-    return os.path.join(MAIN, RAIL_LINES_DIR, svc_version + '_network', infra_version, 'edges_all.gpkg')
+    return os.path.join(MAIN, RAIL_LINES_DIR, svc_version + '_network', infra_version, 'rail_segments.gpkg')
 
 def svc_version_exists(svc_version: str) -> bool:
     """True if the svc_version network folder has a complete Unprojected rail base."""

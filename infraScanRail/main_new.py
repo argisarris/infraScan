@@ -390,10 +390,15 @@ def phase_2_data_preparation(
         skipped.append("GTFS filter")
     else:
         print(f"  {settings.GTFS_FILTER_VERSION} not found -- running services_filter_gtfs ...")
-        print(f"  NOTE: services_filter_gtfs.py requires interactive input.")
-        print(f"  It will prompt for GTFS input folder; output folder: {settings.GTFS_FILTER_VERSION}")
+        print(f"    Input  : {settings.GTFS_RAW_VERSION}")
+        print(f"    Output : {settings.GTFS_FILTER_VERSION}")
         script_path = os.path.join(paths.MAIN, 'services_filter_gtfs.py')
-        result = subprocess.run([sys.executable, script_path], cwd=paths.MAIN)
+        result = subprocess.run(
+            [sys.executable, script_path,
+             '--input-folder',  settings.GTFS_RAW_VERSION,
+             '--output-folder', settings.GTFS_FILTER_VERSION],
+            cwd=paths.MAIN,
+        )
         if result.returncode != 0:
             print(f"  WARNING: services_filter_gtfs.py exited with code {result.returncode}.")
         else:
@@ -482,6 +487,14 @@ def phase_3a_infrastructure(runtimes: dict) -> None:
     # Skipped for _enhanced versions (no pre-enhancement state to capture).
     if not infra_v.endswith('_enhanced'):
         print("--- Step 3A.3: Pre-Enhancement Network Visualisation ---\n")
+        if paths.infra_version_exists(infra_v):
+            from infrabuild_network_builder import _build_infra_qgz
+            _version_dir = Path(paths.get_infra_version_dir(infra_v))
+            _build_infra_qgz(str(_version_dir / f'{infra_v}.qgz'), _version_dir)
+            print(f"  QGIS project written: {_version_dir / f'{infra_v}.qgz'}")
+        else:
+            print(f"  Version '{infra_v}' not on disk — skipping QGIS project.")
+
         if not settings.PLOT_INFRA:
             print(f"  PLOT_INFRA = False — skipping infrastructure plots.")
         elif not paths.infra_version_exists(infra_v):
@@ -495,10 +508,9 @@ def phase_3a_infrastructure(runtimes: dict) -> None:
                 plot_electrification_map,
                 plot_speed_map,
                 NetworkData,
-                _build_infra_qgz,
             )
             import matplotlib.pyplot as plt
-            print(f"  Building QGIS project and plots for '{infra_v}' ...")
+            print(f"  Generating plots for '{infra_v}' ...")
 
             nodes, segments = load_version(infra_v)
             G = build_networkx_graph(nodes, segments)
@@ -521,11 +533,6 @@ def phase_3a_infrastructure(runtimes: dict) -> None:
                                  version=infra_v, boundary=ca_bdry_gdf)
             net_sa = NetworkData(nodes=nodes, segments=segments, graph=G,
                                  version=infra_v, boundary=sa_bdry_gdf)
-
-            version_dir = Path(paths.get_infra_version_dir(infra_v))
-            qgz_path = str(version_dir / f'{infra_v}.qgz')
-            _build_infra_qgz(qgz_path, version_dir)
-            print(f"  QGIS project written: {qgz_path}")
 
             plot_dir = Path(paths.MAIN) / paths.INFRASTRUCTURE_PLOTS_DIR / infra_v
             plot_dir.mkdir(parents=True, exist_ok=True)
@@ -563,6 +570,18 @@ def phase_3a_infrastructure(runtimes: dict) -> None:
 # Phase 3B -Services Network Build
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _list_svc_networks() -> list:
+    """Return sorted list of network folder names found under RAIL_LINES_DIR."""
+    rail_base = Path(paths.MAIN) / paths.RAIL_LINES_DIR
+    if not rail_base.exists():
+        return []
+    return sorted([
+        d.name for d in rail_base.iterdir()
+        if d.is_dir() and d.name.endswith('_network')
+        and (d / paths.SERVICES_UNPROJECTED_SUBDIR).exists()
+    ])
+
+
 def phase_3b_services(
     sa_boundary,
     ca_boundary,
@@ -571,11 +590,10 @@ def phase_3b_services(
     """Build services network, project onto infra, enhance, and plot.
 
     Handles the full integration pipeline:
-      3B.1  Build Unprojected services network (if missing)
-      3B.2  Services version manager (Build_New only)
-      3B.3  Project services onto infrastructure graph
-      3B.4  Enhance infrastructure with GTFS travel times
-      3B.5  Build QGIS project and infrastructure plots
+      3B.1  Services network selection / build (Build_New only: interactive menu)
+      3B.2  Project services onto infrastructure graph
+      3B.3  Enhance infrastructure with GTFS travel times
+      3B.4  Build QGIS project and infrastructure plots
 
     Args:
         sa_boundary: Study area polygon (Shapely) — held for future use.
@@ -594,85 +612,132 @@ def phase_3b_services(
     base_infra_v     = infra_v.removesuffix('_enhanced')
     enhanced_v       = f'{base_infra_v}_enhanced'
 
-    # ── Step 3B.1: Services network build ────────────────────────────────────
-    print("--- Step 3B.1: Services Network Build ---\n")
+    # ── Step 3B.1: Services network / version manager ────────────────────────
+    print("--- Step 3B.1: Services Network ---\n")
     if settings.SVC_VERSION == 'Build_New':
-        # For Build_New: check if any complete network already exists that can be
-        # copied in the version manager; if not, build one from Phase 2 GTFS data.
-        need_rail   = not paths.any_svc_rail_exists()
-        need_feeder = (
-            settings.CATCHMENT_METHOD == 'PT_Feeder'
-            and not paths.any_svc_feeder_exists()
-        )
+        existing = _list_svc_networks()
+        if existing:
+            print(f"  Found {len(existing)} existing network(s): {', '.join(existing)}")
+        else:
+            print("  No existing networks found.")
+        print()
+        print("  " + "-" * 60)
+        print("  What do you want to do?")
+        print("  1) Create a new network")
+        print("  2) Create a new network version (copy from an existing one)")
+        print("  " + "-" * 60)
+        while True:
+            choice = input("  Select (1/2): ").strip()
+            if choice in ('1', '2'):
+                break
+            print("  Enter 1 or 2.")
+        print()
+
+        svc_network = svc_v + '_network'
+        vm_script   = os.path.join(paths.MAIN, 'services_version_manager.py')
+
+        if choice == '1':
+            # Build a new network non-interactively, then open the version
+            # manager in adjust mode for the just-built network.
+            print(f"  Building new network '{svc_network}' ...")
+            print(f"    GTFS source : {settings.GTFS_FILTER_VERSION}")
+            print(f"    Modes       : all  (rail + feeder)")
+            print(f"    Periods     : all")
+            builder_script = os.path.join(paths.MAIN, 'services_network_builder.py')
+            build_cmd = [
+                sys.executable, builder_script,
+                '--gtfs-folder',     settings.GTFS_FILTER_VERSION,
+                '--output-name',     svc_network,
+                '--modes',           'all',
+                '--all-periods',
+                '--non-interactive',
+            ]
+            result = subprocess.run(build_cmd, cwd=paths.MAIN)
+            if result.returncode != 0:
+                print(f"  WARNING: services_network_builder.py exited with code "
+                      f"{result.returncode}.")
+            else:
+                print(f"  Network build complete.\n")
+
+            print(f"  Opening version manager for '{svc_network}' ...")
+            result = subprocess.run(
+                [sys.executable, vm_script,
+                 '--infra-version', infra_v,
+                 '--network',       svc_network],
+                cwd=paths.MAIN,
+            )
+            if result.returncode != 0:
+                print(f"  WARNING: services_version_manager.py exited with code "
+                      f"{result.returncode}.")
+            else:
+                print(f"  Version manager complete.\n")
+
+        else:
+            # Copy from existing — open version manager interactively
+            print(f"  Opening version manager (copy from existing) ...")
+            result = subprocess.run(
+                [sys.executable, vm_script, '--infra-version', infra_v],
+                cwd=paths.MAIN,
+            )
+            if result.returncode != 0:
+                print(f"  WARNING: services_version_manager.py exited with code "
+                      f"{result.returncode}.")
+            else:
+                print(f"  Version manager complete.\n")
+
     else:
         need_rail   = not paths.svc_version_exists(svc_v)
         need_feeder = (
             settings.CATCHMENT_METHOD == 'PT_Feeder'
             and not paths.svc_feeder_exists(svc_v)
         )
-
-    if not need_rail and not need_feeder:
-        print(f"  Services network found — skipping build.")
-    else:
-        missing = []
-        if need_rail:
-            missing.append("rail network")
-        if need_feeder:
-            missing.append("PT-feeder network")
-        print(f"  Missing: {', '.join(missing)} — building from GTFS data ...")
-        print(f"  ┌─ INSTRUCTIONS ──────────────────────────────────────────────────")
-        print(f"  │  GTFS input folder : {settings.GTFS_FILTER_VERSION}")
-        print(f"  │  Mode              : all  (builds rail + feeder)")
-        print(f"  │  Output folder name: {svc_v}")
-        print(f"  └─────────────────────────────────────────────────────────────────\n")
-        script_path = os.path.join(paths.MAIN, 'services_network_builder.py')
-        result = subprocess.run([sys.executable, script_path], cwd=paths.MAIN)
-        if result.returncode != 0:
-            print(f"  WARNING: services_network_builder.py exited with code "
-                  f"{result.returncode}.")
+        if not need_rail and not need_feeder:
+            print(f"  Services network '{svc_v}' found — skipping build.")
         else:
-            print(f"  Services network build complete.\n")
+            missing = []
+            if need_rail:
+                missing.append("rail network")
+            if need_feeder:
+                missing.append("PT-feeder network")
+            print(f"  Missing: {', '.join(missing)} — running services_network_builder ...")
+            script_path = os.path.join(paths.MAIN, 'services_network_builder.py')
+            result = subprocess.run([sys.executable, script_path], cwd=paths.MAIN)
+            if result.returncode != 0:
+                print(f"  WARNING: services_network_builder.py exited with code "
+                      f"{result.returncode}.")
+            else:
+                print(f"  Services network build complete.\n")
     print()
 
-    # ── Step 3B.2: Services version manager (Build_New only) ─────────────────
-    if settings.SVC_VERSION == 'Build_New':
-        print("--- Step 3B.2: Services Version Manager ---\n")
-        print(f"  Opening services_version_manager to create/edit service scenario.")
-        print(f"  ┌─ INSTRUCTIONS ──────────────────────────────────────────────────")
-        print(f"  │  Build from an existing network or copy an existing service version.")
-        print(f"  │  Version name     : {svc_v}")
-        print(f"  │  Infra version    : {infra_v}")
-        print(f"  │  Edit lines/segments, then Save.")
-        print(f"  └─────────────────────────────────────────────────────────────────\n")
-        script_path = os.path.join(paths.MAIN, 'services_version_manager.py')
-        result = subprocess.run(
-            [sys.executable, script_path, '--infra-version', infra_v],
-            cwd=paths.MAIN,
-        )
-        if result.returncode != 0:
-            print(f"  WARNING: services_version_manager.py exited with code "
-                  f"{result.returncode}.")
-        else:
-            print(f"  Services version manager complete.\n")
-        print()
-
-    # ── Step 3B.3: Service projection ─────────────────────────────────────
+    # ── Step 3B.2: Service projection ─────────────────────────────────────
     # Always project onto infra_v (the active version). When already_enhanced,
     # infra_v is the enhanced network which is the correct routing base.
     # When not enhanced, infra_v == base_infra_v — same result, enhancement
     # will then read the projected data from the base_infra_v path.
-    print("--- Step 3B.3: Service Projection ---\n")
+    print("--- Step 3B.2: Service Projection ---\n")
+    _svc_script = os.path.join(paths.MAIN, 'services_service_projection.py')
+    _svc_base_flags = ['--svc-version', svc_v, '--infra-version', infra_v]
+    if settings.CATCHMENT_METHOD != 'PT_Feeder':
+        _svc_base_flags.append('--no-feeder-plots')
+
     if paths.svc_projected_exists(svc_v, infra_v):
-        print(f"  Projected services for '{svc_v}' on '{infra_v}' found "
-              f"— skipping.")
+        print(f"  Projected services for '{svc_v}' on '{infra_v}' found — skipping.")
+        if settings.PLOT_SERVICES:
+            print(f"  Generating service plots from existing projection ...")
+            result = subprocess.run(
+                [sys.executable, _svc_script] + _svc_base_flags + ['--plot-only'],
+                cwd=paths.MAIN,
+            )
+            if result.returncode != 0:
+                print(f"  WARNING: services_service_projection.py exited with code "
+                      f"{result.returncode}.")
+            else:
+                print(f"  Service plots complete.\n")
     else:
         print(f"  Projecting '{svc_v}' onto '{infra_v}' (non-interactive) ...")
-        script_path = os.path.join(paths.MAIN, 'services_service_projection.py')
-        _proj_cmd = [sys.executable, script_path,
-                     '--svc-version',   svc_v,
-                     '--infra-version', infra_v]
-        if settings.CATCHMENT_METHOD != 'PT_Feeder':
-            _proj_cmd.append('--no-feeder-plots')
+        _proj_cmd = [sys.executable, _svc_script] + _svc_base_flags
+        if not settings.PLOT_SERVICES:
+            _proj_cmd.append('--no-plots')
         result = subprocess.run(_proj_cmd, cwd=paths.MAIN)
         if result.returncode != 0:
             print(f"  WARNING: services_service_projection.py exited with code "
@@ -681,8 +746,8 @@ def phase_3b_services(
             print(f"  Service projection complete.\n")
     print()
 
-    # ── Step 3B.4: Infrastructure enhancement ────────────────────────────
-    print("--- Step 3B.4: Infrastructure Enhancement ---\n")
+    # ── Step 3B.3: Infrastructure enhancement ────────────────────────────
+    print("--- Step 3B.3: Infrastructure Enhancement ---\n")
     if already_enhanced:
         print(f"  Infrastructure version '{infra_v}' is already enhanced.")
         print(f"  Skipping enhancement — network assumed complete.")
@@ -716,57 +781,94 @@ def phase_3b_services(
                 _n_total      = len(_enh_segs)
                 _n_tt         = int(_enh_segs['TT_Stopping'].notna().sum()) \
                                 if 'TT_Stopping' in _enh_segs.columns else 0
-                _n_gtfs       = int((_enh_segs.get('speed_source', '') == 'GTFS').sum())
-                _n_osm        = int((_enh_segs.get('speed_source', '') == 'OSM').sum())
-                _n_infra      = int((_enh_segs.get('speed_source', '') == 'infra').sum())
-                _n_feeder     = int(
+                _ss = _enh_segs['speed_source'].fillna('') \
+                      if 'speed_source' in _enh_segs.columns \
+                      else pd.Series([''] * _n_total)
+                _n_gtfs     = int((_ss == 'gtfs').sum())
+                _n_formula  = int((_ss == 'formula').sum())
+                _n_estimate = int((_ss == 'estimate').sum())
+                _n_design   = int((_ss == 'design').sum())
+                _n_feeder   = int(
                     _enh_segs['Segment_ID'].astype(str).str.startswith('feeder_').sum()
                 ) if 'Segment_ID' in _enh_segs.columns else 0
                 _rt_file = os.path.join(paths.MAIN, 'report_new.txt')
                 with open(_rt_file, 'a', encoding='utf-8') as _f:
                     _f.write(f"\n--- Enhancement Stats: {enhanced_v} ---\n")
-                    _f.write(f"  Total segments       : {_n_total}\n")
-                    _f.write(f"  TT_Stopping filled   : {_n_tt} "
+                    _f.write(f"  Total segments         : {_n_total}\n")
+                    _f.write(f"  TT_Stopping filled     : {_n_tt} "
                              f"({_n_tt / _n_total * 100:.1f}%)\n")
-                    _f.write(f"  speed_source = GTFS  : {_n_gtfs}\n")
-                    _f.write(f"  speed_source = OSM   : {_n_osm}\n")
-                    _f.write(f"  speed_source = infra : {_n_infra}\n")
-                    _f.write(f"  Feeder-derived segs  : {_n_feeder}\n")
+                    _f.write(f"  speed_source = gtfs    : {_n_gtfs}\n")
+                    _f.write(f"  speed_source = formula : {_n_formula}\n")
+                    _f.write(f"  speed_source = estimate: {_n_estimate}\n")
+                    _f.write(f"  speed_source = design  : {_n_design}\n")
+                    _f.write(f"  Feeder-derived segs    : {_n_feeder}\n")
         print()
 
     # ── Update resolved infra version ─────────────────────────────────────
     PIPELINE_CONFIG.infra_version = enhanced_v
     print(f"  Active infrastructure version updated to: {enhanced_v}\n")
 
-    # ── Step 3B.5: QGIS project + plots ──────────────────────────────────────
-    print("--- Step 3B.5: Network Visualisation ---\n")
+    # ── Step 3B.4: QGIS project + diff report + plots ────────────────────────
+    print("--- Step 3B.4: Network Visualisation ---\n")
     final_infra_v = PIPELINE_CONFIG.infra_version
+
+    from infrabuild_network_builder import (
+        _build_infra_qgz,
+        load_version,
+        build_networkx_graph,
+        NetworkData,
+        export_infrastructure_diff,
+    )
+
+    # QGIS project — always
+    _version_dir = Path(paths.get_infra_version_dir(final_infra_v))
+    _build_infra_qgz(str(_version_dir / f'{final_infra_v}.qgz'), _version_dir)
+    print(f"  QGIS project written: {_version_dir / f'{final_infra_v}.qgz'}")
+
+    # Load enhanced network — needed for Excel diff and/or plots
+    nodes, segments = load_version(final_infra_v)
+    G = build_networkx_graph(nodes, segments)
+
+    _ca_bdry_path = os.path.join(paths.MAIN, paths.CATCHMENT_AREA_BOUNDARY_GPKG)
+    _sa_bdry_path = os.path.join(paths.MAIN, paths.STUDY_AREA_BOUNDARY_GPKG)
+    ca_bdry_gdf = gpd.read_file(_ca_bdry_path) if os.path.isfile(_ca_bdry_path) else None
+    sa_bdry_gdf = gpd.read_file(_sa_bdry_path) if os.path.isfile(_sa_bdry_path) else None
+
+    # Excel diff report — always when the pre-enhancement version exists
+    _diff_base = base_infra_v if not already_enhanced else \
+                 final_infra_v.removesuffix('_enhanced')
+    _base_nodes = _base_segs = _base_G = None
+    if paths.infra_version_exists(_diff_base):
+        _base_nodes, _base_segs = load_version(_diff_base)
+        _base_G = build_networkx_graph(_base_nodes, _base_segs)
+        _ref_comp_path = Path(paths.get_infra_version_dir(_diff_base)) / 'segments_composition.gpkg'
+        _enh_comp_path = _version_dir / 'segments_composition.gpkg'
+        _ref_comp = gpd.read_file(str(_ref_comp_path)) if _ref_comp_path.exists() else gpd.GeoDataFrame()
+        _enh_comp = gpd.read_file(str(_enh_comp_path)) if _enh_comp_path.exists() else gpd.GeoDataFrame()
+        _diff_xlsx = _version_dir / f'diff_{final_infra_v}_vs_{_diff_base}.xlsx'
+        export_infrastructure_diff(
+            net_a=NetworkData(nodes=_base_nodes, segments=_base_segs,
+                              graph=_base_G, version=_diff_base),
+            net_b=NetworkData(nodes=nodes, segments=segments,
+                              graph=G, version=final_infra_v),
+            comp_a=_ref_comp,
+            comp_b=_enh_comp,
+            output_path=_diff_xlsx,
+        )
+        print(f"  Enhancement diff report → {_diff_xlsx}")
 
     if not settings.PLOT_INFRA:
         print(f"  PLOT_INFRA = False — skipping infrastructure plots.")
     else:
         from infrabuild_network_builder import (
-            load_version,
-            build_networkx_graph,
             plot_infrastructure_canonical,
             plot_infrastructure_diff,
             plot_gauge_map,
             plot_electrification_map,
             plot_speed_map,
-            NetworkData,
-            _build_infra_qgz,
         )
         import matplotlib.pyplot as plt
-        print(f"  Building QGIS project and plots for '{final_infra_v}' ...")
-
-        nodes, segments = load_version(final_infra_v)
-        G = build_networkx_graph(nodes, segments)
-
-        # Load boundary GeoDataFrames from disk (NetworkData.boundary is a GDF)
-        _ca_bdry_path = os.path.join(paths.MAIN, paths.CATCHMENT_AREA_BOUNDARY_GPKG)
-        _sa_bdry_path = os.path.join(paths.MAIN, paths.STUDY_AREA_BOUNDARY_GPKG)
-        ca_bdry_gdf = gpd.read_file(_ca_bdry_path) if os.path.isfile(_ca_bdry_path) else None
-        sa_bdry_gdf = gpd.read_file(_sa_bdry_path) if os.path.isfile(_sa_bdry_path) else None
+        print(f"  Generating plots for '{final_infra_v}' ...")
 
         def _extent_from_gdf(gdf, margin_m: int = 2000):
             if gdf is None:
@@ -782,13 +884,6 @@ def phase_3b_services(
         net_sa = NetworkData(nodes=nodes, segments=segments, graph=G,
                              version=final_infra_v, boundary=sa_bdry_gdf)
 
-        # QGIS project
-        version_dir = Path(paths.get_infra_version_dir(final_infra_v))
-        qgz_path = str(version_dir / f'{final_infra_v}.qgz')
-        _build_infra_qgz(qgz_path, version_dir)
-        print(f"  QGIS project written: {qgz_path}")
-
-        # Plots
         plot_dir = Path(paths.MAIN) / paths.INFRASTRUCTURE_PLOTS_DIR / final_infra_v
         plot_dir.mkdir(parents=True, exist_ok=True)
         print(f"  Generating plots → {plot_dir}")
@@ -816,13 +911,9 @@ def phase_3b_services(
             _fig = _fn(_net, extent=_ext, output_path=plot_dir / _fname, **_kw)
             plt.close(_fig)
 
-        # Diff plot vs original (base_infra_v) — always generated for enhanced versions
-        _diff_base = base_infra_v if not already_enhanced else \
-                     final_infra_v.removesuffix('_enhanced')
-        if paths.infra_version_exists(_diff_base):
+        # Diff plots — reuse ref data already loaded for the Excel report
+        if _base_nodes is not None:
             print(f"    diff vs '{_diff_base}' ...")
-            _base_nodes, _base_segs = load_version(_diff_base)
-            _base_G = build_networkx_graph(_base_nodes, _base_segs)
             _net_base_ca = NetworkData(nodes=_base_nodes, segments=_base_segs,
                                        graph=_base_G, version=_diff_base,
                                        boundary=ca_bdry_gdf)

@@ -63,34 +63,29 @@ INFRA_RAW_VERSION   = 'Raw_ZH'
 # 'AS_2026_ZH_enhanced' — AS_2026_ZH enriched with projected service travel times and corrections from the svc projections
 # 'AS_2035_ZH'          — BAV network as-is for 2035 (must already exist on disk)
 # 'AS_2035_ZH_enhanced' — AS_2035_ZH enriched with projected service travel times and corrections from the svc projections
-INFRA_VERSION = 'AS_2035_ZH'
+INFRA_VERSION = 'AS_2026_ZH'
 
 # Name for the new version to create — used only when INFRA_VERSION = 'Build_New'
-INFRA_BUILD_NEW_NAME = 'AS_2035_ZH'
+INFRA_BUILD_NEW_NAME = 'AS_2026_ZH'
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 4. SERVICES VERSION
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# services_filter_gtfs input: raw GTFS folder under data/Network/GTFS_Timetable/
+GTFS_RAW_VERSION    = 'GTFS_SVC2026_CH_raw'
 # services_filter_gtfs output: data/Network/GTFS_Timetable/<GTFS_FILTER_VERSION>/
-GTFS_FILTER_VERSION = 'GTFS_SVC2026_ZH_S18'
+GTFS_FILTER_VERSION = 'GTFS_SVC2026_ZH'
 
 # 'Build_New'   — run full services pipeline to create a new named version
 # 'AK_2026'     — scheduled services as of 2026 timetable
 # 'AK_2026_S18' — AK_2026 with S18 line included
 # 'AK_2035'     — scheduled services as of 2035 timetable
 # 'AK_2035_S18' — AK_2035 with S18 line included
-SVC_VERSION = 'AK_2026_S18'
+SVC_VERSION = 'AK_2026'
 
 # Name for the new version to create — used only when SVC_VERSION = 'Build_New'
-SVC_BUILD_NEW_NAME = 'AK_2026_S18'
-
-# ── Enhancement conflict resolution ─────────────────────────────────────────
-# When both infra and service data are Tier 1 (real data: infra/gtfs vs
-# gtfs/infra), this setting decides which side is the source of truth.
-# 'service' — GTFS service recalibrates infra TT/speed → speed_source='gtfs'
-# 'infra'   — infra speeds recalibrate service TT     → tt_source='infra'
-ENHANCEMENT_CONFLICT_T1 = 'service'
+SVC_BUILD_NEW_NAME = 'AK_2026'
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 5. CAPACITY
@@ -100,6 +95,13 @@ ENHANCEMENT_CONFLICT_T1 = 'service'
 # 'Set_Value' — apply a fixed trains/hour/direction threshold to all sections
 # 'Dynamic'   — full iterative capacity calculator workflow (run_capacity_analysis.py)
 CAPACITY_MODE = 'Dynamic'
+
+# Capacity grouping strategy — controls automated decisions in the capacity workflow
+# 'manual'       — prompt for each capacity grouping decision
+# 'conservative' — always choose the lowest capacity option
+# 'baseline'     — always choose the middle option
+# 'optimal'      — always choose the highest capacity option
+CAPACITY_GROUPING_STRATEGY = 'manual'
 
 CAPACITY_SET_VALUE = 6             # trains/hour/direction — used when CAPACITY_MODE = 'Set_Value'
 capacity_threshold = 2.0           # minimum available capacity (tphpd) — Dynamic only
@@ -174,20 +176,13 @@ start_valuation_year = 2050
 # 'all'    — generate all optional plots without prompting
 VISUALIZATION_MODE = 'manual'
 
-# Capacity grouping strategy — controls automated decisions in the capacity workflow
-# 'manual'       — prompt for each capacity grouping decision
-# 'conservative' — always choose the lowest capacity option
-# 'baseline'     — always choose the middle option
-# 'optimal'      — always choose the highest capacity option
-CAPACITY_GROUPING_STRATEGY = 'manual'
-
 # Per-pipeline plot toggles — set False to suppress all plots for that pipeline area
 # without changing the global VISUALIZATION_MODE for interactive decisions elsewhere
-PLOT_CATCHMENT = True   # catchment_base population/employment maps (Phase 2)
-PLOT_INFRA     = True   # infrabuild network plots (Phase 3A)
+PLOT_CATCHMENT = False   # catchment_base population/employment maps (Phase 2)
+PLOT_INFRA     = False    # infrabuild network plots (Phase 3A)
 PLOT_SERVICES  = True   # services pipeline plots (Phase 3B)
-PLOT_CAPACITY  = True   # capacity analysis plots (Phase 3C)
-PLOT_RESULTS   = True   # final CBA/result visualisations
+PLOT_CAPACITY  = False   # capacity analysis plots (Phase 3C)
+PLOT_RESULTS   = False   # final CBA/result visualisations
 
 plot_passenger_flow = True
 plot_railway_line_load = True

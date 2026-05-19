@@ -1292,7 +1292,11 @@ def run_build_base(
             macro_nodes[col] = macro_nodes[col].round(3)
 
     # ---- Enforce canonical column order ------------------------------------
-    macro_segs['speed_source'] = 'OSM'
+    _has_osm_speed = (
+        (macro_segs['Average_Speed'].notna() & (macro_segs['Average_Speed'] > 0)) |
+        (macro_segs['Predominant_Speed'].notna() & (macro_segs['Predominant_Speed'] > 0))
+    )
+    macro_segs['speed_source'] = _has_osm_speed.map({True: 'formula', False: 'estimate'})
 
     _SEG_COL_ORDER = [
         "Segment_ID", "From_Name", "To_Name", "Number", "Code",

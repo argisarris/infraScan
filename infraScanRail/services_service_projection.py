@@ -29,6 +29,8 @@ import geopandas as gpd
 import pandas as pd
 import numpy as np
 import networkx as nx
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
@@ -264,6 +266,7 @@ class ProjectionConfig:
     raw_infra_dir: Path      # data/Infrastructure/Raw/
     auto_mode: bool = False             # when True, skip all interactive prompts
     include_feeder_plots: bool = True   # when False, skip _with_feeders plot variant
+    include_plots: bool = True          # when False, skip Phase 3 entirely (PLOT_SERVICES=False)
 
 
 # =============================================================================
@@ -3353,7 +3356,6 @@ def _list_projection_outputs() -> List[Tuple[str, str]]:
     """
     _SKIP = {
         paths.SERVICES_UNPROJECTED_SUBDIR,
-        paths.SERVICES_VERSIONS_SUBDIR,
         paths.SERVICES_PROJECTED_SUBDIR,
     }
     results = []
@@ -3559,91 +3561,492 @@ def _classify_edges_spatial(
     return result
 
 
-def _write_spatial_outputs(
-    enriched: gpd.GeoDataFrame,
+# =============================================================================
+# Output Writers — shared helpers, rail writer, feeder writer
+# =============================================================================
+
+_PERIOD_SPECS: List[Tuple[str, str, frozenset]] = [
+    ("All_Day",  "allday",  frozenset({"all_day"})),
+    ("Peak",     "peak",    frozenset({"all_day", "peak_only"})),
+    ("Off_Peak", "offpeak", frozenset({"all_day", "offpeak_only"})),
+]
+
+
+def _write_multilayer_gpkg(
+    gdf: gpd.GeoDataFrame,
+    path: Path,
+    drop_cols: List[str],
+    rename_map: Dict[str, str],
+) -> None:
+    # Remove existing file so layers are never appended to a stale version
+    if Path(path).exists():
+        Path(path).unlink()
+    """Write a GDF as multi-layer GPKG; uses _source_layer for layer names."""
+    if path.exists():
+        path.unlink()
+    if "_source_layer" in gdf.columns:
+        for layer_name, layer_gdf in gdf.groupby("_source_layer"):
+            (layer_gdf
+             .drop(columns=["_source_layer"] + drop_cols, errors="ignore")
+             .rename(columns=rename_map)
+             .to_file(path, driver="GPKG", layer=layer_name))
+    else:
+        (gdf.drop(columns=drop_cols, errors="ignore")
+            .rename(columns=rename_map)
+            .to_file(path, driver="GPKG"))
+
+
+def _copy_multilayer_gpkg(src: Path, dst: Path) -> None:
+    """Copy a multi-layer GPKG layer-by-layer (preserves all layers)."""
+    if not src.exists():
+        print(f"  WARNING: {src.name} not found — skipping copy")
+        return
+    if dst.exists():
+        dst.unlink()
+    import pyogrio as _pyogrio
+    for layer_name, _ in _pyogrio.list_layers(str(src)):
+        gpd.read_file(src, layer=layer_name).to_file(
+            dst, driver="GPKG", layer=layer_name)
+
+
+def _write_stops_sa(src: Path, dst: Path, sa_poly) -> None:
+    """Filter multi-layer stops GPKG to stops whose geometry is within sa_poly."""
+    if dst.exists():
+        dst.unlink()
+    import pyogrio as _pyogrio
+    if sa_poly is None:
+        _copy_multilayer_gpkg(src, dst)
+        return
+    for layer_name, _ in _pyogrio.list_layers(str(src)):
+        stops = gpd.read_file(src, layer=layer_name)
+        within = stops[stops.geometry.within(sa_poly)]
+        if not within.empty:
+            within.to_file(dst, driver="GPKG", layer=layer_name)
+    print(f"  Written: {dst.name}")
+
+
+def _write_stops_filtered(src: Path, dst: Path, keep_numbers: set) -> None:
+    """Write multi-layer stops GPKG filtered to a set of Number values."""
+    import pyogrio as _pyogrio
+    if not src.exists():
+        return
+    if dst.exists():
+        dst.unlink()
+    keep_str = {str(x) for x in keep_numbers}
+    for layer_name, _ in _pyogrio.list_layers(str(src)):
+        stops = gpd.read_file(src, layer=layer_name)
+        if "Number" not in stops.columns:
+            continue
+        keep = stops[stops["Number"].astype(str).isin(keep_str)]
+        if not keep.empty:
+            keep.to_file(dst, driver="GPKG", layer=layer_name)
+
+
+def _write_segments_qgz(
+    subset_gdf: gpd.GeoDataFrame,
+    qgz_path: Path,
+    gpkg_name: str,
+) -> None:
+    """Build QGZ project for a rail segments GPKG."""
+    by_type: Dict[int, gpd.GeoDataFrame] = {}
+    if "_source_layer" in subset_gdf.columns:
+        for layer_name, layer_gdf in subset_gdf.groupby("_source_layer"):
+            rt = _LAYER_NAME_TO_RT.get(str(layer_name))
+            if rt is not None:
+                by_type[rt] = layer_gdf.drop(columns=["_source_layer"], errors="ignore")
+    if not by_type:
+        by_type[100] = subset_gdf
+    layers_list = _collect_qgz_line_layers(
+        by_type, gpkg_name, _RAIL_LINE_TYPES, suffix="Segments"
+    )
+    _build_qgz(str(qgz_path), layers_list)
+    print(f"  Written: {qgz_path.name} ({len(layers_list)} layer(s))")
+
+
+def _write_lines_qgz(
+    lines_by_layer: Dict[str, gpd.GeoDataFrame],
+    qgz_path: Path,
+    gpkg_name: str,
+    line_type_map: Optional[Dict[int, str]] = None,
+) -> None:
+    """Build QGZ project for a lines GPKG (rail or feeder)."""
+    if not lines_by_layer:
+        return
+    lm = line_type_map if line_type_map is not None else _RAIL_LINE_TYPES
+    by_type: Dict[int, gpd.GeoDataFrame] = {}
+    for layer_name, gdf_l in lines_by_layer.items():
+        rt = _LAYER_NAME_TO_RT.get(str(layer_name))
+        if rt is not None:
+            by_type[rt] = gdf_l
+    if not by_type:
+        return
+    layers_list = _collect_qgz_line_layers(by_type, gpkg_name, lm, suffix="Lines")
+    _build_qgz(str(qgz_path), layers_list)
+    print(f"  Written: {qgz_path.name} ({len(layers_list)} layer(s))")
+
+
+def _write_feeder_qgz(
+    feeder_gdf: gpd.GeoDataFrame,
+    qgz_path: Path,
+    gpkg_name: str,
+    suffix: str = "Segments",
+) -> None:
+    """Build QGZ project for a feeder segments GPKG."""
+    by_type: Dict[int, gpd.GeoDataFrame] = {}
+    if "_source_layer" in feeder_gdf.columns:
+        for layer_name, layer_gdf in feeder_gdf.groupby("_source_layer"):
+            rt = _LAYER_NAME_TO_RT.get(str(layer_name))
+            if rt is not None:
+                by_type[rt] = layer_gdf.drop(columns=["_source_layer"], errors="ignore")
+    if not by_type:
+        return
+    layers_list = _collect_qgz_line_layers(
+        by_type, gpkg_name, _PT_FEEDER_LINE_TYPES, suffix=suffix
+    )
+    _build_qgz(str(qgz_path), layers_list)
+    print(f"  Written: {qgz_path.name} ({len(layers_list)} layer(s))")
+
+
+def _filter_segments_by_sa(
+    gdf: gpd.GeoDataFrame,
+    sa_poly,
+) -> gpd.GeoDataFrame:
+    """Keep segments whose both endpoint coordinates lie within sa_poly."""
+    if sa_poly is None:
+        return gdf
+
+    def _both_inside(row):
+        f = Point(float(row.get("from_stop_E", 0) or 0),
+                  float(row.get("from_stop_N", 0) or 0))
+        t = Point(float(row.get("to_stop_E",   0) or 0),
+                  float(row.get("to_stop_N",   0) or 0))
+        return f.within(sa_poly) and t.within(sa_poly)
+
+    mask = gdf.apply(_both_inside, axis=1)
+    return gdf[mask]
+
+
+def _build_projected_lines(
+    projected_segs: gpd.GeoDataFrame,
+    unprojected_lines_path: Path,
+) -> Dict[str, gpd.GeoDataFrame]:
+    """Aggregate projected segments into per-line merged geometries.
+
+    Groups by (_source_layer, GTFS_ID, direction_id, variant_rank), linemerges
+    the geometry per group, then left-joins metadata from the Unprojected lines
+    GPKG (route_id → GTFS_ID key). Drops tt_source — projected lines don't carry it.
+
+    Returns: {layer_name: GeoDataFrame}
+    """
+    import pyogrio as _pyogrio
+    if not unprojected_lines_path.exists():
+        print(f"  WARNING: {unprojected_lines_path.name} not found — skipping lines build")
+        return {}
+
+    out: Dict[str, gpd.GeoDataFrame] = {}
+    layers = [l[0] for l in _pyogrio.list_layers(str(unprojected_lines_path))]
+
+    for layer_name in layers:
+        unproj = gpd.read_file(unprojected_lines_path, layer=layer_name)
+        unproj = unproj.drop(columns=["tt_source", "geometry"], errors="ignore")
+
+        segs = (projected_segs[projected_segs["_source_layer"] == layer_name]
+                if "_source_layer" in projected_segs.columns
+                else projected_segs)
+        if segs.empty:
+            continue
+
+        gtfs_col = "GTFS_ID" if "GTFS_ID" in segs.columns else "Service"
+        dir_col  = "direction_id" if "direction_id" in segs.columns else "Direction"
+
+        line_rows = []
+        for (gtfs_id, dir_id, var_rank), grp in segs.groupby(
+                [gtfs_col, dir_col, "variant_rank"]):
+            geoms = [g for g in grp.geometry if g is not None and not g.is_empty]
+            if not geoms:
+                continue
+            union = unary_union(geoms)
+            merged = linemerge(union) if union.geom_type != "LineString" else union
+            line_rows.append({
+                "route_id":     gtfs_id,
+                "direction_id": dir_id,
+                "variant_rank": var_rank,
+                "geometry":     merged,
+            })
+
+        if not line_rows:
+            continue
+
+        proj_lines = gpd.GeoDataFrame(line_rows, crs=SWISS_CRS)
+        merged_df  = proj_lines.merge(
+            unproj, on=["route_id", "direction_id", "variant_rank"], how="left"
+        )
+        out[layer_name] = gpd.GeoDataFrame(merged_df, geometry="geometry", crs=SWISS_CRS)
+
+    return out
+
+
+def _write_period_subfolders_rail(
+    segments_gdf: gpd.GeoDataFrame,
+    lines_by_layer: Dict[str, gpd.GeoDataFrame],
+    stops_path: Path,
+    out_dir: Path,
+    drop_cols: List[str],
+    rename_map: Dict[str, str],
+) -> None:
+    """Write All_Day/, Peak/, Off_Peak/ subfolders for the rail projected output.
+
+    Each subfolder contains rail_segments_<suffix>.gpkg/.qgz,
+    rail_lines_<suffix>.gpkg/.qgz, and rail_stops_<suffix>.gpkg.
+    """
+    if "service_period" not in segments_gdf.columns:
+        print("  [period] service_period column absent — skipping rail subfolders")
+        return
+
+    for subfolder_name, suffix, period_set in _PERIOD_SPECS:
+        sub_dir = out_dir / subfolder_name
+        sub_dir.mkdir(parents=True, exist_ok=True)
+
+        seg_mask   = segments_gdf["service_period"].isin(period_set)
+        seg_subset = segments_gdf[seg_mask]
+        _write_multilayer_gpkg(
+            seg_subset, sub_dir / f"rail_segments_{suffix}.gpkg", drop_cols, rename_map
+        )
+
+        lines_gpkg = sub_dir / f"rail_lines_{suffix}.gpkg"
+        if lines_gpkg.exists():
+            lines_gpkg.unlink()
+        period_lines: Dict[str, gpd.GeoDataFrame] = {}
+        for lname, lines_gdf in lines_by_layer.items():
+            if "service_period" not in lines_gdf.columns:
+                continue
+            sub_lines = lines_gdf[lines_gdf["service_period"].isin(period_set)]
+            if not sub_lines.empty:
+                sub_lines.to_file(lines_gpkg, driver="GPKG", layer=lname)
+                period_lines[lname] = sub_lines
+
+        stop_nrs: set = set()
+        for col in ("from_stop_nr", "to_stop_nr", "FromCode", "ToCode"):
+            if col in seg_subset.columns:
+                stop_nrs |= {str(x) for x in seg_subset[col].dropna().tolist()}
+        _write_stops_filtered(
+            src=stops_path,
+            dst=sub_dir / f"rail_stops_{suffix}.gpkg",
+            keep_numbers=stop_nrs,
+        )
+
+        _write_segments_qgz(seg_subset, sub_dir / f"rail_segments_{suffix}.qgz",
+                            gpkg_name=f"rail_segments_{suffix}.gpkg")
+        _write_lines_qgz(period_lines, sub_dir / f"rail_lines_{suffix}.qgz",
+                         gpkg_name=f"rail_lines_{suffix}.gpkg")
+        print(f"  Written: {subfolder_name}/ ({len(seg_subset)} rail segments)")
+
+
+def _write_period_subfolders_feeder(
+    segments_gdf: gpd.GeoDataFrame,
+    lines_by_layer: Dict[str, gpd.GeoDataFrame],
+    stops_path: Path,
     out_dir: Path,
 ) -> None:
-    """Write five spatially-filtered geopackages and three QGIS .qgz projects.
+    """Write All_Day/, Peak/, Off_Peak/ subfolders for the feeder projected output."""
+    if "service_period" not in segments_gdf.columns:
+        print("  [period] service_period column absent — skipping feeder subfolders")
+        return
 
-    Geopackages (written to out_dir/):
-      edges_all.gpkg          — all projected edges
-      edges_in_sa.gpkg        — both endpoints within study area boundary
-      edges_extended_sa.gpkg  — at least one endpoint within study area boundary
-      edges_in_ca.gpkg        — both endpoints within catchment area boundary
-      edges_extended_ca.gpkg  — at least one endpoint within catchment area boundary
+    for subfolder_name, suffix, period_set in _PERIOD_SPECS:
+        sub_dir = out_dir / subfolder_name
+        sub_dir.mkdir(parents=True, exist_ok=True)
 
-    QGIS projects (written to out_dir/qgis/):
-      edges_in_sa.qgz, edges_in_ca.qgz, edges_all.qgz
-
-    Gracefully degrades when boundary files are absent: all edges are written to
-    all outputs (no crash, informational print).
-    """
-    main = Path(paths.MAIN)
-    sa_poly = _load_polygon(main / paths.STUDY_AREA_BOUNDARY_GPKG)
-    ca_poly = _load_polygon(main / paths.CATCHMENT_AREA_BOUNDARY_GPKG)
-
-    if sa_poly is None:
-        print("  [spatial] Study area boundary absent — all edges included in SA outputs.")
-    if ca_poly is None:
-        print("  [spatial] Catchment area boundary absent — all edges included in CA outputs.")
-
-    gdf = _classify_edges_spatial(enriched, sa_poly, ca_poly)
-    _TEMP_COLS = ["_sa_from", "_sa_to", "_ca_from", "_ca_to"]
-
-    subsets: Dict[str, gpd.GeoDataFrame] = {
-        "edges_all":         gdf,
-        "edges_in_sa":       gdf[gdf["_sa_from"] & gdf["_sa_to"]],
-        "edges_extended_sa": gdf[gdf["_sa_from"] | gdf["_sa_to"]],
-        "edges_in_ca":       gdf[gdf["_ca_from"] & gdf["_ca_to"]],
-        "edges_extended_ca": gdf[gdf["_ca_from"] | gdf["_ca_to"]],
-    }
-
-    drop_all = _OUTPUT_DROP + _TEMP_COLS
-
-    # In correction mode the GDF is loaded from an already-renamed file, so
-    # _OUTPUT_RENAME must not be applied again (would duplicate column names).
-    already_output = "GTFS_ID" in enriched.columns
-    rename_map = {} if already_output else _OUTPUT_RENAME
-
-    for name, subset in subsets.items():
-        out_path = out_dir / f"{name}.gpkg"
-        if "_source_layer" in subset.columns:
-            for layer_name, layer_gdf in subset.groupby("_source_layer"):
-                (layer_gdf
-                 .drop(columns=["_source_layer"] + drop_all, errors="ignore")
-                 .rename(columns=rename_map)
-                 .to_file(out_path, driver="GPKG", layer=layer_name))
-        else:
-            (subset
-             .drop(columns=drop_all, errors="ignore")
-             .rename(columns=rename_map)
-             .to_file(out_path, driver="GPKG"))
-        print(f"  Written: {name}.gpkg ({len(subset)} edges)")
-
-    # ── QGIS .qgz projects ─────────────────────────────────────────────────────
-    for project_name, gpkg_name in [
-        ("edges_in_sa",  "edges_in_sa.gpkg"),
-        ("edges_in_ca",  "edges_in_ca.gpkg"),
-        ("edges_all",    "edges_all.gpkg"),
-    ]:
-        subset_gdf = subsets[project_name]
-
-        by_type: Dict[int, gpd.GeoDataFrame] = {}
-        if "_source_layer" in subset_gdf.columns:
-            for layer_name, layer_gdf in subset_gdf.groupby("_source_layer"):
-                rt = _LAYER_NAME_TO_RT.get(str(layer_name))
-                if rt is not None:
-                    by_type[rt] = layer_gdf.drop(columns=["_source_layer"], errors="ignore")
-        if not by_type:
-            by_type[100] = subset_gdf
-
-        gpkg_relpath = gpkg_name
-        layers_list = _collect_qgz_line_layers(
-            by_type, gpkg_relpath, _RAIL_LINE_TYPES, suffix="Segments"
+        seg_mask   = segments_gdf["service_period"].isin(period_set)
+        seg_subset = segments_gdf[seg_mask]
+        _write_multilayer_gpkg(
+            seg_subset, sub_dir / f"pt_feeder_segments_{suffix}.gpkg",
+            drop_cols=[], rename_map={},
         )
-        qgz_path = out_dir / f"{project_name}.qgz"
-        _build_qgz(str(qgz_path), layers_list)
-        print(f"  Written: {project_name}.qgz ({len(layers_list)} layer(s))")
+
+        lines_gpkg = sub_dir / f"pt_feeder_lines_{suffix}.gpkg"
+        if lines_gpkg.exists():
+            lines_gpkg.unlink()
+        period_lines: Dict[str, gpd.GeoDataFrame] = {}
+        for lname, lines_gdf in lines_by_layer.items():
+            if "service_period" not in lines_gdf.columns:
+                continue
+            sub_lines = lines_gdf[lines_gdf["service_period"].isin(period_set)]
+            if not sub_lines.empty:
+                sub_lines.to_file(lines_gpkg, driver="GPKG", layer=lname)
+                period_lines[lname] = sub_lines
+
+        stop_nrs: set = set()
+        for col in ("from_stop_nr", "to_stop_nr"):
+            if col in seg_subset.columns:
+                stop_nrs |= {str(x) for x in seg_subset[col].dropna().tolist()}
+        _write_stops_filtered(
+            src=stops_path,
+            dst=sub_dir / f"pt_feeder_stops_{suffix}.gpkg",
+            keep_numbers=stop_nrs,
+        )
+
+        _write_feeder_qgz(seg_subset, sub_dir / f"pt_feeder_segments_{suffix}.qgz",
+                          gpkg_name=f"pt_feeder_segments_{suffix}.gpkg")
+        _write_lines_qgz(period_lines, sub_dir / f"pt_feeder_lines_{suffix}.qgz",
+                         gpkg_name=f"pt_feeder_lines_{suffix}.gpkg",
+                         line_type_map=_PT_FEEDER_LINE_TYPES)
+        print(f"  Written: {subfolder_name}/ ({len(seg_subset)} feeder segments)")
+
+
+def _write_feeder_outputs(
+    config: "ProjectionConfig",
+    track_feeder_enriched: Dict[str, gpd.GeoDataFrame],
+    non_track_feeder_processed: Dict[str, gpd.GeoDataFrame],
+) -> None:
+    """Write projected feeder outputs mirroring the Unprojected folder schema.
+
+    Produces:
+      pt_feeder_segments.gpkg       — all projected feeder segments, multi-layer
+      pt_feeder_segments_sa.gpkg    — SA-filtered
+      pt_feeder_lines.gpkg          — aggregated per-line geometry
+      pt_feeder_stops.gpkg          — copied from Unprojected
+      pt_feeder_stops_sa.gpkg       — stops within SA boundary
+      pt_feeder_segments.qgz, pt_feeder_lines.qgz
+      All_Day/, Peak/, Off_Peak/ subfolders
+    """
+    out_dir  = config.feeder_output_dir
+    main_dir = Path(paths.MAIN)
+    sa_poly  = _load_polygon(main_dir / paths.STUDY_AREA_BOUNDARY_GPKG)
+
+    all_layers: List[gpd.GeoDataFrame] = []
+    for lname, lgdf in {**track_feeder_enriched, **non_track_feeder_processed}.items():
+        if lgdf.empty:
+            continue
+        tagged = lgdf.copy()
+        tagged["_source_layer"] = lname
+        all_layers.append(tagged)
+    if not all_layers:
+        print("  [feeder] no projected feeder data — skipping outputs")
+        return
+    feeder_all = gpd.GeoDataFrame(pd.concat(all_layers, ignore_index=True), crs=SWISS_CRS)
+
+    seg_path = out_dir / "pt_feeder_segments.gpkg"
+    if seg_path.exists():
+        seg_path.unlink()
+    _write_multilayer_gpkg(feeder_all, seg_path, drop_cols=[], rename_map={})
+    print(f"  Written: pt_feeder_segments.gpkg ({len(feeder_all)} segments)")
+
+    feeder_sa = _filter_segments_by_sa(feeder_all, sa_poly)
+    sa_path = out_dir / "pt_feeder_segments_sa.gpkg"
+    if sa_path.exists():
+        sa_path.unlink()
+    _write_multilayer_gpkg(feeder_sa, sa_path, drop_cols=[], rename_map={})
+    print(f"  Written: pt_feeder_segments_sa.gpkg ({len(feeder_sa)} segments)")
+
+    lines_by_layer = _build_projected_lines(
+        projected_segs=feeder_all,
+        unprojected_lines_path=config.svc_dir / "pt_feeder_lines.gpkg",
+    )
+    lines_path = out_dir / "pt_feeder_lines.gpkg"
+    if lines_path.exists():
+        lines_path.unlink()
+    for lname, gdf_l in lines_by_layer.items():
+        gdf_l.to_file(lines_path, driver="GPKG", layer=lname)
+    n_lines = sum(len(v) for v in lines_by_layer.values())
+    print(f"  Written: pt_feeder_lines.gpkg ({n_lines} lines, {len(lines_by_layer)} layer(s))")
+
+    _copy_multilayer_gpkg(
+        src=config.svc_dir / "pt_feeder_stops.gpkg",
+        dst=out_dir / "pt_feeder_stops.gpkg",
+    )
+    print("  Written: pt_feeder_stops.gpkg")
+    _write_stops_sa(
+        src=out_dir / "pt_feeder_stops.gpkg",
+        dst=out_dir / "pt_feeder_stops_sa.gpkg",
+        sa_poly=sa_poly,
+    )
+
+    _write_feeder_qgz(feeder_all, out_dir / "pt_feeder_segments.qgz",
+                      gpkg_name="pt_feeder_segments.gpkg", suffix="Segments")
+    _write_lines_qgz(lines_by_layer, out_dir / "pt_feeder_lines.qgz",
+                     gpkg_name="pt_feeder_lines.gpkg",
+                     line_type_map=_PT_FEEDER_LINE_TYPES)
+
+    _write_period_subfolders_feeder(
+        segments_gdf=feeder_all,
+        lines_by_layer=lines_by_layer,
+        stops_path=out_dir / "pt_feeder_stops.gpkg",
+        out_dir=out_dir,
+    )
+
+
+def _write_rail_outputs(
+    enriched: gpd.GeoDataFrame,
+    config: "ProjectionConfig",
+) -> None:
+    """Write projected rail outputs mirroring the Unprojected folder schema.
+
+    Produces:
+      rail_segments.gpkg       — all projected segments, multi-layer by route type
+      rail_segments_sa.gpkg    — both endpoints within SA, multi-layer
+      rail_lines.gpkg          — one row per (GTFS_ID, direction_id, variant_rank)
+      rail_stops.gpkg          — copied from Unprojected (unchanged by projection)
+      rail_stops_sa.gpkg       — stops within SA boundary
+      rail_segments.qgz, rail_lines.qgz
+      All_Day/, Peak/, Off_Peak/ subfolders with the above set at each time slice
+    """
+    out_dir  = config.rail_output_dir
+    main_dir = Path(paths.MAIN)
+    sa_poly  = _load_polygon(main_dir / paths.STUDY_AREA_BOUNDARY_GPKG)
+    if sa_poly is None:
+        print("  [spatial] SA boundary absent — SA outputs will include all edges.")
+
+    gdf = _classify_edges_spatial(enriched, sa_poly, None)
+    _TEMP_COLS  = ["_sa_from", "_sa_to", "_ca_from", "_ca_to"]
+    drop_all    = _OUTPUT_DROP + _TEMP_COLS
+    already_out = "GTFS_ID" in enriched.columns
+    rename_map  = {} if already_out else _OUTPUT_RENAME
+
+    _write_multilayer_gpkg(gdf, out_dir / "rail_segments.gpkg", drop_all, rename_map)
+    print(f"  Written: rail_segments.gpkg ({len(gdf)} edges)")
+
+    sa_gdf = gdf[gdf["_sa_from"] & gdf["_sa_to"]]
+    _write_multilayer_gpkg(sa_gdf, out_dir / "rail_segments_sa.gpkg", drop_all, rename_map)
+    print(f"  Written: rail_segments_sa.gpkg ({len(sa_gdf)} edges)")
+
+    _copy_multilayer_gpkg(
+        src=config.rail_input.parent / "rail_stops.gpkg",
+        dst=out_dir / "rail_stops.gpkg",
+    )
+    print("  Written: rail_stops.gpkg")
+    _write_stops_sa(
+        src=out_dir / "rail_stops.gpkg",
+        dst=out_dir / "rail_stops_sa.gpkg",
+        sa_poly=sa_poly,
+    )
+
+    _write_segments_qgz(gdf, out_dir / "rail_segments.qgz",
+                        gpkg_name="rail_segments.gpkg")
+
+    lines_by_layer = _build_projected_lines(
+        projected_segs=gdf,
+        unprojected_lines_path=config.rail_input.parent / "rail_lines.gpkg",
+    )
+    lines_path = out_dir / "rail_lines.gpkg"
+    if lines_path.exists():
+        lines_path.unlink()
+    for lname, lines_gdf in lines_by_layer.items():
+        lines_gdf.to_file(lines_path, driver="GPKG", layer=lname)
+    n_lines = sum(len(v) for v in lines_by_layer.values())
+    print(f"  Written: rail_lines.gpkg ({n_lines} lines, {len(lines_by_layer)} layer(s))")
+
+    _write_lines_qgz(lines_by_layer, out_dir / "rail_lines.qgz",
+                     gpkg_name="rail_lines.gpkg")
+
+    _write_period_subfolders_rail(
+        segments_gdf=gdf,
+        lines_by_layer=lines_by_layer,
+        stops_path=out_dir / "rail_stops.gpkg",
+        out_dir=out_dir,
+        drop_cols=drop_all,
+        rename_map=rename_map,
+    )
 
 
 # =============================================================================
@@ -3652,12 +4055,12 @@ def _write_spatial_outputs(
 
 def _run_phase1(
     config: ProjectionConfig,
-) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
+) -> Tuple[gpd.GeoDataFrame, Dict[str, gpd.GeoDataFrame], Dict[str, gpd.GeoDataFrame]]:
     """
-    Phase 1: load data, match stops, route paths, save enriched geopackages.
+    Phase 1: load data, match stops, route paths.
 
     Returns:
-        (rail_enriched, tram_enriched, funicular_enriched)
+        (rail_enriched, track_feeder_enriched, non_track_feeder_processed)
     """
     main = Path(paths.MAIN)
     print("\n" + "─" * 60)
@@ -3812,36 +4215,9 @@ def _run_phase1(
             processed = _apply_zvv_postpass(segs, layer_name, is_track_based=False)
             non_track_feeder_processed[layer_name] = processed
 
-    # 1j. Rail spatial outputs are written after Phase 1.5 completes (in main())
-    print("\n  Saving enriched geopackages...")
-
-    feeder_segs_out = config.feeder_output_dir / "pt_feeder_segments.gpkg"
-    for layer_name, enriched_gdf in track_feeder_enriched.items():
-        enriched_gdf.to_file(feeder_segs_out, driver="GPKG", layer=layer_name)
-    for layer_name, processed_gdf in non_track_feeder_processed.items():
-        processed_gdf.to_file(feeder_segs_out, driver="GPKG", layer=layer_name)
-    print(f"  Feeder -> {feeder_segs_out}")
-
-    # 1k. Copy stops for all processed feeder layers
-    stops_out = config.feeder_output_dir / "pt_feeder_stops.gpkg"
-    stops_gpkg = config.svc_dir / "pt_feeder_stops.gpkg"
-    if stops_gpkg.exists():
-        all_stop_layers = _fiona.listlayers(str(stops_gpkg))
-        processed_layer_names = (
-            set(track_feeder_enriched.keys()) | set(non_track_feeder_processed.keys())
-        )
-        for layer in all_stop_layers:
-            if layer in processed_layer_names:
-                gpd.read_file(stops_gpkg, layer=layer).to_file(
-                    stops_out, driver="GPKG", layer=layer
-                )
-        print(f"  Stops -> {stops_out}")
-
+    # 1j. Rail and feeder outputs are written after Phase 1.5 completes (in main())
     print(f"\n  Phase 1 complete.")
-    # Return for backward compatibility with Phase 1.5 callers
-    tram_enriched  = track_feeder_enriched.get("tram",      gpd.GeoDataFrame())
-    func_enriched  = track_feeder_enriched.get("funicular", gpd.GeoDataFrame())
-    return rail_enriched, tram_enriched, func_enriched
+    return rail_enriched, track_feeder_enriched, non_track_feeder_processed
 
 # =============================================================================
 # Phase 1.5 — Boundary Station Routing
@@ -4231,18 +4607,11 @@ def _save_phase2_outputs(
     func_enriched: gpd.GeoDataFrame,
 ) -> None:
     """
-    Build the PT-Feeder QGIS project file (.qgz) and two clipped segment geopackages.
+    Rebuild the PT-Feeder QGIS project file (.qgz) from disk after Phase 2 corrections.
 
-    Outputs (written next to the existing Phase-1 enriched files):
-      feeder_output_dir/ pt_feeder_segments.qgz
-      feeder_output_dir/ projected_segments_study.gpkg
-      feeder_output_dir/ projected_segments_catchment.gpkg
-
-    Rail outputs (edges_all.gpkg, edges_in_sa.gpkg, etc. and their .qgz projects)
-    are written by _write_spatial_outputs() called from main() after Phase 1.5.
-    The PT-Feeder QGZ contains enriched tram/funicular segments and, for bus/ship
-    (modes not touched by projection), inherits geometry from the parent svc_version
-    geopackage one directory level up.
+    Reads the pt_feeder_segments.gpkg and pt_feeder_stops.gpkg that were written
+    by _write_feeder_outputs() (or updated in-place by tram/funicular corrections
+    in _run_phase2()) and writes a fresh pt_feeder_segments.qgz.
     """
     import fiona as _fiona
     main = Path(paths.MAIN)
@@ -4291,51 +4660,6 @@ def _save_phase2_outputs(
     feeder_qgz = config.feeder_output_dir / "pt_feeder_segments.qgz"
     _build_qgz(str(feeder_qgz), feeder_layers_list)
     print(f"  PT-Feeder QGZ → {feeder_qgz}  ({len(feeder_layers_list)} layer(s))")
-
-    # ── 3. Clipped segment geopackages ─────────────────────────────────────────
-    # Merge all enriched modes, drop internal tag
-    all_frames = []
-    for mode, gdf in [("rail", rail_enriched), ("tram", tram_enriched), ("funicular", func_enriched)]:
-        sub = gdf.copy()
-        if "_source_layer" in sub.columns:
-            sub = sub.drop(columns=["_source_layer"])
-        sub["mode"] = mode
-        all_frames.append(sub)
-    combined = gpd.GeoDataFrame(pd.concat(all_frames, ignore_index=True), crs=SWISS_CRS)
-
-    def _clip_and_save(boundary_path: Path, out_path: Path, area_label: str) -> None:
-        if not boundary_path.exists():
-            print(f"  Skipping {area_label} segments — boundary not found: {boundary_path.name}")
-            return
-        boundary_poly = gpd.read_file(boundary_path).geometry.union_all()
-        total = 0
-        for mode in ["rail", "tram", "funicular"]:
-            sub = combined[combined["mode"] == mode].copy()
-            if sub.empty:
-                continue
-            try:
-                clipped = gpd.clip(sub, boundary_poly)
-            except Exception:
-                clipped = sub[sub.geometry.intersects(boundary_poly)]
-            if not clipped.empty:
-                clipped.to_file(str(out_path), driver="GPKG", layer=mode)
-                total += len(clipped)
-        if total:
-            print(f"  {area_label} segments → {out_path}  ({total} features)")
-        else:
-            print(f"  {area_label} segments — no features within boundary.")
-
-    study_path = main / paths.STUDY_AREA_BOUNDARY_GPKG
-    _clip_and_save(
-        study_path,
-        config.feeder_output_dir / "projected_segments_study.gpkg",
-        "Study area",
-    )
-    _clip_and_save(
-        main / paths.CATCHMENT_AREA_BOUNDARY_GPKG,
-        config.feeder_output_dir / "projected_segments_catchment.gpkg",
-        "Catchment area",
-    )
 
 
 # =============================================================================
@@ -4588,7 +4912,7 @@ def _run_phase2(
         # Update the mode map reference
         if mode_input == "rail":
             rail_enriched = enriched_df
-            _write_spatial_outputs(rail_enriched, config.rail_output_dir)
+            _write_rail_outputs(rail_enriched, config)
         elif mode_input == "tram":
             tram_enriched = enriched_df
             tram_enriched.to_file(
@@ -4669,6 +4993,8 @@ def _plot_gazette_style(
     main = Path(paths.MAIN)
     boundary_gdf  = gpd.read_file(boundary_gpkg)
     boundary_poly = boundary_gdf.geometry.union_all()
+    from shapely.prepared import prep as _prep_boundary
+    _bp = _prep_boundary(boundary_poly)
     is_sa         = boundary_name == "study_area"
     extent        = _extent_from_gdf(boundary_gdf, margin_m=2000)
 
@@ -4756,9 +5082,11 @@ def _plot_gazette_style(
             pass
 
     # ── Non-track feeder background (bus / ship) ─────────────────────────────
-    _labelled_feeders: set = set()  # (layer, service, direction_id) already labelled
+    _labelled_feeders: set = set()  # (layer, line_short_name) already labelled
 
     if feeder_bg_gdfs:
+        _feeder_batches: Dict[str, List] = defaultdict(list)
+
         for _flayer, _fgdf in feeder_bg_gdfs.items():
             if _fgdf is None or _fgdf.empty:
                 continue
@@ -4769,80 +5097,66 @@ def _plot_gazette_style(
                 if _fg is None or _fg.is_empty:
                     continue
                 try:
-                    _fe = float(_frow.get("from_stop_E", 0) or 0)
-                    _fn = float(_frow.get("from_stop_N", 0) or 0)
-                    _te = float(_frow.get("to_stop_E",   0) or 0)
-                    _tn = float(_frow.get("to_stop_N",   0) or 0)
-                except (TypeError, ValueError):
-                    continue
-                if (not boundary_poly.contains(Point(_fe, _fn))
-                        and not boundary_poly.contains(Point(_te, _tn))):
-                    continue
-                try:
                     _fclip = _fg.intersection(boundary_poly)
                 except Exception:
                     _fclip = _fg
                 if _fclip.is_empty:
                     continue
-                gpd.GeoDataFrame({"geometry": [_fclip]}, crs=SWISS_CRS).plot(
-                    ax=ax, color=_fcol, linewidth=_FEEDER_BG_LW,
-                    alpha=0.75, zorder=2,
-                )
+                _feeder_batches[_fcol].append(_fclip)
 
-            # SA: label bus/ship service numbers alongside their route — once per service
-            if is_sa and "Service" in _fgdf.columns:
-                for _fsvc, _fgrp in _fgdf.groupby("Service"):
-                    _fkey = (_flayer, _fsvc)
-                    if _fkey in _labelled_feeders:
-                        continue
-                    _labelled_feeders.add(_fkey)
-                    _fgeoms = []
-                    for _, _fr in _fgrp.iterrows():
-                        _g = _fr.geometry
+            # SA: label bus/ship numbers once per line (direction 0 only)
+            if is_sa:
+                _svc_col = 'line_short_name' if 'line_short_name' in _fgdf.columns else None
+                _dir_col = 'direction_id'    if 'direction_id'    in _fgdf.columns else None
+                if _svc_col:
+                    for _, _frow in _fgdf.iterrows():
+                        if _dir_col and str(_frow.get(_dir_col, '0')) != '0':
+                            continue
+                        _fsvc = str(_frow.get(_svc_col, '')).strip()
+                        _fkey = (_flayer, _fsvc)
+                        if not _fsvc or _fkey in _labelled_feeders:
+                            continue
+                        _labelled_feeders.add(_fkey)
+                        _g = _frow.geometry
                         if _g is None or _g.is_empty:
                             continue
                         try:
-                            _c = _g.intersection(boundary_poly)
+                            _fc = _g.intersection(boundary_poly)
                         except Exception:
-                            _c = _g
-                        if not _c.is_empty:
-                            _fgeoms.append(_c)
-                    if not _fgeoms:
-                        continue
-                    _funion = unary_union(_fgeoms)
-                    if _funion.geom_type == "LineString":
-                        _fmerged = _funion
-                    elif _funion.geom_type in ("MultiLineString", "GeometryCollection"):
+                            _fc = _g
+                        if _fc.is_empty:
+                            continue
+                        _fline = (
+                            _fc if _fc.geom_type == 'LineString'
+                            else max(_fc.geoms, key=lambda _x: _x.length)
+                            if _fc.geom_type == 'MultiLineString' and list(_fc.geoms)
+                            else None
+                        )
+                        if _fline is None or _fline.length < 1:
+                            continue
+                        _fmid = _fline.interpolate(0.5, normalized=True)
                         try:
-                            _fmerged = linemerge(_funion)
-                        except ValueError:
-                            _fmerged = _funion
-                    else:
-                        continue
-                    _fline = (
-                        _fmerged if _fmerged.geom_type == "LineString"
-                        else max(_fmerged.geoms, key=lambda _g: _g.length)
-                        if _fmerged.geom_type == "MultiLineString"
-                        else None
-                    )
-                    if _fline is None or _fline.length < 1:
-                        continue
-                    _fmid = _fline.interpolate(0.5, normalized=True)
-                    try:
-                        _fp1 = _fline.interpolate(0.45, normalized=True)
-                        _fp2 = _fline.interpolate(0.55, normalized=True)
-                        _fang = float(np.degrees(np.arctan2(_fp2.y - _fp1.y, _fp2.x - _fp1.x)))
-                        if _fang < -90: _fang += 180
-                        if _fang >  90: _fang -= 180
-                    except Exception:
-                        _fang = 0
-                    ax.text(
-                        _fmid.x, _fmid.y, str(_fsvc),
-                        fontsize=5, color=_fcol, ha="center", va="bottom",
-                        rotation=_fang, zorder=6,
-                        bbox=dict(boxstyle="round,pad=0.1", facecolor="white",
-                                  alpha=0.55, edgecolor="none"),
-                    )
+                            _fp1  = _fline.interpolate(0.45, normalized=True)
+                            _fp2  = _fline.interpolate(0.55, normalized=True)
+                            _fang = float(np.degrees(
+                                np.arctan2(_fp2.y - _fp1.y, _fp2.x - _fp1.x)))
+                            if _fang < -90: _fang += 180
+                            if _fang >  90: _fang -= 180
+                        except Exception:
+                            _fang = 0
+                        ax.text(
+                            _fmid.x, _fmid.y, str(_fsvc),
+                            fontsize=5, color=_fcol, ha="center", va="bottom",
+                            rotation=_fang, zorder=6,
+                            bbox=dict(boxstyle="round,pad=0.1", facecolor="white",
+                                      alpha=0.55, edgecolor="none"),
+                        )
+
+        for _fbcol, _fbgeoms in _feeder_batches.items():
+            gpd.GeoDataFrame({"geometry": _fbgeoms}, crs=SWISS_CRS).plot(
+                ax=ax, color=_fbcol, linewidth=_FEEDER_BG_LW,
+                alpha=0.75, zorder=2,
+            )
 
     # Normalize rail column names to output schema.
     # Phase 1 ("map" mode) delivers internal names (TrainType, Direction, x_origin, …);
@@ -4852,8 +5166,6 @@ def _plot_gazette_style(
         rail_enriched = rail_enriched.rename(columns=_OUTPUT_RENAME)
 
     # ── Column schema per mode ────────────────────────────────────────────────
-    # Maps each mode to the column names used in its enriched GeoDataFrame.
-    # Rail uses output (post-rename) column names; feeder modes were always consistent.
     _MC = {
         "rail": dict(
             gdf=rail_enriched,
@@ -4884,7 +5196,7 @@ def _plot_gazette_style(
         ),
     }
 
-    # ── Stub length (mirrors _plot_service_overview) ──────────────────────────
+    # ── Stub length ──────────────────────────────────────────────────────────
     if extent is not None:
         _map_min = min(extent[1] - extent[0], extent[3] - extent[2])
     else:
@@ -4893,18 +5205,19 @@ def _plot_gazette_style(
     _preferred_stub = max(375, _map_min * 0.03)
 
     # ── Per-service rendering ─────────────────────────────────────────────────
-    exit_labels:  Dict = {}   # (grid_key) → {pt, texts, colour, udx, udy}
-    terminus_pts: list = []   # [(x, y, colour, label, mode, seg_geom)]
-    terminus_bpnr: set = set()  # BAV Numbers of inside terminus stops (for station labelling)
+    exit_labels:  Dict = {}
+    terminus_pts: list = []
+    terminus_bpnr: set = set()
+    _geom_batches: Dict[Tuple[str, float], List] = defaultdict(list)
 
     for mode, mc in _MC.items():
         gdf = mc["gdf"]
         if gdf is None or gdf.empty:
             continue
 
-        colour    = MODE_COLOURS[mode]
-        lw_solid  = 1.8 if mode == "rail" else 0.9
-        lw_fall   = 1.2 if mode == "rail" else 0.6
+        colour   = MODE_COLOURS[mode]
+        lw_solid = 1.8 if mode == "rail" else 0.9
+        lw_fall  = 1.2 if mode == "rail" else 0.6
 
         gc = mc["group_cols"]
         valid_gc = [c for c in gc if c in gdf.columns]
@@ -4916,38 +5229,35 @@ def _plot_gazette_style(
             if not svc_label:
                 continue
 
-            # Identify terminus: to_id values that never appear as from_id
-            from_ids = set(grp[mc["from_id"]].dropna().astype(str))
-            to_ids   = set(grp[mc["to_id"]].dropna().astype(str))
-            terminus_ids     = to_ids - from_ids
-            last_inside_geom = None  # geometry of terminus-bound inside link
+            # Terminus: to_id values that never appear as from_id
+            from_ids     = set(grp[mc["from_id"]].dropna().astype(str))
+            to_ids       = set(grp[mc["to_id"]].dropna().astype(str))
+            terminus_ids = to_ids - from_ids
+            last_inside_geom = None
 
             for _, row in grp.iterrows():
                 geom = row.geometry
                 if geom is None or geom.is_empty:
                     continue
 
-                is_fallback = bool(row.get("needs_correction", False))
+                _nc = row.get("needs_correction", False)
+                is_fallback = str(_nc).strip().lower() == 'true'
                 line_colour = MODE_COLOURS["fallback"] if is_fallback else colour
                 lw          = lw_fall if is_fallback else lw_solid
 
-                # Classify link by endpoint containment
                 try:
-                    fe = float(row.get(mc["from_e"], 0) or 0)
+                    fe  = float(row.get(mc["from_e"], 0) or 0)
                     fn_ = float(row.get(mc["from_n"], 0) or 0)
-                    te = float(row.get(mc["to_e"], 0) or 0)
-                    tn_ = float(row.get(mc["to_n"], 0) or 0)
+                    te  = float(row.get(mc["to_e"],   0) or 0)
+                    tn_ = float(row.get(mc["to_n"],   0) or 0)
                 except (TypeError, ValueError):
                     continue
-                from_pt   = Point(fe, fn_)
-                to_pt     = Point(te, tn_)
-                from_in   = boundary_poly.contains(from_pt)
-                to_in     = boundary_poly.contains(to_pt)
+                from_in = _bp.contains(Point(fe, fn_))
+                to_in   = _bp.contains(Point(te, tn_))
 
                 if not from_in and not to_in:
-                    continue  # entirely outside — skip
+                    continue
 
-                # Clip geometry to boundary for drawing
                 try:
                     clipped = geom.intersection(boundary_poly)
                 except Exception:
@@ -4955,22 +5265,18 @@ def _plot_gazette_style(
                 if clipped.is_empty:
                     continue
 
-                seg_gdf = gpd.GeoDataFrame({"geometry": [clipped]}, crs=SWISS_CRS)
-                seg_gdf.plot(ax=ax, color=line_colour, linewidth=lw, zorder=3)
+                _geom_batches[(line_colour, lw)].append(clipped)
 
-                # Track the terminus-bound inside link for label placement
                 to_id_str = str(row.get(mc["to_id"], ""))
                 if to_id_str in terminus_ids and from_in:
                     last_inside_geom = clipped
 
-                # Exiting link: from inside, to outside → stub + destination label
                 if from_in and not to_in:
                     to_stop_name = str(row.get(mc["to_name"], "") or "")
                     if not to_stop_name:
                         continue
                     label_text = f"{svc_label} → {to_stop_name}"
 
-                    # Find crossing point
                     try:
                         cross = boundary_poly.boundary.intersection(geom)
                     except Exception:
@@ -4987,7 +5293,6 @@ def _plot_gazette_style(
                     if cp is None:
                         continue
 
-                    # Direction vector: crossing point → outside endpoint
                     dx, dy = te - cp.x, tn_ - cp.y
                     d = (dx**2 + dy**2) ** 0.5
                     if d < 1:
@@ -5002,7 +5307,6 @@ def _plot_gazette_style(
                         }
                     exit_labels[grid_key]["texts"].append(label_text)
 
-            # Record terminus for filled-circle drawing
             for _, row in grp.iterrows():
                 to_id_str = str(row.get(mc["to_id"], ""))
                 if to_id_str not in terminus_ids:
@@ -5012,13 +5316,19 @@ def _plot_gazette_style(
                     tn_ = float(row.get(mc["to_n"], 0) or 0)
                 except (TypeError, ValueError):
                     continue
-                if not boundary_poly.contains(Point(te, tn_)):
+                if not _bp.contains(Point(te, tn_)):
                     continue
                 terminus_pts.append((te, tn_, colour, svc_label, mode, last_inside_geom))
                 try:
                     terminus_bpnr.add(int(float(to_id_str)))
                 except (ValueError, TypeError):
                     pass
+
+    # Batch-render all collected service geometries (one .plot() per colour/lw bucket)
+    for (_col, _lw), _geoms in _geom_batches.items():
+        gpd.GeoDataFrame({"geometry": _geoms}, crs=SWISS_CRS).plot(
+            ax=ax, color=_col, linewidth=_lw, zorder=3,
+        )
 
     # ── Exit stubs + labels ───────────────────────────────────────────────────
     if extent is not None:
@@ -5595,13 +5905,13 @@ def _run_phase3(
     if not study_area_boundary.exists():
         study_area_boundary = main / paths.STUDY_AREA_BOUNDARY_GPKG
 
-    # Load bus / ship feeder backgrounds for the overlay variant
+    # Load bus / ship feeder backgrounds for the overlay variant (line-level)
     _feeder_bg: Dict[str, gpd.GeoDataFrame] = {}
-    _feeder_seg_path = config.feeder_output_dir / "pt_feeder_segments.gpkg"
-    if _feeder_seg_path.exists():
+    _feeder_lines_path = config.feeder_output_dir / "pt_feeder_lines.gpkg"
+    if _feeder_lines_path.exists():
         for _layer in ("bus", "express_bus", "ondemand_bus", "ship"):
             try:
-                _gdf = gpd.read_file(_feeder_seg_path, layer=_layer)
+                _gdf = gpd.read_file(_feeder_lines_path, layer=_layer)
                 if not _gdf.empty:
                     _feeder_bg[_layer] = _gdf
             except Exception:
@@ -5632,13 +5942,15 @@ def _run_phase3(
 # Main
 # =============================================================================
 
-def _run_phase0_auto(svc_version: str, infra_version: str, include_feeder_plots: bool = True) -> Optional[Tuple[ProjectionConfig, str]]:
+def _run_phase0_auto(svc_version: str, infra_version: str, include_feeder_plots: bool = True, include_plots: bool = True, plot_only: bool = False) -> Optional[Tuple[ProjectionConfig, str]]:
     """Non-interactive Phase 0: mode=map, source=Unprojected.
 
     Args:
         svc_version:           Service version name WITHOUT '_network' suffix.
+        infra_version:         Infrastructure version name (e.g. 'AS_2026_ZH').
         include_feeder_plots:  When False, skip the _with_feeders plot variant.
-        infra_version: Infrastructure version name (e.g. 'AS_2026_ZH').
+        include_plots:         When False, skip Phase 3 entirely (driven by PLOT_SERVICES).
+        plot_only:             When True, load existing projected data and run Phase 3 only.
     """
     main = Path(paths.MAIN)
     svc_folder = svc_version + '_network'
@@ -5683,15 +5995,17 @@ def _run_phase0_auto(svc_version: str, infra_version: str, include_feeder_plots:
         raw_infra_dir=raw_infra_dir,
         auto_mode=True,
         include_feeder_plots=_include_feeder_plots,
+        include_plots=include_plots,
     )
 
+    mode = "plot" if plot_only else "map"
     print(f"\n  Auto-config (non-interactive):")
     print(f"  Service version : {svc_folder}")
-    print(f"  Source          : Unprojected")
+    print(f"  Source          : {'Projected (plot only)' if plot_only else 'Unprojected'}")
     print(f"  Infrastructure  : {infra_version}")
     print(f"  Rail output     : {rail_output_dir}")
     print(f"  Feeder output   : {feeder_output_dir}")
-    return config, "map"
+    return config, mode
 
 
 def main() -> None:
@@ -5704,6 +6018,10 @@ def main() -> None:
                         help='Infrastructure version name')
     parser.add_argument('--no-feeder-plots',  action='store_true', default=False,
                         help='Skip the _with_feeders plot variant')
+    parser.add_argument('--no-plots',         action='store_true', default=False,
+                        help='Skip Phase 3 plots entirely (set by main_new when PLOT_SERVICES=False)')
+    parser.add_argument('--plot-only',        action='store_true', default=False,
+                        help='Load existing projected data and run Phase 3 only; skip projection')
     args, _ = parser.parse_known_args()
 
     if not _check_prerequisites():
@@ -5713,6 +6031,8 @@ def main() -> None:
         result = _run_phase0_auto(
             args.svc_version, args.infra_version,
             include_feeder_plots=not args.no_feeder_plots,
+            include_plots=not args.no_plots,
+            plot_only=args.plot_only,
         )
         if result is None:
             raise SystemExit(1)
@@ -5724,13 +6044,17 @@ def main() -> None:
     config, mode = result
 
     if mode == "map":
-        rail_enriched, tram_enriched, func_enriched = _run_phase1(config)
+        rail_enriched, track_feeder_enriched, non_track_feeder_processed = _run_phase1(config)
+        tram_enriched = track_feeder_enriched.get("tram",      gpd.GeoDataFrame())
+        func_enriched = track_feeder_enriched.get("funicular", gpd.GeoDataFrame())
         rail_enriched = _run_phase1_5(config, rail_enriched)
-        print("\n  Writing spatial filter outputs...")
-        _write_spatial_outputs(rail_enriched, config.rail_output_dir)
+        print("\n  Writing rail outputs...")
+        _write_rail_outputs(rail_enriched, config)
+        print("\n  Writing feeder outputs...")
+        _write_feeder_outputs(config, track_feeder_enriched, non_track_feeder_processed)
     else:
         # Load existing projection for correction
-        rail_out = config.rail_output_dir / "edges_all.gpkg"
+        rail_out = config.rail_output_dir / "rail_segments.gpkg"
         feeder_out = config.feeder_output_dir / "pt_feeder_segments.gpkg"
         if not rail_out.exists() or not feeder_out.exists():
             print(f"\n  ERROR: Projected files not found in {config.rail_output_dir}.")
@@ -5756,14 +6080,17 @@ def main() -> None:
         )
         if mode != "plot":
             rail_enriched = _run_phase1_5(config, rail_enriched)
-            print("\n  Writing spatial filter outputs...")
-            _write_spatial_outputs(rail_enriched, config.rail_output_dir)
+            print("\n  Writing rail outputs...")
+            _write_rail_outputs(rail_enriched, config)
 
     if mode != "plot":
         rail_enriched, tram_enriched, func_enriched = _run_phase2(
             config, rail_enriched, tram_enriched, func_enriched
         )
-    _run_phase3(config, rail_enriched, tram_enriched, func_enriched)
+    if config.include_plots:
+        _run_phase3(config, rail_enriched, tram_enriched, func_enriched)
+    else:
+        print("\n  Phase 3 — Plotting skipped (PLOT_SERVICES = False).")
 
     print("\n" + "─" * 60)
     print("  Service projection complete.")

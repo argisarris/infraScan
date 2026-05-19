@@ -386,13 +386,22 @@ def _load_station_catalog(infra_version: str) -> gpd.GeoDataFrame:
 # Phase 0 — version selection
 # =============================================================================
 
-def _run_phase0(auto_infra_version: Optional[str] = None) -> Tuple[
+def _run_phase0(
+    auto_infra_version: Optional[str] = None,
+    auto_network: Optional[str] = None,
+) -> Tuple[
     Dict[str, gpd.GeoDataFrame], Dict[str, gpd.GeoDataFrame],
     Dict[str, gpd.GeoDataFrame], Dict[str, gpd.GeoDataFrame],
     gpd.GeoDataFrame, str, str, str,
 ]:
     """
     Phase 0 — version selection and setup.
+
+    Args:
+        auto_infra_version: When provided, auto-selects this infra version for the
+            station catalog without prompting.
+        auto_network: When provided, skips the mode menu and directly enters
+            'adjust' mode for this network name (with or without '_network' suffix).
 
     Returns
     -------
@@ -414,73 +423,86 @@ def _run_phase0(auto_infra_version: Optional[str] = None) -> Tuple[
     rail_base   = Path(paths.MAIN) / paths.RAIL_LINES_DIR
     feeder_base = Path(paths.MAIN) / paths.FEEDER_LINES_DIR
 
-    print("\n" + "-" * 60)
-    print("  What do you want to do?")
-    print("    1) Create a new network version (copy from an existing one)")
-    print("    2) Adjust an existing network")
-    while True:
-        choice = input("  Select (1/2): ").strip()
-        if choice in ('1', '2'):
-            break
-        print("  Enter 1 or 2.")
-
-    if choice == '1':
-        mode = 'new'
-
-        print("\n  Choose source network to copy from:")
-        src_idx = _pick_one(all_networks, "Source network")
-        if src_idx is None:
-            raise SystemExit(0)
-        src_name = all_networks[src_idx]
-
-        while True:
-            raw_name = input("\n  Name for the new network (without '_network' suffix): ").strip()
-            if not raw_name:
-                print("  Name cannot be empty.")
-                continue
-            version_name   = raw_name if raw_name.endswith('_network') else raw_name + '_network'
-            out_rail_dir   = rail_base   / version_name / paths.SERVICES_UNPROJECTED_SUBDIR
-            out_feeder_dir = feeder_base / version_name / paths.SERVICES_UNPROJECTED_SUBDIR
-            if out_rail_dir.exists() and (out_rail_dir / RAIL_SEG_GPKG).exists():
-                print(f"  '{version_name}' already exists.")
-                overwrite = input("  Overwrite? (y/n) [n]: ").strip().lower() or 'n'
-                if overwrite != 'y':
-                    continue
-                shutil.rmtree(out_rail_dir,   ignore_errors=True)
-                shutil.rmtree(out_feeder_dir, ignore_errors=True)
-            break
-
-        # Copy entire Unprojected/ tree (gpkgs, subfolders, QGIS projects)
-        src_rail_unproj   = rail_base   / src_name / paths.SERVICES_UNPROJECTED_SUBDIR
-        src_feeder_unproj = feeder_base / src_name / paths.SERVICES_UNPROJECTED_SUBDIR
-        print(f"\n  Copying Unprojected/ from '{src_name}' → '{version_name}' ...")
-        if src_rail_unproj.exists():
-            shutil.copytree(str(src_rail_unproj), str(out_rail_dir))
-            print(f"  Rail Unprojected/ copied.")
-        else:
-            print(f"  WARNING: Source rail Unprojected/ not found: {src_rail_unproj}")
-            out_rail_dir.mkdir(parents=True, exist_ok=True)
-
-        if src_feeder_unproj.exists():
-            shutil.copytree(str(src_feeder_unproj), str(out_feeder_dir))
-            print(f"  Feeder Unprojected/ copied.")
-        else:
-            out_feeder_dir.mkdir(parents=True, exist_ok=True)
-
-        future_template = input(
-            "\n  Apply future-scenario template (set all TTs to formula)? (y/n) [n]: "
-        ).strip().lower() == 'y'
-
-    else:
-        mode = 'adjust'
-        future_template = False
-        print("\n  Choose network to adjust:")
-        idx2 = _pick_one(all_networks, "Network")
-        if idx2 is None:
-            raise SystemExit(0)
-        version_name   = all_networks[idx2]
+    if auto_network is not None:
+        # Non-interactive: directly enter adjust mode for the given network
+        version_name = (auto_network if auto_network.endswith('_network')
+                        else auto_network + '_network')
         out_rail_dir   = rail_base   / version_name / paths.SERVICES_UNPROJECTED_SUBDIR
         out_feeder_dir = feeder_base / version_name / paths.SERVICES_UNPROJECTED_SUBDIR
+        if not out_rail_dir.exists():
+            print(f"\n  ERROR: Network '{version_name}' not found at {out_rail_dir}")
+            raise SystemExit(1)
+        mode = 'adjust'
+        future_template = False
+        print(f"\n  Auto-selected network '{version_name}' for adjustment.")
+    else:
+        print("\n" + "-" * 60)
+        print("  What do you want to do?")
+        print("    1) Create a new network version (copy from an existing one)")
+        print("    2) Adjust an existing network")
+        while True:
+            choice = input("  Select (1/2): ").strip()
+            if choice in ('1', '2'):
+                break
+            print("  Enter 1 or 2.")
+
+        if choice == '1':
+            mode = 'new'
+
+            print("\n  Choose source network to copy from:")
+            src_idx = _pick_one(all_networks, "Source network")
+            if src_idx is None:
+                raise SystemExit(0)
+            src_name = all_networks[src_idx]
+
+            while True:
+                raw_name = input("\n  Name for the new network (without '_network' suffix): ").strip()
+                if not raw_name:
+                    print("  Name cannot be empty.")
+                    continue
+                version_name   = raw_name if raw_name.endswith('_network') else raw_name + '_network'
+                out_rail_dir   = rail_base   / version_name / paths.SERVICES_UNPROJECTED_SUBDIR
+                out_feeder_dir = feeder_base / version_name / paths.SERVICES_UNPROJECTED_SUBDIR
+                if out_rail_dir.exists() and (out_rail_dir / RAIL_SEG_GPKG).exists():
+                    print(f"  '{version_name}' already exists.")
+                    overwrite = input("  Overwrite? (y/n) [n]: ").strip().lower() or 'n'
+                    if overwrite != 'y':
+                        continue
+                    shutil.rmtree(out_rail_dir,   ignore_errors=True)
+                    shutil.rmtree(out_feeder_dir, ignore_errors=True)
+                break
+
+            # Copy entire Unprojected/ tree (gpkgs, subfolders, QGIS projects)
+            src_rail_unproj   = rail_base   / src_name / paths.SERVICES_UNPROJECTED_SUBDIR
+            src_feeder_unproj = feeder_base / src_name / paths.SERVICES_UNPROJECTED_SUBDIR
+            print(f"\n  Copying Unprojected/ from '{src_name}' → '{version_name}' ...")
+            if src_rail_unproj.exists():
+                shutil.copytree(str(src_rail_unproj), str(out_rail_dir))
+                print(f"  Rail Unprojected/ copied.")
+            else:
+                print(f"  WARNING: Source rail Unprojected/ not found: {src_rail_unproj}")
+                out_rail_dir.mkdir(parents=True, exist_ok=True)
+
+            if src_feeder_unproj.exists():
+                shutil.copytree(str(src_feeder_unproj), str(out_feeder_dir))
+                print(f"  Feeder Unprojected/ copied.")
+            else:
+                out_feeder_dir.mkdir(parents=True, exist_ok=True)
+
+            future_template = input(
+                "\n  Apply future-scenario template (set all TTs to formula)? (y/n) [n]: "
+            ).strip().lower() == 'y'
+
+        else:
+            mode = 'adjust'
+            future_template = False
+            print("\n  Choose network to adjust:")
+            idx2 = _pick_one(all_networks, "Network")
+            if idx2 is None:
+                raise SystemExit(0)
+            version_name   = all_networks[idx2]
+            out_rail_dir   = rail_base   / version_name / paths.SERVICES_UNPROJECTED_SUBDIR
+            out_feeder_dir = feeder_base / version_name / paths.SERVICES_UNPROJECTED_SUBDIR
 
     # -- Infra version for station catalog ------------------------------------
     infra_versions = list_infra_versions()
@@ -2279,14 +2301,19 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--infra-version', default=None,
-                        help='Infrastructure version to use for station catalog (auto-select, no prompt)')
+                        help='Infra version for station catalog (auto-select, no prompt)')
+    parser.add_argument('--network', default=None,
+                        help='Auto-select this network in adjust mode, skipping the Phase 0 menu')
     args, _ = parser.parse_known_args()
 
     try:
         (rail_seg, rail_line, feed_seg, feed_line,
          orig_rail_seg, orig_rail_line,
          station_catalog, version_name,
-         out_rail_dir, out_feeder_dir, _) = _run_phase0(auto_infra_version=args.infra_version)
+         out_rail_dir, out_feeder_dir, _) = _run_phase0(
+            auto_infra_version=args.infra_version,
+            auto_network=args.network,
+        )
     except SystemExit:
         return
 

@@ -35,14 +35,71 @@ import paths
 
 SWISS_CRS = "EPSG:2056"
 MERGE_ATTRS = ('Num_Tracks', 'Gauge', 'Electrification_Class')
+_NODE_SNAP_TOLERANCE_M = 25.0  # max distance (m) for an imported node to snap onto a segment
 
 GAUGE_OPTIONS           = ['1435', '1000']
 ELECTRIFICATION_OPTIONS = ['AC_16.7Hz', 'DC', 'non_electrified']
 NODE_CLASS_OPTIONS      = ['station', 'junction', 'abandoned_station']
 CONSTRUCT_TYPE_OPTIONS  = ['bridge', 'normal', 'tunnel']
-SPEED_SOURCE_OPTIONS    = ['OSM', 'gtfs', 'infra']
+SPEED_SOURCE_OPTIONS    = ['estimate', 'formula', 'gtfs', 'design']
 TRACK_MODE_OPTIONS      = ['train', 'tram', 'cog_railway', 'train / tram']
 _EDGE_LEVEL_BY_CT       = {'bridge': ['2', '3'], 'normal': ['1'], 'tunnel': ['-1', '-2']}
+
+
+# Mode-default speeds for auto-TT computation — must mirror infrabuild_network_builder
+_MODE_DEFAULT_SPEEDS_VM: dict = {
+    'train': 50.0, 'tram': 30.0, 'funicular': 10.0,
+    'cog_railway': 15.0, 'bus': 30.0,
+}
+_MODE_DEFAULT_FALLBACK_VM: float = 50.0
+
+
+def _auto_tt(length_m: float, speed_kmh: float, n_sta: int) -> tuple:
+    """Return (TT_Stopping, TT_Passing) in minutes using the standard physics formula.
+
+    Args:
+        length_m: segment length in metres.
+        speed_kmh: cruise speed in km/h.
+        n_sta: number of segment endpoints classified as 'station' (0, 1, or 2).
+    """
+    _A = 0.7   # m/s² — must match infrabuild_network_builder and enhancement
+    _B = 1.30  # buffer — must match
+    v = speed_kmh / 3.6
+    cruise = length_m / v
+    tt_pass = round(max(0.1, (cruise * _B) / 60), 1)
+    tt_stop = round(max(0.1, ((cruise + n_sta * 0.5 * v / _A) * _B) / 60), 1)
+    return tt_stop, tt_pass
+
+
+def _count_stations_at_endpoints(
+    from_name: str,
+    to_name: str,
+    nodes: gpd.GeoDataFrame,
+) -> int:
+    """Return 0, 1, or 2 — how many segment endpoints are classified as 'station'."""
+    n = 0
+    for name in (from_name, to_name):
+        if name is None or (isinstance(name, float) and pd.isna(name)):
+            continue
+        match = nodes[nodes['Name'] == name]
+        if not match.empty and str(match.iloc[0].get('Node_Class', '')).strip() == 'station':
+            n += 1
+    return n
+
+
+def _default_speed_for_segment(segment_row, gauge_fallback: float = None) -> float:
+    """Pick a mode-default cruise speed (km/h) for a segment based on its gauge."""
+    g = segment_row.get('Gauge')
+    if g is not None and not (isinstance(g, float) and pd.isna(g)):
+        try:
+            gi = int(float(g))
+            if gi <= 900:
+                return _MODE_DEFAULT_SPEEDS_VM.get('funicular', 10.0)
+            if gi == 1000:
+                return _MODE_DEFAULT_SPEEDS_VM.get('tram', 30.0)
+        except (ValueError, TypeError):
+            pass
+    return gauge_fallback if gauge_fallback is not None else _MODE_DEFAULT_FALLBACK_VM
 
 
 # =============================================================================
@@ -399,7 +456,7 @@ def _run_phase0() -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame,
     segments    = gpd.read_file(out_dir / 'segments.gpkg').reset_index(drop=True)
     composition = gpd.read_file(out_dir / 'segments_composition.gpkg').reset_index(drop=True)
     if 'speed_source' not in segments.columns:
-        segments['speed_source'] = 'OSM'
+        segments['speed_source'] = 'formula'
     print(f"  {len(nodes)} nodes, {len(segments)} segments, "
           f"{len(composition)} composition pieces loaded.")
 
@@ -553,6 +610,7 @@ def _remove_node(
                     'Route_Number':        s0['Route_Number'],
                     'Route_Name':          s0['Route_Name'],
                     'Route_Owner':         s0['Route_Owner'],
+                    'speed_source':        s0.get('speed_source', 'formula'),
                     'geometry':            new_geom,
                 }
 
@@ -628,11 +686,13 @@ def _split_segment_at(
     new_node_name: str,
     new_node_code: str,
     nodes: gpd.GeoDataFrame,
+    new_node_class: Optional[str] = None,
 ) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """
     Split segments.loc[seg_idx] at split_dist metres along its geometry.
     Produces S_A (before split) and S_B (after split).
     Redistributes composition pieces between A and B by cumulative length.
+    Recomputes TT_Stopping and TT_Passing via _auto_tt (speed_source='formula').
     Returns updated (segments, composition).
     """
     S = segments.loc[seg_idx]
@@ -648,9 +708,27 @@ def _split_segment_at(
     geom_B = substring(geom, split_dist, seg_len)
 
     t      = split_dist / seg_len if seg_len > 0 else 0.0
-    km_mid = S['Km_Start'] + t * (S['Km_End'] - S['Km_Start'])
+    km_start = float(S['Km_Start']) if S['Km_Start'] is not None and not (isinstance(S['Km_Start'], float) and pd.isna(S['Km_Start'])) else 0.0
+    km_end   = float(S['Km_End'])   if S['Km_End']   is not None and not (isinstance(S['Km_End'],   float) and pd.isna(S['Km_End']))   else 0.0
+    km_mid   = km_start + t * (km_end - km_start)
 
     split_pt = geom.interpolate(split_dist)
+
+    # Speed resolution: use Average_Speed from original, fall back to gauge-derived default
+    avg_spd = S.get('Average_Speed')
+    speed_kmh = (
+        float(avg_spd)
+        if pd.notna(avg_spd) and float(avg_spd) > 0
+        else _default_speed_for_segment(S)
+    )
+
+    # Station counts at each sub-segment's endpoints
+    n_from = _count_stations_at_endpoints(S['From_Name'], None, nodes)
+    n_to   = _count_stations_at_endpoints(None, S['To_Name'], nodes)
+    n_new  = 1 if (new_node_class or '').strip() == 'station' else 0
+
+    tt_stop_A, tt_pass_A = _auto_tt(geom_A.length, speed_kmh, n_from + n_new)
+    tt_stop_B, tt_pass_B = _auto_tt(geom_B.length, speed_kmh, n_new + n_to)
 
     from_code_rows = nodes[nodes['Name'] == S['From_Name']]
     to_code_rows   = nodes[nodes['Name'] == S['To_Name']]
@@ -672,7 +750,7 @@ def _split_segment_at(
         'Num_Tracks':            S['Num_Tracks'],
         'Gauge':                 S['Gauge'],
         'Electrification_Class': S['Electrification_Class'],
-        'Km_Start':              S['Km_Start'],
+        'Km_Start':              km_start,
         'Km_End':                km_mid,
         'Route_Number':          S['Route_Number'],
         'Route_Name':            S['Route_Name'],
@@ -680,6 +758,9 @@ def _split_segment_at(
         'Average_Speed':         S.get('Average_Speed', pd.NA),
         'Predominant_Speed':     S.get('Predominant_Speed', pd.NA),
         'Speed_Coverage_Pct':    S.get('Speed_Coverage_Pct', 0.0),
+        'TT_Stopping':           tt_stop_A,
+        'TT_Passing':            tt_pass_A,
+        'speed_source':          'formula',
         'geometry':              geom_A,
     }
     row_B = {
@@ -695,13 +776,16 @@ def _split_segment_at(
         'Gauge':                 S['Gauge'],
         'Electrification_Class': S['Electrification_Class'],
         'Km_Start':              km_mid,
-        'Km_End':                S['Km_End'],
+        'Km_End':                km_end,
         'Route_Number':          S['Route_Number'],
         'Route_Name':            S['Route_Name'],
         'Route_Owner':           S['Route_Owner'],
         'Average_Speed':         S.get('Average_Speed', pd.NA),
         'Predominant_Speed':     S.get('Predominant_Speed', pd.NA),
         'Speed_Coverage_Pct':    S.get('Speed_Coverage_Pct', 0.0),
+        'TT_Stopping':           tt_stop_B,
+        'TT_Passing':            tt_pass_B,
+        'speed_source':          'formula',
         'geometry':              geom_B,
     }
 
@@ -892,7 +976,7 @@ def _add_node(
 
     if seg_idx is not None:
         segments, composition = _split_segment_at(
-            segments, composition, seg_idx, split_dist, name, code, nodes
+            segments, composition, seg_idx, split_dist, name, code, nodes, node_class
         )
 
     # Append new node
@@ -962,6 +1046,7 @@ def _remove_segment(
 def _adjust_segment(
     segments: gpd.GeoDataFrame,
     composition: gpd.GeoDataFrame,
+    nodes: gpd.GeoDataFrame,
 ) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """Phase 2 — Adjust a segment's attributes and optionally redefine its composition."""
     term = input("  Search segment (partial from-name, to-name, or segment_name): ").strip()
@@ -987,7 +1072,7 @@ def _adjust_segment(
     print(f"\n  Segment: {row.get('From_Name', '')} → {row.get('To_Name', '')}  [{row.get('Segment_ID', '')}]")
     print(f"  Route: {row.get('Route_Number', 'N/A')} — {row.get('Route_Name', 'N/A')}  [read-only]")
     print(
-        f"  OSM-derived (read-only): Predominant_Speed={row.get('Predominant_Speed', 'N/A')}  "
+        f"  Formula-derived (read-only): Predominant_Speed={row.get('Predominant_Speed', 'N/A')}  "
         f"Speed_Coverage_Pct={row.get('Speed_Coverage_Pct', 'N/A')}"
     )
 
@@ -1030,11 +1115,11 @@ def _adjust_segment(
         elif col == 'Average_Speed':
             val = _prompt_text('Average speed (km/h)', example='120', current=cur, cast=float)
         elif col in ('TT_Stopping', 'TT_Passing'):
-            val = _prompt_text(col.replace('_', ' ') + ' (s)', example='45',
+            val = _prompt_text(col.replace('_', ' ') + ' (min)', example='2.5',
                                current=cur, cast=float)
         elif col == 'speed_source':
             val = _prompt_enum('Speed source', SPEED_SOURCE_OPTIONS,
-                               current=cur or 'OSM', allow_other=False)
+                               current=cur or 'formula', allow_other=False)
         else:
             val = _prompt_text(col, current=cur)
 
@@ -1049,6 +1134,26 @@ def _adjust_segment(
 
     if changed:
         print(f"  Segment '{row['Segment_ID']}' attributes updated.")
+
+    # When Average_Speed changed and source is not 'design', offer to recompute TT
+    new_spd = segments.at[row_idx, 'Average_Speed']
+    new_src = segments.at[row_idx, 'speed_source'] if 'speed_source' in segments.columns else 'formula'
+    spd_changed = changed and new_spd is not None and not (isinstance(new_spd, float) and pd.isna(new_spd))
+    if spd_changed and str(new_src) in ('formula', 'estimate'):
+        recompute = input(
+            '  Average_Speed changed — recompute TT_Stopping/TT_Passing from new speed? (y/n) [y]: '
+        ).strip().lower() or 'y'
+        if recompute == 'y':
+            n_sta = sum(
+                1 for node_name in (row.get('From_Name'), row.get('To_Name'))
+                for _, n in nodes.iterrows()
+                if n.get('Name') == node_name and str(n.get('Node_Class', '')).strip() == 'station'
+            )
+            tt_s, tt_p = _auto_tt(float(row.get('Length', 0)), float(new_spd), n_sta)
+            segments.at[row_idx, 'TT_Stopping'] = tt_s
+            segments.at[row_idx, 'TT_Passing']  = tt_p
+            segments.at[row_idx, 'speed_source'] = 'formula'
+            print(f"  TT recomputed: TT_Stopping={tt_s} min, TT_Passing={tt_p} min.")
 
     # Composition update
     recomp = input("\n  Redefine composition for this segment? (y/n) [n]: ").strip().lower() or 'n'
@@ -1112,13 +1217,16 @@ def _add_segment(
     owner   = _prompt_enum('Route owner', owner_opts)
     km_s    = _prompt_text('Km start', example='0.0', cast=float)
     km_e    = _prompt_text('Km end', example='12.5', cast=float)
-    avg_spd = _prompt_text('Average speed (km/h)', example='120', cast=float)
+    avg_spd = _prompt_text('Average speed (km/h) — leave blank for mode default', cast=float)
 
-    if avg_spd is not None:
-        speed_source = _prompt_enum('Speed source', SPEED_SOURCE_OPTIONS,
-                                    current='infra', allow_other=False) or 'infra'
-    else:
-        speed_source = 'OSM'
+    # Prompt for explicit TT only when user has known measured values
+    tt_known_raw = input(
+        '\n  Do you have known TT_Stopping and TT_Passing (min) for this segment? (y/n) [n]: '
+    ).strip().lower() or 'n'
+    tt_stop_manual = tt_pass_manual = None
+    if tt_known_raw == 'y':
+        tt_stop_manual = _prompt_text('TT_Stopping (min)', example='2.5', cast=float)
+        tt_pass_manual = _prompt_text('TT_Passing (min)', example='1.8', cast=float)
 
     def _na(v):
         return pd.NA if v is None else v
@@ -1133,7 +1241,6 @@ def _add_segment(
         'Km_Start':              float(km_s) if isinstance(km_s, str) else _na(km_s),
         'Km_End':                float(km_e) if isinstance(km_e, str) else _na(km_e),
     }
-    avg_speed = float(avg_spd) if isinstance(avg_spd, str) else _na(avg_spd)
 
     seg_id  = f"c{f_node['Code']}_{t_node['Code']}"
     existing_seg_ids = set(segments['Segment_ID'].dropna().astype(str))
@@ -1146,6 +1253,36 @@ def _add_segment(
         print(f"  Segment ID '{seg_id}' already exists. Using '{candidate}'.")
         seg_id = candidate
     seg_len = geom.length
+
+    # Determine speed_source and compute TT from what the user provided
+    n_sta = sum(
+        1 for n in (f_node, t_node)
+        if str(n.get('Node_Class', '')).strip() == 'station'
+    )
+    if tt_stop_manual is not None and avg_spd is not None:
+        speed_source = 'design'
+        avg_speed    = float(avg_spd)
+        tt_stop      = float(tt_stop_manual)
+        tt_pass      = float(tt_pass_manual) if tt_pass_manual is not None else tt_stop
+    elif avg_spd is not None:
+        speed_source     = 'formula'
+        avg_speed        = float(avg_spd)
+        tt_stop, tt_pass = _auto_tt(seg_len, avg_speed, n_sta)
+    else:
+        speed_source = 'estimate'
+        avg_speed    = pd.NA  # no measured speed — keep null
+        # infer mode default from gauge when available
+        default_spd  = _MODE_DEFAULT_FALLBACK_VM
+        if gauge is not None:
+            try:
+                g = int(float(gauge))
+                if g <= 900:
+                    default_spd = _MODE_DEFAULT_SPEEDS_VM.get('funicular', 10.0)
+                elif g == 1000:
+                    default_spd = _MODE_DEFAULT_SPEEDS_VM.get('tram', 30.0)
+            except (ValueError, TypeError):
+                pass
+        tt_stop, tt_pass = _auto_tt(seg_len, default_spd, n_sta)
 
     fn_num = f_node.get('Number')
     tn_num = t_node.get('Number')
@@ -1173,6 +1310,8 @@ def _add_segment(
         'Average_Speed':         avg_speed,
         'Predominant_Speed':     avg_speed,
         'Speed_Coverage_Pct':    1.0 if pd.notna(avg_speed) else 0.0,
+        'TT_Stopping':           tt_stop,
+        'TT_Passing':            tt_pass,
         'speed_source':          speed_source,
         'geometry':              geom,
     }
@@ -1368,12 +1507,16 @@ def _edit_composition(
 
 def _import_nodes(
     current_nodes: gpd.GeoDataFrame,
+    current_segs: gpd.GeoDataFrame,
+    current_comp: gpd.GeoDataFrame,
     current_version: str,
-) -> gpd.GeoDataFrame:
+) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """Import and update nodes from another version.
 
     Shows three diff categories:
-      New     — in source, not in current → offer to add
+      New     — in source, not in current → offer to add; if the node lands
+                within _NODE_SNAP_TOLERANCE_M of an existing segment, offers
+                to split that segment via _split_segment_at.
       Changed — in both but attributes differ → offer to replace
       Removed — in current, not in source → offer to delete from current
     """
@@ -1381,10 +1524,10 @@ def _import_nodes(
     versions = [v for v in list_versions(infra_root) if v != current_version]
     if not versions:
         print("  No other versions available to import from.")
-        return current_nodes
+        return current_nodes, current_segs, current_comp
     idx = _pick_one(versions, "Version to import nodes from")
     if idx is None:
-        return current_nodes
+        return current_nodes, current_segs, current_comp
     source_version = versions[idx]
 
     print(f"  Loading nodes from '{source_version}'...")
@@ -1439,7 +1582,7 @@ def _import_nodes(
 
     if not diff_items:
         print("  No differences found between current version and source.")
-        return current_nodes
+        return current_nodes, current_segs, current_comp
 
     print("\n  Available imports:")
     for j, (_, status, _, desc) in enumerate(diff_items, 1):
@@ -1447,15 +1590,16 @@ def _import_nodes(
 
     ans = input("\n  Enter numbers to apply (e.g. 1,3,21-25), 'all', or Enter to cancel: ").strip()
     if not ans:
-        return current_nodes
+        return current_nodes, current_segs, current_comp
 
     selected_indices = _parse_selection(ans, len(diff_items))
 
     if not selected_indices:
         print("  No valid choices selected.")
-        return current_nodes
+        return current_nodes, current_segs, current_comp
 
     new_rows = []
+    new_node_source_rows = []  # (s_row) for "New" nodes only — checked for segment snap
     drop_indices = []
 
     for idx_in_diff in selected_indices:
@@ -1463,7 +1607,10 @@ def _import_nodes(
         if status == "Removed":
             drop_indices.append(c_idx)
         else:
-            new_rows.append(source_nodes.loc[s_idx])
+            s_row = source_nodes.loc[s_idx]
+            new_rows.append(s_row)
+            if status == "New":
+                new_node_source_rows.append(s_row)
             if status == "Changed" and c_idx is not None:
                 drop_indices.append(c_idx)
 
@@ -1476,8 +1623,36 @@ def _import_nodes(
             ignore_index=True
         )
 
+    # --- Snap new nodes onto segments ----------------------------------------
+    for s_row in new_node_source_rows:
+        node_name  = str(s_row.get('Name', ''))
+        node_code  = str(s_row.get('Code', node_name[:4].upper()))
+        node_class = str(s_row.get('Node_Class', ''))
+        node_pt    = s_row.geometry
+
+        dists      = current_segs.geometry.distance(node_pt)
+        nearest_idx  = dists.idxmin()
+        nearest_dist = dists[nearest_idx]
+
+        if nearest_dist > _NODE_SNAP_TOLERANCE_M:
+            continue
+
+        seg_row = current_segs.loc[nearest_idx]
+        print(f"\n  Node '{node_name}' is {nearest_dist:.1f} m from segment "
+              f"'{seg_row['From_Name']} → {seg_row['To_Name']}' [{seg_row['Segment_ID']}].")
+        ans2 = input("  Split this segment at the node? (y/n) [y]: ").strip().lower() or 'y'
+        if ans2 != 'y':
+            continue
+
+        split_dist = seg_row.geometry.project(node_pt)
+        current_segs, current_comp = _split_segment_at(
+            current_segs, current_comp, nearest_idx, split_dist,
+            node_name, node_code, current_nodes, node_class,
+        )
+        print(f"  Segment split at {split_dist:.0f} m.")
+
     print(f"  Applied {len(selected_indices)} change(s).")
-    return current_nodes
+    return current_nodes, current_segs, current_comp
 
 
 def _import_segments(
@@ -1634,7 +1809,7 @@ def _adjust_network_speed_source(
 ) -> gpd.GeoDataFrame:
     """Set speed_source for all segments in the network (or a filtered subset)."""
     if 'speed_source' not in segments.columns:
-        segments['speed_source'] = 'OSM'
+        segments['speed_source'] = 'formula'
 
     counts = segments['speed_source'].value_counts().to_dict()
     print(f"\n  Current speed_source distribution:")
@@ -1642,11 +1817,11 @@ def _adjust_network_speed_source(
         print(f"    {val}: {counts.get(val, 0)} segment(s)")
 
     print("\n  Set speed_source to:")
-    print("    1) OSM   — derived from OSM speeds; open to gtfs calibration")
-    print("    2) gtfs  — timetable-calibrated; locked until reset")
-    print("    3) infra — designer-set speed; locked unconditionally")
+    print("    1) formula — OSM/formula-derived; open to GTFS calibration")
+    print("    2) gtfs    — timetable-calibrated; protected from formula re-calibration")
+    print("    3) design  — designer-set; locked unconditionally (no GTFS override)")
     src_choice = input("  Select (1/2/3): ").strip()
-    target_map = {'1': 'OSM', '2': 'gtfs', '3': 'infra'}
+    target_map = {'1': 'formula', '2': 'gtfs', '3': 'design'}
     if src_choice not in target_map:
         print("  Cancelled.")
         return segments
@@ -1691,6 +1866,256 @@ def _adjust_network_speed_source(
 
 
 # =============================================================================
+# Pre-save validation and auto-fill
+# =============================================================================
+
+def _validate_and_autofill(
+    nodes: gpd.GeoDataFrame,
+    segments: gpd.GeoDataFrame,
+    composition: gpd.GeoDataFrame,
+) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, bool]:
+    """Auto-fill derivable nulls and report remaining issues before save.
+
+    Runs 10 sequential fills, then reports what changed. Non-blocking warnings
+    are printed but do not stop the save. Blocking issues (null endpoint names,
+    zero length) prompt "Save anyway?" and return False if the user declines.
+
+    Returns updated (nodes, segments, composition, ok_to_save).
+    """
+    print("\n" + "─" * 60)
+    print("  Pre-save validation")
+    print("─" * 60)
+
+    counts: dict = {}
+    warnings: List[str] = []
+    blockers: List[str] = []
+
+    node_lookup = {
+        str(r['Name']): r
+        for _, r in nodes.iterrows()
+        if pd.notna(r.get('Name'))
+    }
+
+    # ── Step 1 — Length from geometry ────────────────────────────────────────
+    bad_len_mask = segments['Length'].isnull() | (segments['Length'] <= 0)
+    for i in segments.index[bad_len_mask]:
+        g = segments.at[i, 'geometry']
+        if g is not None and not g.is_empty:
+            segments.at[i, 'Length'] = float(g.length)
+            counts['Length'] = counts.get('Length', 0) + 1
+
+    # ── Step 2 — From_E/N, To_E/N from nodes table ───────────────────────────
+    for i, row in segments.iterrows():
+        for prefix, name_col in (('From', 'From_Name'), ('To', 'To_Name')):
+            e_col, n_col = f'{prefix}_E', f'{prefix}_N'
+            if e_col not in segments.columns or n_col not in segments.columns:
+                continue
+            if pd.notna(segments.at[i, e_col]) and pd.notna(segments.at[i, n_col]):
+                continue
+            name = row.get(name_col)
+            if name in node_lookup:
+                segments.at[i, e_col] = float(node_lookup[name].get('E', 0) or 0)
+                segments.at[i, n_col] = float(node_lookup[name].get('N', 0) or 0)
+                counts['Endpoint_coords'] = counts.get('Endpoint_coords', 0) + 1
+
+    # ── Step 3 — Average_Speed from Predominant_Speed ────────────────────────
+    if 'Predominant_Speed' in segments.columns:
+        mask = segments['Average_Speed'].isnull() & segments['Predominant_Speed'].notna()
+        n_fill = int(mask.sum())
+        if n_fill:
+            segments.loc[mask, 'Average_Speed'] = segments.loc[mask, 'Predominant_Speed']
+            counts['Average_Speed'] = n_fill
+
+    # ── Step 4 — Speed_Coverage_Pct ──────────────────────────────────────────
+    if 'Speed_Coverage_Pct' in segments.columns:
+        mask_null = segments['Speed_Coverage_Pct'].isnull()
+        if mask_null.any():
+            segments.loc[mask_null & segments['Average_Speed'].notna(), 'Speed_Coverage_Pct'] = 1.0
+            segments.loc[mask_null & segments['Average_Speed'].isnull(), 'Speed_Coverage_Pct'] = 0.0
+            counts['Speed_Coverage_Pct'] = int(mask_null.sum())
+
+    # ── Step 5 — speed_source inference when null/empty ──────────────────────
+    if 'speed_source' not in segments.columns:
+        segments['speed_source'] = pd.NA
+    mask_null_src = (
+        segments['speed_source'].isnull()
+        | (segments['speed_source'].astype(str).str.strip() == '')
+    )
+    if mask_null_src.any():
+        has_speed = segments['Average_Speed'].notna()
+        segments.loc[mask_null_src &  has_speed, 'speed_source'] = 'formula'
+        segments.loc[mask_null_src & ~has_speed, 'speed_source'] = 'estimate'
+        counts['speed_source'] = int(mask_null_src.sum())
+
+    # ── Step 6 — TT_Stopping / TT_Passing from formula ───────────────────────
+    for col in ('TT_Stopping', 'TT_Passing'):
+        if col not in segments.columns:
+            segments[col] = pd.NA
+    null_tt_mask = segments['TT_Stopping'].isnull() | segments['TT_Passing'].isnull()
+    for i in segments.index[null_tt_mask]:
+        row = segments.loc[i]
+        length_m = float(row.get('Length') or 0)
+        if length_m <= 0:
+            continue
+        spd = row.get('Average_Speed')
+        if pd.notna(spd) and float(spd) > 0:
+            speed_kmh = float(spd)
+            new_src = 'formula'
+        else:
+            speed_kmh = _default_speed_for_segment(row)
+            new_src = 'estimate'
+        n_sta = _count_stations_at_endpoints(
+            row.get('From_Name'), row.get('To_Name'), nodes,
+        )
+        tt_s, tt_p = _auto_tt(length_m, speed_kmh, n_sta)
+        segments.at[i, 'TT_Stopping'] = tt_s
+        segments.at[i, 'TT_Passing']  = tt_p
+        if new_src == 'formula' and str(segments.at[i, 'speed_source']) == 'estimate':
+            segments.at[i, 'speed_source'] = 'formula'
+        counts['TT_filled'] = counts.get('TT_filled', 0) + 1
+
+    # ── Step 7 — Number / Code from endpoint nodes ───────────────────────────
+    for i, row in segments.iterrows():
+        if 'Number' in segments.columns and pd.isna(row.get('Number')):
+            fn = node_lookup.get(str(row.get('From_Name', '') or ''))
+            tn = node_lookup.get(str(row.get('To_Name',   '') or ''))
+            if (fn is not None and tn is not None
+                    and pd.notna(fn.get('Number')) and pd.notna(tn.get('Number'))):
+                segments.at[i, 'Number'] = f"{int(fn['Number'])}_{int(tn['Number'])}"
+                counts['Number'] = counts.get('Number', 0) + 1
+        if 'Code' in segments.columns and pd.isna(row.get('Code')):
+            fn = node_lookup.get(str(row.get('From_Name', '') or ''))
+            tn = node_lookup.get(str(row.get('To_Name',   '') or ''))
+            if (fn is not None and tn is not None
+                    and pd.notna(fn.get('Code')) and pd.notna(tn.get('Code'))):
+                segments.at[i, 'Code'] = f"{fn['Code']}_{tn['Code']}"
+                counts['Code'] = counts.get('Code', 0) + 1
+
+    # ── Step 9 — Missing composition entries (before step 8 so step 8 sees them) ─
+    seg_ids_with_comp = (
+        set(composition['Segment_ID'].dropna().astype(str).unique())
+        if not composition.empty else set()
+    )
+    missing_comp_rows = []
+    for _, row in segments.iterrows():
+        sid = str(row.get('Segment_ID', '') or '')
+        if not sid or sid in seg_ids_with_comp:
+            continue
+        missing_comp_rows.append({
+            'Segment_ID':            sid,
+            'From_Name':             row.get('From_Name'),
+            'To_Name':               row.get('To_Name'),
+            'Engineering_Structure': 'normal',
+            'Edge_Level':            1,
+            'Under_Construction':    0,
+            'Piece_Length':          float(row.get('Length') or 0),
+            'geometry':              row.get('geometry'),
+        })
+    if missing_comp_rows:
+        composition = pd.concat(
+            [composition, gpd.GeoDataFrame(missing_comp_rows, crs=SWISS_CRS)],
+            ignore_index=True,
+        )
+        counts['Composition_added'] = len(missing_comp_rows)
+
+    # ── Step 8 — Tunnel/Bridge/Conventional_Length from composition ───────────
+    derived_cols = [
+        ('Tunnel_Length',       'tunnel'),
+        ('Bridge_Length',       'bridge'),
+        ('Conventional_Length', 'normal'),
+    ]
+    if all(c in segments.columns for c, _ in derived_cols):
+        for i, row in segments.iterrows():
+            if not any(pd.isna(segments.at[i, col]) for col, _ in derived_cols):
+                continue
+            sid = row.get('Segment_ID')
+            pieces = composition[composition['Segment_ID'] == sid]
+            if pieces.empty:
+                continue
+            by_type = pieces.groupby('Engineering_Structure')['Piece_Length'].sum()
+            for col, struct in derived_cols:
+                if pd.isna(segments.at[i, col]):
+                    segments.at[i, col] = float(by_type.get(struct, 0.0))
+                    counts['Length_breakdown'] = counts.get('Length_breakdown', 0) + 1
+
+    # ── Step 10 — Orphan composition rows ─────────────────────────────────────
+    seg_ids_existing = set(segments['Segment_ID'].dropna().astype(str).unique())
+    orphan_mask = ~composition['Segment_ID'].astype(str).isin(seg_ids_existing)
+    n_orphan = int(orphan_mask.sum())
+    if n_orphan > 0:
+        composition = composition[~orphan_mask].reset_index(drop=True)
+        counts['Composition_orphans_removed'] = n_orphan
+
+    # ── Non-blocking warnings ─────────────────────────────────────────────────
+    null_class = nodes[
+        nodes['Node_Class'].isnull()
+        | (nodes['Node_Class'].astype(str).str.strip() == '')
+    ]
+    if not null_class.empty:
+        names = null_class['Name'].dropna().astype(str).tolist()
+        warnings.append(
+            f"{len(null_class)} node(s) have null Node_Class: "
+            f"{', '.join(names[:5])}{'…' if len(names) > 5 else ''}"
+        )
+
+    null_num = nodes[nodes['Number'].isnull()]
+    if not null_num.empty:
+        names = null_num['Name'].dropna().astype(str).tolist()
+        warnings.append(
+            f"{len(null_num)} node(s) have null Number: "
+            f"{', '.join(names[:5])}{'…' if len(names) > 5 else ''}"
+        )
+
+    # ── Blocking issues ───────────────────────────────────────────────────────
+    null_endpoint = segments[
+        segments['From_Name'].isnull() | segments['To_Name'].isnull()
+    ]
+    if not null_endpoint.empty:
+        ids = null_endpoint['Segment_ID'].dropna().astype(str).tolist()
+        blockers.append(
+            f"{len(null_endpoint)} segment(s) have null From_Name or To_Name: "
+            f"{', '.join(ids[:5])}{'…' if len(ids) > 5 else ''}"
+        )
+
+    bad_length = segments[
+        segments['Length'].isnull() | (segments['Length'] <= 0)
+    ]
+    if not bad_length.empty:
+        ids = bad_length['Segment_ID'].dropna().astype(str).tolist()
+        blockers.append(
+            f"{len(bad_length)} segment(s) have Length <= 0 after auto-fill: "
+            f"{', '.join(ids[:5])}{'…' if len(ids) > 5 else ''}"
+        )
+
+    # ── Report ────────────────────────────────────────────────────────────────
+    if counts:
+        print("\n  Auto-filled:")
+        for key, n in counts.items():
+            print(f"    {key:32s} {n} row(s)")
+    else:
+        print("\n  Nothing to auto-fill — all derivable values already populated.")
+
+    if warnings:
+        print("\n  Warnings (save will proceed):")
+        for w in warnings:
+            print(f"    • {w}")
+
+    ok_to_save = True
+    if blockers:
+        print("\n  BLOCKING ISSUES:")
+        for b in blockers:
+            print(f"    • {b}")
+        ans = input("\n  Save anyway? (y/n) [n]: ").strip().lower() or 'n'
+        if ans != 'y':
+            print("  Save aborted. Fix the issues above and try again.")
+            ok_to_save = False
+        else:
+            print("  Saving despite blocking issues — downstream pipeline may fail.")
+
+    return nodes, segments, composition, ok_to_save
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -1723,7 +2148,7 @@ def main():
                 elif c == '3':
                     nodes, segments, composition = _add_node(nodes, segments, composition)
                 elif c == '4':
-                    nodes = _import_nodes(nodes, name)
+                    nodes, segments, composition = _import_nodes(nodes, segments, composition, name)
                 elif c == '5':
                     phase = 2
                     break
@@ -1739,7 +2164,7 @@ def main():
                 print("    2) Adjust a segment")
                 print("    3) Add a segment")
                 print("    4) Import segments from another version")
-                print("    5) Reset speed source (GTFS → OSM, for re-calibration)")
+                print("    5) Adjust speed source (bulk re-tier segments)")
                 print("    6) Proceed to composition editing  →")
                 print("    7) ← Back to node editing")
                 c = input("  Select (1-7): ").strip()
@@ -1747,7 +2172,7 @@ def main():
                 if c == '1':
                     segments, composition, nodes = _remove_segment(segments, composition, nodes)
                 elif c == '2':
-                    segments, composition = _adjust_segment(segments, composition)
+                    segments, composition = _adjust_segment(segments, composition, nodes)
                 elif c == '3':
                     segments, composition = _add_segment(nodes, segments, composition)
                 elif c == '4':
@@ -1776,6 +2201,11 @@ def main():
                 if c == '1':
                     composition = _edit_composition(segments, composition)
                 elif c == '2':
+                    nodes, segments, composition, ok = _validate_and_autofill(
+                        nodes, segments, composition
+                    )
+                    if not ok:
+                        continue
                     print("\n  Saving GeoPackages...")
                     nodes.to_file(out_dir / 'nodes.gpkg', driver='GPKG')
                     segments.to_file(out_dir / 'segments.gpkg', driver='GPKG')
@@ -1811,6 +2241,11 @@ def main():
                 phase = 3
                 continue
             if ans == '1':
+                nodes, segments, composition, ok = _validate_and_autofill(
+                    nodes, segments, composition
+                )
+                if not ok:
+                    continue
                 print("  Saving GeoPackages...")
                 nodes.to_file(out_dir / 'nodes.gpkg', driver='GPKG')
                 segments.to_file(out_dir / 'segments.gpkg', driver='GPKG')

@@ -174,9 +174,20 @@ def _configure_gtfs_folders():
     }
 
 
-_gtfs_cfg = _configure_gtfs_folders()
-GTFS_INPUT_FOLDER  = _gtfs_cfg['gtfs_input_folder']
-GTFS_OUTPUT_FOLDER = _gtfs_cfg['gtfs_output_folder']
+import argparse as _ap
+_cli = _ap.ArgumentParser(add_help=False)
+_cli.add_argument('--input-folder',  default=None)
+_cli.add_argument('--output-folder', default=None)
+_cli_args, _ = _cli.parse_known_args()
+
+if _cli_args.input_folder and _cli_args.output_folder:
+    GTFS_INPUT_FOLDER  = _cli_args.input_folder
+    GTFS_OUTPUT_FOLDER = _cli_args.output_folder
+    print(f"  Non-interactive: input='{GTFS_INPUT_FOLDER}', output='{GTFS_OUTPUT_FOLDER}'")
+else:
+    _gtfs_cfg = _configure_gtfs_folders()
+    GTFS_INPUT_FOLDER  = _gtfs_cfg['gtfs_input_folder']
+    GTFS_OUTPUT_FOLDER = _gtfs_cfg['gtfs_output_folder']
 
 
 # ===========================================================================

@@ -1266,7 +1266,14 @@ def _build_qgz(qgz_path, layers):
 # ---------------------------------------------------------------------------
 
 def _configure_pipeline():
-    """Prompt the user for pipeline configuration choices.
+    """Prompt the user for pipeline configuration choices, or read from CLI args.
+
+    When called with --non-interactive (e.g. from main_new.py), all prompts are
+    skipped and values are taken from CLI args instead:
+        --gtfs-folder  : GTFS input subfolder name
+        --output-name  : output folder name (both Rail and Feeder)
+        --modes        : all | pt_feeder | rail  (default: all)
+        --all-periods  : write all time-period outputs (full-day + all-day + peak + off-peak)
 
     Returns a dict with keys:
         gtfs_input_folder  : str   – subfolder name under GTFS_TRANSIT_DIR
@@ -1277,6 +1284,54 @@ def _configure_pipeline():
         write_peak         : bool
         write_offpeak      : bool
     """
+    import argparse as _ap
+    _parser = _ap.ArgumentParser(add_help=False)
+    _parser.add_argument('--gtfs-folder',      default=None)
+    _parser.add_argument('--output-name',      default=None)
+    _parser.add_argument('--modes',            default=None,
+                         choices=['all', 'pt_feeder', 'rail'])
+    _parser.add_argument('--all-periods',      action='store_true')
+    _parser.add_argument('--non-interactive',  action='store_true')
+    _args, _ = _parser.parse_known_args()
+
+    gtfs_base = os.path.join(paths.MAIN, paths.GTFS_TRANSIT_DIR)
+
+    if _args.non_interactive:
+        gtfs_input    = _args.gtfs_folder or GTFS_INPUT_FOLDER
+        build_modes   = _args.modes or 'all'
+        output_folder = _args.output_name or (
+            gtfs_input.replace('GTFS_', '', 1) + '_network'
+            if gtfs_input.startswith('GTFS_') else gtfs_input + '_network'
+        )
+        full_input = os.path.join(gtfs_base, gtfs_input)
+        if not os.path.isdir(full_input):
+            raise SystemExit(f"  ERROR: GTFS folder not found: {full_input}")
+
+        write_fullday = write_allday = write_peak = write_offpeak = _args.all_periods
+        if not _args.all_periods:
+            write_fullday = True
+
+        mode_labels = {'all': 'ALL', 'pt_feeder': 'PT-FEEDER ONLY', 'rail': 'RAIL ONLY'}
+        print("=" * 70)
+        print("services_network_builder.py — NON-INTERACTIVE CONFIGURATION")
+        print("=" * 70)
+        print(f"  GTFS input folder  : {gtfs_input}")
+        print(f"  Mode selection     : {mode_labels[build_modes]}")
+        print(f"  Time-period output : {'ALL' if _args.all_periods else 'FULL-DAY ONLY'}")
+        print(f"  Output folder      : {output_folder}")
+        print("=" * 70)
+
+        return {
+            'gtfs_input_folder': gtfs_input,
+            'output_folder':     output_folder,
+            'build_modes':       build_modes,
+            'write_fullday':     write_fullday,
+            'write_allday':      write_allday,
+            'write_peak':        write_peak,
+            'write_offpeak':     write_offpeak,
+        }
+
+    # --- Interactive path ----------------------------------------------------
     print("=" * 70)
     print("services_network_builder.py — PIPELINE CONFIGURATION")
     print("=" * 70)
@@ -1284,7 +1339,6 @@ def _configure_pipeline():
     # --- A. GTFS Input Folder ------------------------------------------------
     print("\nA. GTFS INPUT FOLDER")
     print(f"   Base path: {paths.GTFS_TRANSIT_DIR}")
-    gtfs_base = os.path.join(paths.MAIN, paths.GTFS_TRANSIT_DIR)
     if os.path.isdir(gtfs_base):
         subfolders = sorted([
             d for d in os.listdir(gtfs_base)
@@ -3127,7 +3181,7 @@ report_lines = [
     "",
     "CONFIGURATION",
     f"  CATCHMENT_METHOD : {settings.CATCHMENT_METHOD}",
-    f"  CATCHMENT_CANTON : {settings.CATCHMENT_CANTON}",
+    f"  CATCHMENT_CANTON : {settings.CATCHMENT_CANTON_ABBREV}",
     f"  GTFS source      : {os.path.join(paths.GTFS_TRANSIT_DIR, GTFS_INPUT_FOLDER)}",
     f"  Output folder    : {PT_FEEDER_OUTPUT_FOLDER}",
     f"  Spatial CRS      : {CODEBASE_CRS}",

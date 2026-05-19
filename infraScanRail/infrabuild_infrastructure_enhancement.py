@@ -4,7 +4,7 @@ Infrastructure Enhancement Module
 Produces a named "enhanced" infrastructure version by combining:
   1. Travel time enrichment — distribute GTFS-observed travel times (TT_Stopping,
      TT_Passing) across BAV segments via projected service path_nodes, covering
-     both rail (edges_all.gpkg) and track-based feeder services (tram, metro,
+     both rail (rail_segments.gpkg) and track-based feeder services (tram, metro,
      funicular via pt_feeder_segments.gpkg).
   2. Gauge / electrification fill — infer missing attribute values from service
      traversal paths via path-based consensus.
@@ -18,9 +18,9 @@ a new named version in the same infrastructure directory.
 Output column names TT_Stopping / TT_Passing match the column read by
 build_infra_graph in services_service_projection.py for routing weight calibration.
 
-Rail TT enrichment note: requires edges_all.gpkg to contain path_nodes (retained
+Rail TT enrichment note: requires rail_segments.gpkg to contain path_nodes (retained
 after the _OUTPUT_DROP fix in services_service_projection.py). If path_nodes is
-absent from an existing edges_all.gpkg, rail services are skipped and only feeder
+absent from an existing rail_segments.gpkg, rail services are skipped and only feeder
 TT is distributed. Re-run services_service_projection.py after that fix to generate
 a path_nodes-aware rail output.
 
@@ -82,6 +82,23 @@ _FEEDER_LAYER_MODE: Dict[str, str] = {
     "tram":      "tram",
     "funicular": "funicular",
     "metro":     "tram",
+}
+
+
+# Tier rank for segment speed_source values.
+# 'design' (3) is a locked tier — never updated by service contributions.
+_SPEED_SOURCE_TIER: Dict[str, int] = {
+    'estimate': 0,
+    'formula':  1,
+    'gtfs':     2,
+    'design':   3,
+}
+
+# Tier rank for service link tt_source values.
+_TT_SOURCE_TIER: Dict[str, int] = {
+    'estimate': 0,
+    'formula':  1,
+    'gtfs':     2,
 }
 
 
@@ -1152,7 +1169,6 @@ def compute_segment_stats(
     infra_dir: Path,
     enhanced_dir: Path,
     extend_mode: bool = False,
-    conflict_t1: str = 'service',
 ) -> Tuple[gpd.GeoDataFrame, Optional[gpd.GeoDataFrame]]:
     """
     Returns (enriched_base_segments, feeder_derived_segments).
@@ -1164,17 +1180,17 @@ def compute_segment_stats(
     feeder_derived_segments: new infra segments built from track-based feeder
         data with ZVV geometry and no BAV path. None if none qualify.
 
-    Rail TT is read from edges_all.gpkg (column 'TT', normalised to
+    Rail TT is read from rail_segments.gpkg (column 'TT', normalised to
     'travel_time_min'). Feeder TT is read from pt_feeder_segments.gpkg
     (column 'travel_time_min'). Both use path_nodes for decomposition.
-    Rail TT requires edges_all.gpkg to have been generated after the
+    Rail TT requires rail_segments.gpkg to have been generated after the
     _OUTPUT_DROP fix in services_service_projection.py.
 
     Args:
         infra_version: Name of the infrastructure version.
         svc_version: Name of the service version.
         feeder_source_dir: Directory containing pt_feeder_segments.gpkg.
-        rail_source_dir: Directory containing edges_all.gpkg.
+        rail_source_dir: Directory containing rail_segments.gpkg.
         infra_dir: Directory of the source infrastructure version.
         enhanced_dir: Output directory for the enhanced version (already created
             by Phase 0 with a copy of nodes.gpkg). Used to persist any junction
@@ -1191,7 +1207,7 @@ def compute_segment_stats(
     segments = gpd.read_file(infra_dir / "segments.gpkg").reset_index(drop=True)
     nodes_source_gdf = gpd.read_file(infra_dir / "nodes.gpkg")
     if 'speed_source' not in segments.columns:
-        segments['speed_source'] = 'OSM'
+        segments['speed_source'] = 'formula'
     print(f"  {len(segments)} segments, {len(nodes_source_gdf)} nodes loaded.")
 
     # Catchment-area filter — same rules as infrabuild_filter_network.py:
@@ -1395,8 +1411,8 @@ def compute_segment_stats(
     service_link_frames = []
     feeder_all_frames   = []
 
-    # Rail: edges_all.gpkg
-    rail_gpkg = rail_source_dir / "edges_all.gpkg"
+    # Rail: rail_segments.gpkg
+    rail_gpkg = rail_source_dir / "rail_segments.gpkg"
     if rail_gpkg.exists():
         try:
             rail_layers = fiona.listlayers(str(rail_gpkg))
@@ -1474,33 +1490,26 @@ def compute_segment_stats(
     print(f"  {len(stop_ids)} unique stop node IDs.")
 
     # ── 4. Decompose path_nodes and collect contributions ────────────────────
-    # Two-tier source system:
-    #   Infra  Tier 1: speed_source ∈ {'infra', 'GTFS', 'gtfs'} — real / calibrated data
-    #   Infra  Tier 2: speed_source == 'OSM'                     — map-derived approximation
-    #   Service Tier 1: tt_source ∈ {'gtfs', 'infra'}            — real / infra-calibrated
-    #   Service Tier 2: tt_source == 'formula'                   — physics approximation
+    # Four-tier source system (see _SPEED_SOURCE_TIER / _TT_SOURCE_TIER constants):
+    #   estimate(0) < formula(1) < gtfs(2) < design(locked)
     #
-    # Rules:
-    #   T2 service (formula) → entire link skipped at outer loop
-    #   T1 infra vs T2 service → infra holds (never reached; formula already skipped)
-    #   T2 infra vs T1 service → service wins → contribute normally
-    #   T1 infra vs T1 service → conflict_t1 setting decides:
-    #       'service' → service contributes (updates infra TT/speed → speed_source='gtfs')
-    #       'infra'   → infra holds; service link TT back-calculated from infra
-    #                   (updates service TT → tt_source='infra')
-    print(f"\n[4] Distributing travel times across infrastructure segments "
-          f"(T1 conflict strategy: '{conflict_t1}')...")
+    # Acceptance rules:
+    #   'estimate' / 'formula' service links → skipped at outer loop
+    #   'design' infra segment → locked, never updated
+    #   'gtfs' service, 'gtfs' infra → accept (mean of GTFS observations)
+    #   'gtfs' service, 'formula' infra → accept (GTFS calibrates formula-derived)
+    #   'gtfs' service, 'estimate' infra → accept
+    print(f"\n[4] Distributing travel times across infrastructure segments...")
     stopping_contributions: Dict[str, List[float]] = defaultdict(list)
     passing_contributions:  Dict[str, List[float]] = defaultdict(list)
-    infra_win_links: set = set()   # service_links_gdf indices where infra wins T1 vs T1
 
     # Per-segment speed_source lookup (built once for O(1) access in the loop).
-    # GPKG round-trip may produce NULL/NaN/'' — treat those as 'OSM' (permissive default).
+    # GPKG round-trip may produce NULL/NaN/'' — fall back to 'formula' (safe mid-tier).
     def _parse_speed_source(v) -> str:
         if v is None or (isinstance(v, float) and pd.isna(v)):
-            return 'OSM'
+            return 'formula'
         s = str(v).strip()
-        return s if s in ('OSM', 'GTFS', 'gtfs', 'infra') else 'OSM'
+        return s if s in _SPEED_SOURCE_TIER else 'formula'
 
     sid_to_speed_source: Dict[str, str] = {
         str(row['Segment_ID']): _parse_speed_source(row.get('speed_source'))
@@ -1508,24 +1517,16 @@ def compute_segment_stats(
         if row.get('Segment_ID')
     }
 
-    # Collectors for conflict reporting (infra vs gtfs) and OSM+formula warnings.
-    # infra_conflicts: sid → list of GTFS-implied effective speeds (km/h) for display.
-    infra_conflicts:     Dict[str, List[float]] = defaultdict(list)
-    infra_conflict_tt:   Dict[str, List[float]] = defaultdict(list)  # prop_tt values, held for later
-    osm_formula_sids:    set = set()
-
     skipped_no_path  = 0
     skipped_no_tt    = 0
     skipped_no_dist  = 0
     skipped_boundary = 0
-    skipped_formula  = 0
-    source_counts    = {'gtfs': 0, 'infra': 0, 'formula': 0, 'other': 0}
+    skipped_estimate = 0
+    source_counts    = {'gtfs': 0, 'formula': 0, 'estimate': 0, 'other': 0}
     used_links = 0
 
     for link_row_idx, row in service_links_gdf.iterrows():
-        # Provenance: classify and skip 'formula'-sourced links (their TT is
-        # already on segments via the builder; redistribution would be a
-        # no-op against the builder formula).
+        # Classify service link tt_source; skip estimate and formula sources.
         raw_src = row.get('tt_source')
         if raw_src is None or (isinstance(raw_src, float) and pd.isna(raw_src)):
             tt_source = 'gtfs'
@@ -1535,8 +1536,9 @@ def compute_segment_stats(
             source_counts[tt_source] += 1
         else:
             source_counts['other'] += 1
-        if tt_source == 'formula':
-            skipped_formula += 1
+        # 'estimate' and 'formula' service links never contribute to infra calibration.
+        if tt_source in ('estimate', 'formula'):
+            skipped_estimate += 1
             continue
 
         # Skip boundary-rerouted service links: their path_nodes covers only
@@ -1619,29 +1621,18 @@ def compute_segment_stats(
                 continue
             prop_tt = _round_half_min(travel_time * exp_tt / total_expected)
 
-            seg_ss      = sid_to_speed_source.get(sid, 'OSM')
-            tier1_infra = seg_ss in ('infra', 'GTFS', 'gtfs')
-            tier1_svc   = tt_source in ('gtfs', 'infra')
+            seg_ss   = sid_to_speed_source.get(sid, 'formula')
+            seg_tier = _SPEED_SOURCE_TIER.get(seg_ss, 1)
+            svc_tier = _TT_SOURCE_TIER.get(tt_source, 1)
 
-            if tier1_infra:
-                if tier1_svc:
-                    # T1 vs T1 — governed by conflict_t1 setting.
-                    if conflict_t1 == 'infra':
-                        # Infra holds; mark service link for TT back-calculation.
-                        infra_win_links.add(link_row_idx)
-                        continue
-                    # else: conflict_t1 == 'service' → fall through and contribute.
-                else:
-                    # T1 infra vs T2 service (formula) — infra holds.
-                    # Formula links are filtered at the outer loop, so this is a
-                    # safety guard only.
-                    continue
-            else:
-                # OSM (T2 infra)
-                if not tier1_svc:
-                    # T2 vs T2 — formula links already skipped at outer loop; unreachable.
-                    continue
-                # T2 infra vs T1 service — service always wins; fall through.
+            # Rule 1: 'design' segment is locked — never updated by service data.
+            if seg_tier == _SPEED_SOURCE_TIER['design']:
+                continue
+
+            # Rule 2: service tier must be >= infra tier.
+            # Exception: gtfs == gtfs → accept (mean of observations).
+            if svc_tier < seg_tier:
+                continue
 
             # Accept contribution.
             if is_passing_link:
@@ -1650,108 +1641,12 @@ def compute_segment_stats(
                 stopping_contributions[sid].append(prop_tt)
 
     print(f"  Used {used_links} service links.")
-    print(f"  Sources: gtfs={source_counts['gtfs']}, infra={source_counts['infra']}, "
-          f"formula={source_counts['formula']}, other={source_counts['other']}")
+    print(f"  Sources: gtfs={source_counts['gtfs']}, formula={source_counts['formula']}, "
+          f"estimate={source_counts['estimate']}, other={source_counts['other']}")
     print(f"  Skipped: {skipped_no_path} (no path), {skipped_no_tt} (no travel time), "
           f"{skipped_no_dist} (zero expected distance), "
           f"{skipped_boundary} (boundary-rerouted), "
-          f"{skipped_formula} (formula-sourced).")
-    if infra_win_links:
-        print(f"  T1 conflict (infra wins): {len(infra_win_links)} service link(s) "
-              f"marked for TT back-calculation.")
-
-    # ── 4.5 Service TT back-calculation (when infra wins T1 vs T1) ───────────
-    # Build infra-derived TT for each service link where infra holds, then write
-    # back to edges_all.gpkg and pt_feeder_segments.gpkg in-place.
-    if infra_win_links and conflict_t1 == 'infra':
-        print(f"\n[4.5] Back-calculating service TT from infra for "
-              f"{len(infra_win_links)} link(s)...")
-
-        seg_tt_stop: Dict[str, float] = {}
-        seg_tt_pass: Dict[str, float] = {}
-        for _, sr in segments.iterrows():
-            sid = str(sr.get('Segment_ID', ''))
-            if not sid:
-                continue
-            ts = sr.get('TT_Stopping')
-            tp = sr.get('TT_Passing')
-            if ts is not None and not (isinstance(ts, float) and pd.isna(ts)):
-                seg_tt_stop[sid] = float(ts)
-            if tp is not None and not (isinstance(tp, float) and pd.isna(tp)):
-                seg_tt_pass[sid] = float(tp)
-
-        # path_nodes → new_tt (links with same path get same infra-derived TT)
-        pn_to_new_tt: Dict[str, float] = {}
-        for link_idx in infra_win_links:
-            row = service_links_gdf.iloc[link_idx]
-            path_str = str(row.get('path_nodes', '')).strip()
-            if path_str in pn_to_new_tt:
-                continue  # already computed for this path
-            try:
-                node_ids = [int(n.strip()) for n in path_str.split(';') if n.strip()]
-            except (ValueError, TypeError):
-                continue
-            if len(node_ids) < 2:
-                continue
-            pairs = list(zip(node_ids[:-1], node_ids[1:]))
-            intermediate = node_ids[1:-1]
-            is_pass = any(n in stop_ids for n in intermediate)
-            new_tt = 0.0
-            for u, v in pairs:
-                s = seg_by_nodes.get((u, v)) or seg_by_nodes.get((v, u))
-                if s is None:
-                    continue
-                tt = seg_tt_pass.get(s) if is_pass else seg_tt_stop.get(s)
-                if tt is not None:
-                    new_tt += tt
-            if new_tt > 0:
-                pn_to_new_tt[path_str] = _round_half_min(new_tt)
-
-        n_updated = sum(
-            1 for idx in infra_win_links
-            if str(service_links_gdf.at[idx, 'path_nodes']) in pn_to_new_tt
-        )
-        print(f"  {n_updated} link(s) with computable infra TT.")
-
-        def _write_service_file_back(
-            gpkg_path: Path,
-            track_layers: Optional[set] = None,
-        ) -> None:
-            """Re-read gpkg, apply pn_to_new_tt updates, write all layers back."""
-            if not gpkg_path.exists():
-                return
-            all_layers = fiona.listlayers(str(gpkg_path))
-            first = True
-            for lname in all_layers:
-                gdf = gpd.read_file(str(gpkg_path), layer=lname)
-                if track_layers is not None and lname not in track_layers:
-                    gdf.to_file(str(gpkg_path), layer=lname, driver='GPKG',
-                                mode='w' if first else 'a')
-                    first = False
-                    continue
-                if 'path_nodes' in gdf.columns:
-                    tt_col = 'TT' if 'TT' in gdf.columns else 'travel_time_min'
-                    if 'tt_source' not in gdf.columns:
-                        gdf['tt_source'] = 'gtfs'
-                    n_upd = 0
-                    for idx, row in gdf.iterrows():
-                        pn = str(row.get('path_nodes', ''))
-                        if pn in pn_to_new_tt:
-                            gdf.at[idx, tt_col] = pn_to_new_tt[pn]
-                            gdf.at[idx, 'tt_source'] = 'infra'
-                            n_upd += 1
-                    if n_upd:
-                        print(f"    {gpkg_path.name} / '{lname}': {n_upd} link(s) → tt_source='infra'")
-                gdf.to_file(str(gpkg_path), layer=lname, driver='GPKG',
-                            mode='w' if first else 'a')
-                first = False
-
-        _write_service_file_back(rail_source_dir / "edges_all.gpkg")
-        _write_service_file_back(
-            feeder_source_dir / "pt_feeder_segments.gpkg",
-            track_layers=TRACK_BASED_FEEDER_LAYERS,
-        )
-        print(f"  Service files updated in-place.")
+          f"{skipped_estimate} (estimate/formula-sourced).")
 
     # ── 5. Compute means ─────────────────────────────────────────────────────
     # Ensure TT columns exist — builder-produced Base versions carry them, but
@@ -1916,6 +1811,177 @@ def compute_segment_stats(
 
     print(f"  Average_Speed corrected: {n_corrected} segment(s).")
 
+    # ── 4.5 Infra → Service back-calculation (Direction 2) ───────────────────
+    # For each service link whose tt_source tier is strictly lower than the
+    # infra data along its path, recompute service TT from the enriched segment
+    # TT values and write it back to the service files.
+    #
+    # Fire condition (weakest-link rule):
+    #   - Any 'estimate' on path → skip (contaminated path)
+    #   - Compute path_output_tier: 'gtfs' when all segs are {gtfs/design},
+    #     'formula' when any seg is 'formula'
+    #   - Fire when svc_tier < path_output_tier_rank
+    #   - Also fire when service is 'gtfs' and path has at least one 'design'
+    #     segment (design override)
+    #
+    # Output tt_source: 'gtfs' when path_output_tier is 'gtfs', 'formula' otherwise.
+    print("\n[4.5] Infra → Service back-calculation (Direction 2)...")
+
+    # Build post-step5d segment TT lookup (uses newly enriched values).
+    seg_tt_stop_d2: Dict[str, float] = {}
+    seg_tt_pass_d2: Dict[str, float] = {}
+    for _, sr in segments.iterrows():
+        _sid = str(sr.get('Segment_ID', ''))
+        if not _sid:
+            continue
+        _ts = sr.get('TT_Stopping')
+        _tp = sr.get('TT_Passing')
+        if _ts is not None and not (isinstance(_ts, float) and pd.isna(_ts)):
+            seg_tt_stop_d2[_sid] = float(_ts)
+        if _tp is not None and not (isinstance(_tp, float) and pd.isna(_tp)):
+            seg_tt_pass_d2[_sid] = float(_tp)
+
+    # path_nodes_str → (new_tt, output_label)
+    pn_to_d2: Dict[str, tuple] = {}
+
+    d2_skipped_estimate = 0
+    d2_skipped_same_tier = 0
+    d2_skipped_no_tt = 0
+
+    for _, svc_row in service_links_gdf.iterrows():
+        raw_src = svc_row.get('tt_source')
+        if raw_src is None or (isinstance(raw_src, float) and pd.isna(raw_src)):
+            svc_tt_source = 'gtfs'
+        else:
+            svc_tt_source = str(raw_src).strip().lower() or 'gtfs'
+
+        path_str = str(svc_row.get('path_nodes', '')).strip()
+        if not path_str or path_str in pn_to_d2:
+            continue
+
+        try:
+            node_ids = [int(n.strip()) for n in path_str.split(';') if n.strip()]
+        except (ValueError, TypeError):
+            continue
+        if len(node_ids) < 2:
+            continue
+
+        pairs = list(zip(node_ids[:-1], node_ids[1:]))
+
+        # Collect path segment tiers
+        path_tiers: List[int] = []
+        for u, v in pairs:
+            _sid = seg_by_nodes.get((u, v)) or seg_by_nodes.get((v, u))
+            if _sid is None:
+                continue
+            path_tiers.append(_SPEED_SOURCE_TIER.get(
+                sid_to_speed_source.get(_sid, 'formula'), 1
+            ))
+
+        if not path_tiers:
+            continue
+
+        # Any 'estimate' (tier 0) on path → contaminated, skip
+        if any(t == 0 for t in path_tiers):
+            d2_skipped_estimate += 1
+            continue
+
+        # Determine path output tier label
+        path_has_design = any(t == _SPEED_SOURCE_TIER['design'] for t in path_tiers)
+        all_gtfs_or_design = all(t >= _SPEED_SOURCE_TIER['gtfs'] for t in path_tiers)
+        path_output_tier = 'gtfs' if all_gtfs_or_design else 'formula'
+        path_output_rank = _TT_SOURCE_TIER[path_output_tier]
+        svc_tier_rank    = _TT_SOURCE_TIER.get(svc_tt_source, 1)
+
+        # Fire condition
+        fire = False
+        if svc_tier_rank < path_output_rank:
+            fire = True
+        elif svc_tt_source == 'gtfs' and path_output_tier == 'gtfs' and path_has_design:
+            fire = True  # design override: design can update gtfs service
+
+        if not fire:
+            d2_skipped_same_tier += 1
+            continue
+
+        # Determine stopping/passing label for this link
+        intermediate = node_ids[1:-1]
+        is_pass = any(n in stop_ids for n in intermediate)
+
+        # Sum TT from enriched segment values
+        new_tt = 0.0
+        for u, v in pairs:
+            _sid = seg_by_nodes.get((u, v)) or seg_by_nodes.get((v, u))
+            if _sid is None:
+                continue
+            _tt = seg_tt_pass_d2.get(_sid) if is_pass else seg_tt_stop_d2.get(_sid)
+            if _tt is not None:
+                new_tt += _tt
+
+        if new_tt <= 0:
+            d2_skipped_no_tt += 1
+            continue
+
+        pn_to_d2[path_str] = (_round_half_min(new_tt), path_output_tier)
+
+    print(f"  Direction 2: {len(pn_to_d2)} path(s) queued for service update.")
+    print(f"  Skipped: {d2_skipped_estimate} (estimate on path), "
+          f"{d2_skipped_same_tier} (same/lower tier), "
+          f"{d2_skipped_no_tt} (no TT on segments).")
+
+    if pn_to_d2:
+        def _write_d2_back(
+            gpkg_path: Path,
+            track_layers: Optional[set] = None,
+        ) -> None:
+            """Re-read gpkg, apply Direction 2 TT updates, write all layers back."""
+            if not gpkg_path.exists():
+                return
+            all_layers = fiona.listlayers(str(gpkg_path))
+            first = True
+            for lname in all_layers:
+                gdf = gpd.read_file(str(gpkg_path), layer=lname)
+                if track_layers is not None and lname not in track_layers:
+                    gdf.to_file(str(gpkg_path), layer=lname, driver='GPKG',
+                                mode='w' if first else 'a')
+                    first = False
+                    continue
+                if 'path_nodes' not in gdf.columns:
+                    gdf.to_file(str(gpkg_path), layer=lname, driver='GPKG',
+                                mode='w' if first else 'a')
+                    first = False
+                    continue
+                tt_col = 'TT' if 'TT' in gdf.columns else 'travel_time_min'
+                if 'tt_source' not in gdf.columns:
+                    gdf['tt_source'] = 'gtfs'
+                n_upd_gtfs = 0
+                n_upd_formula = 0
+                for idx, row in gdf.iterrows():
+                    pn = str(row.get('path_nodes', ''))
+                    if pn not in pn_to_d2:
+                        continue
+                    new_tt_val, out_label = pn_to_d2[pn]
+                    gdf.at[idx, tt_col]      = new_tt_val
+                    gdf.at[idx, 'tt_source'] = out_label
+                    if out_label == 'gtfs':
+                        n_upd_gtfs += 1
+                    else:
+                        n_upd_formula += 1
+                if n_upd_gtfs or n_upd_formula:
+                    print(f"    {gpkg_path.name} / '{lname}': "
+                          f"{n_upd_gtfs} → tt_source='gtfs', "
+                          f"{n_upd_formula} → tt_source='formula'")
+                gdf.to_file(str(gpkg_path), layer=lname, driver='GPKG',
+                            mode='w' if first else 'a')
+                first = False
+
+        _write_d2_back(rail_source_dir / "rail_segments.gpkg")
+        _write_d2_back(
+            feeder_source_dir / "pt_feeder_segments.gpkg",
+            track_layers=TRACK_BASED_FEEDER_LAYERS,
+        )
+        print("  Service files updated in-place (Direction 2).")
+
     return segments, derived
 
 
@@ -2060,16 +2126,11 @@ def main():
     mode_str = "extend (in-place)" if extend_mode else "initial"
     print(f"  Enhanced output: {enhanced_dir}  [{mode_str}]")
 
-    conflict_t1 = getattr(settings, 'ENHANCEMENT_CONFLICT_T1', 'service')
-    print(f"  T1 conflict strategy: '{conflict_t1}' "
-          f"({'service updates infra' if conflict_t1 == 'service' else 'infra updates service'})")
-
     base_segments, derived = compute_segment_stats(
         infra_version, svc_version,
         feeder_source_dir, rail_source_dir,
         infra_dir, enhanced_dir,
         extend_mode=extend_mode,
-        conflict_t1=conflict_t1,
     )
 
     print("\n[6] Saving enhanced version...")
