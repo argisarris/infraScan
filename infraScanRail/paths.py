@@ -50,10 +50,85 @@ TLMREGIO_RAILWAY_SHP = r"data/Spatial_Data/Land_Use/Transportation/swissTLMRegio
 NETWORK_INFRASTRUCTURE_DIR  = r"data/Infrastructure"
 # Raw/  : spatial-filtered BAV output (infrabuild_filter_network.py stage 1)
 NETWORK_INFRASTRUCTURE_RAW  = r"data/Infrastructure/Raw"
+# Seeds/ : per-INFRA_VERSION seed nodes/segments auto-applied during base build (Topic 3)
+INFRASTRUCTURE_SEEDS_DIR    = r"data/Infrastructure/Seeds"
+# Developments/ : infra-intervention registries (cc, cap, …) — Topic 2
+INFRASTRUCTURE_DEVELOPMENTS_DIR = r"data/Infrastructure/Developments"
+# Dev_Full/ : reference version with ALL infra ints applied (visualisation)
+INFRASTRUCTURE_DEV_FULL_DIR     = r"data/Infrastructure/Developments/Dev_Full"
+# Derived/ : auto-built derived versions for capacity runs (not main infra folder)
+INFRASTRUCTURE_DERIVED_DIR      = r"data/Infrastructure/Developments/Derived"
+# Network Developments/ : service-intervention registries (ext, …) — Topic 2
+NETWORK_DEVELOPMENTS_DIR        = r"data/Network/Developments"
+
+
+def _extract_seed_year(year_or_version: str) -> str:
+    import re
+    m = re.search(r'(20\d{2})', str(year_or_version))
+    return m.group(1) if m else str(year_or_version)
+
+
+def get_seed_nodes_gpkg(year_or_version: str) -> str:
+    """Return absolute path to nodes_<year>.gpkg in the Seeds directory.
+
+    Args:
+        year_or_version: bare year ('2026') or full version name ('AS_2026_ZH').
+    """
+    return os.path.join(MAIN, INFRASTRUCTURE_SEEDS_DIR, f"nodes_{_extract_seed_year(year_or_version)}.gpkg")
+
+
+def get_seed_segments_gpkg(year_or_version: str) -> str:
+    """Return absolute path to segments_<year>.gpkg in the Seeds directory."""
+    return os.path.join(MAIN, INFRASTRUCTURE_SEEDS_DIR, f"segments_{_extract_seed_year(year_or_version)}.gpkg")
+
+
+def get_seed_composition_gpkg(year_or_version: str) -> str:
+    """Return absolute path to segments_composition_<year>.gpkg in the Seeds directory."""
+    return os.path.join(MAIN, INFRASTRUCTURE_SEEDS_DIR, f"segments_composition_{_extract_seed_year(year_or_version)}.gpkg")
+
+
+def get_seed_qgz(year_or_version: str) -> str:
+    """Return absolute path to seed_<year>.qgz in the Seeds directory."""
+    return os.path.join(MAIN, INFRASTRUCTURE_SEEDS_DIR, f"seed_{_extract_seed_year(year_or_version)}.qgz")
+
+
+def get_infra_int_registry(int_type: str) -> str:
+    """Return absolute path to the infra-int registry gpkg for a given type.
+
+    Args:
+        int_type: short code (e.g. 'cc' for connecting curves, 'cap' for passing sidings).
+    """
+    return os.path.join(MAIN, INFRASTRUCTURE_DEVELOPMENTS_DIR, f"{int_type}_interventions.gpkg")
+
+
+def get_svc_int_registry(int_type: str) -> str:
+    """Return absolute path to the svc-int registry xlsx for a given type.
+
+    Args:
+        int_type: short code (e.g. 'ext' for extended lines).
+    """
+    return os.path.join(MAIN, NETWORK_DEVELOPMENTS_DIR, f"{int_type}_interventions.xlsx")
 
 def get_infra_version_dir(version: str) -> str:
     """Return absolute path to the named infrastructure version directory."""
     return os.path.join(MAIN, NETWORK_INFRASTRUCTURE_DIR, version)
+
+def get_derived_infra_version_dir(version: str) -> str:
+    """Return absolute path to a derived infra version under Developments/Derived/.
+
+    Args:
+        version: derived version name (e.g. 'AS_2026_ZH+cap_ps_0001').
+    """
+    return os.path.join(MAIN, INFRASTRUCTURE_DERIVED_DIR, version)
+
+def derived_version_exists(version: str) -> bool:
+    """True if nodes.gpkg, segments.gpkg and segments_composition.gpkg all exist
+    in the derived version directory."""
+    d = get_derived_infra_version_dir(version)
+    return all(
+        os.path.isfile(os.path.join(d, f))
+        for f in ('nodes.gpkg', 'segments.gpkg', 'segments_composition.gpkg')
+    )
 
 def get_infra_raw_dir(version: str) -> str:
     """Return absolute path to the named infrastructure raw directory.
@@ -157,6 +232,18 @@ SERVICES_UNPROJECTED_SUBDIR = "Unprojected"
 SERVICES_PROJECTED_SUBDIR   = "Projected"
 RAIL_PROCESSED_DIR = r"data/Network/processed"
 EDGES_IN_CORRIDOR_GPKG = r"data/Network/processed/edges_in_corridor.gpkg"
+CAPACITY_DIR      = r"data/Network/Capacity"
+CAPACITY_PLOTS_DIR = r"plots/Network/Capacity"
+
+# --- Catchment / Study Area Boundaries ---
+CATCHMENT_AREA_BOUNDARIES_DIR = r"data/Catchment_Area/Boundaries"
+SA_BOUNDARY_PATH = r"data/Catchment_Area/Boundaries/study_area_boundary.gpkg"
+CA_BOUNDARY_PATH = r"data/Catchment_Area/Boundaries/catchment_area_boundary.gpkg"
+
+
+def get_projected_services_sa_path(svc_version: str, infra_version: str) -> str:
+    """Return absolute path to study-area-filtered projected rail segments for a svc/infra pair."""
+    return os.path.join(MAIN, RAIL_LINES_DIR, svc_version + '_network', infra_version, 'rail_segments_sa.gpkg')
 
 STUDY_AREA_DIR           = r"data/Catchment_Area/Boundaries"
 STUDY_AREA_BOUNDARY_GPKG = r"data/Catchment_Area/Boundaries/study_area_boundary.gpkg"
