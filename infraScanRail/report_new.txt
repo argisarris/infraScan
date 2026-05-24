@@ -3,13 +3,13 @@ INFRASCANRAIL NEW PIPELINE - RUN LOG
 ================================================================================
   RUN CONFIGURATION
 ================================================================================
-  Infrastructure   : AS_2026_ZH
+  Infrastructure   : Build_New  -->  build as 'AS_2026_ZH'
   Raw version      : Raw_ZH
-  Services         : Build_New  [needs projection]
+  Services         : AK_2026
   GTFS version     : GTFS_SVC2026_ZH
   Canton           : ZH
   Catchment method : PT_Feeder  (OD: feeder_weighted)
-  Capacity mode    : Dynamic
+  Capacity mode    : None
   OD type          : canton_ZH  (base year 2023)
   Population base  : 2023
   Scenarios        : 100 x [2018-2100]
@@ -28,11 +28,11 @@ INFRASCANRAIL NEW PIPELINE - RUN LOG
 PHASE RUNTIMES
 ================================================================================
 
-Phase 1: Initialisation..................................... 0m 3s (3.37s)
-Phase 2: Data Preparation................................... 0m 5s (5.69s)
-Phase 3A: Infrastructure Network Build...................... 0m 0s (0.16s)
-Phase 3B: Services Network Build............................ 7m 19s (439.42s)
+Phase 1: Initialisation..................................... 0m 0s (0.52s)
+Phase 2: Data Preparation................................... 0m 6s (6.30s)
+Phase 3A: Infrastructure Network Build...................... 1m 26s (86.64s)
+Phase 3B: Services Network Build............................ 0m 4s (4.94s)
 
 ================================================================================
-TOTAL TIME.................................................. 7m 28s (448.66s)
+TOTAL TIME.................................................. 1m 38s (98.40s)
 ================================================================================

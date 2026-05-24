@@ -20,22 +20,32 @@ import shutil
 import geopandas as gpd
 import pandas as pd
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+import fiona
 from shapely.geometry import LineString, Point
 from shapely.ops import substring, linemerge
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
 import paths
+import settings
+import infrabuild_network_builder as ic
+from infrabuild_network_builder import (
+    auto_tt as _auto_tt_core,
+    count_stations_at_endpoints as _count_stations_at_endpoints,
+    default_speed_for_segment as _default_speed_for_segment,
+    split_segment_at as _split_segment_at_core,
+    validate_and_autofill as _validate_and_autofill_core,
+)
 
 
 # =============================================================================
 # Constants
 # =============================================================================
 
-SWISS_CRS = "EPSG:2056"
+SWISS_CRS = ic.SWISS_CRS
 MERGE_ATTRS = ('Num_Tracks', 'Gauge', 'Electrification_Class')
-_NODE_SNAP_TOLERANCE_M = 25.0  # max distance (m) for an imported node to snap onto a segment
+_NODE_SNAP_TOLERANCE_M = ic.NODE_SNAP_TOLERANCE_M
 
 GAUGE_OPTIONS           = ['1435', '1000']
 ELECTRIFICATION_OPTIONS = ['AC_16.7Hz', 'DC', 'non_electrified']
@@ -46,60 +56,12 @@ TRACK_MODE_OPTIONS      = ['train', 'tram', 'cog_railway', 'train / tram']
 _EDGE_LEVEL_BY_CT       = {'bridge': ['2', '3'], 'normal': ['1'], 'tunnel': ['-1', '-2']}
 
 
-# Mode-default speeds for auto-TT computation — must mirror infrabuild_network_builder
-_MODE_DEFAULT_SPEEDS_VM: dict = {
-    'train': 50.0, 'tram': 30.0, 'funicular': 10.0,
-    'cog_railway': 15.0, 'bus': 30.0,
-}
-_MODE_DEFAULT_FALLBACK_VM: float = 50.0
-
-
-def _auto_tt(length_m: float, speed_kmh: float, n_sta: int) -> tuple:
-    """Return (TT_Stopping, TT_Passing) in minutes using the standard physics formula.
-
-    Args:
-        length_m: segment length in metres.
-        speed_kmh: cruise speed in km/h.
-        n_sta: number of segment endpoints classified as 'station' (0, 1, or 2).
-    """
-    _A = 0.7   # m/s² — must match infrabuild_network_builder and enhancement
-    _B = 1.30  # buffer — must match
-    v = speed_kmh / 3.6
-    cruise = length_m / v
-    tt_pass = round(max(0.1, (cruise * _B) / 60), 1)
-    tt_stop = round(max(0.1, ((cruise + n_sta * 0.5 * v / _A) * _B) / 60), 1)
-    return tt_stop, tt_pass
-
-
-def _count_stations_at_endpoints(
-    from_name: str,
-    to_name: str,
-    nodes: gpd.GeoDataFrame,
-) -> int:
-    """Return 0, 1, or 2 — how many segment endpoints are classified as 'station'."""
-    n = 0
-    for name in (from_name, to_name):
-        if name is None or (isinstance(name, float) and pd.isna(name)):
-            continue
-        match = nodes[nodes['Name'] == name]
-        if not match.empty and str(match.iloc[0].get('Node_Class', '')).strip() == 'station':
-            n += 1
-    return n
-
-
-def _default_speed_for_segment(segment_row, gauge_fallback: float = None) -> float:
-    """Pick a mode-default cruise speed (km/h) for a segment based on its gauge."""
-    g = segment_row.get('Gauge')
-    if g is not None and not (isinstance(g, float) and pd.isna(g)):
-        try:
-            gi = int(float(g))
-            if gi <= 900:
-                return _MODE_DEFAULT_SPEEDS_VM.get('funicular', 10.0)
-            if gi == 1000:
-                return _MODE_DEFAULT_SPEEDS_VM.get('tram', 30.0)
-        except (ValueError, TypeError):
-            pass
-    return gauge_fallback if gauge_fallback is not None else _MODE_DEFAULT_FALLBACK_VM
+# Helpers _auto_tt, _count_stations_at_endpoints, _default_speed_for_segment are
+# imported from infrabuild_network_builder above. Re-exported below for callers that
+# still reference the local underscored name.
+_auto_tt = _auto_tt_core
+_MODE_DEFAULT_SPEEDS_VM = ic._MODE_DEFAULT_SPEEDS_VM
+_MODE_DEFAULT_FALLBACK_VM = ic._MODE_DEFAULT_FALLBACK_VM
 
 
 # =============================================================================
@@ -688,177 +650,11 @@ def _split_segment_at(
     nodes: gpd.GeoDataFrame,
     new_node_class: Optional[str] = None,
 ) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
-    """
-    Split segments.loc[seg_idx] at split_dist metres along its geometry.
-    Produces S_A (before split) and S_B (after split).
-    Redistributes composition pieces between A and B by cumulative length.
-    Recomputes TT_Stopping and TT_Passing via _auto_tt (speed_source='formula').
-    Returns updated (segments, composition).
-    """
-    S = segments.loc[seg_idx]
-    
-    geom = S.geometry
-    if geom.geom_type == 'MultiLineString':
-        geom = linemerge(geom)
-        
-    seg_len    = geom.length
-    split_dist = min(max(split_dist, 0.0), seg_len)  # clamp to valid range
-
-    geom_A = substring(geom, 0, split_dist)
-    geom_B = substring(geom, split_dist, seg_len)
-
-    t      = split_dist / seg_len if seg_len > 0 else 0.0
-    km_start = float(S['Km_Start']) if S['Km_Start'] is not None and not (isinstance(S['Km_Start'], float) and pd.isna(S['Km_Start'])) else 0.0
-    km_end   = float(S['Km_End'])   if S['Km_End']   is not None and not (isinstance(S['Km_End'],   float) and pd.isna(S['Km_End']))   else 0.0
-    km_mid   = km_start + t * (km_end - km_start)
-
-    split_pt = geom.interpolate(split_dist)
-
-    # Speed resolution: use Average_Speed from original, fall back to gauge-derived default
-    avg_spd = S.get('Average_Speed')
-    speed_kmh = (
-        float(avg_spd)
-        if pd.notna(avg_spd) and float(avg_spd) > 0
-        else _default_speed_for_segment(S)
+    """Delegates to infrabuild_network_builder.split_segment_at (pure version)."""
+    return _split_segment_at_core(
+        segments, composition, seg_idx, split_dist,
+        new_node_name, new_node_code, nodes, new_node_class,
     )
-
-    # Station counts at each sub-segment's endpoints
-    n_from = _count_stations_at_endpoints(S['From_Name'], None, nodes)
-    n_to   = _count_stations_at_endpoints(None, S['To_Name'], nodes)
-    n_new  = 1 if (new_node_class or '').strip() == 'station' else 0
-
-    tt_stop_A, tt_pass_A = _auto_tt(geom_A.length, speed_kmh, n_from + n_new)
-    tt_stop_B, tt_pass_B = _auto_tt(geom_B.length, speed_kmh, n_new + n_to)
-
-    from_code_rows = nodes[nodes['Name'] == S['From_Name']]
-    to_code_rows   = nodes[nodes['Name'] == S['To_Name']]
-    from_code = from_code_rows.iloc[0]['Code'] if not from_code_rows.empty else S['From_Name']
-    to_code   = to_code_rows.iloc[0]['Code']   if not to_code_rows.empty   else S['To_Name']
-
-    id_A = f"c{from_code}_{new_node_code}"
-    id_B = f"c{new_node_code}_{to_code}"
-
-    row_A = {
-        'Segment_ID':                    id_A,
-        'From_Name':             S['From_Name'],
-        'To_Name':               new_node_name,
-        'From_N':                S.get('From_N', pd.NA),
-        'From_E':                S.get('From_E', pd.NA),
-        'To_N':                  split_pt.y,
-        'To_E':                  split_pt.x,
-        'Length':                geom_A.length,
-        'Num_Tracks':            S['Num_Tracks'],
-        'Gauge':                 S['Gauge'],
-        'Electrification_Class': S['Electrification_Class'],
-        'Km_Start':              km_start,
-        'Km_End':                km_mid,
-        'Route_Number':          S['Route_Number'],
-        'Route_Name':            S['Route_Name'],
-        'Route_Owner':           S['Route_Owner'],
-        'Average_Speed':         S.get('Average_Speed', pd.NA),
-        'Predominant_Speed':     S.get('Predominant_Speed', pd.NA),
-        'Speed_Coverage_Pct':    S.get('Speed_Coverage_Pct', 0.0),
-        'TT_Stopping':           tt_stop_A,
-        'TT_Passing':            tt_pass_A,
-        'speed_source':          'formula',
-        'geometry':              geom_A,
-    }
-    row_B = {
-        'Segment_ID':                    id_B,
-        'From_Name':             new_node_name,
-        'To_Name':               S['To_Name'],
-        'From_N':                split_pt.y,
-        'From_E':                split_pt.x,
-        'To_N':                  S.get('To_N', pd.NA),
-        'To_E':                  S.get('To_E', pd.NA),
-        'Length':                geom_B.length,
-        'Num_Tracks':            S['Num_Tracks'],
-        'Gauge':                 S['Gauge'],
-        'Electrification_Class': S['Electrification_Class'],
-        'Km_Start':              km_mid,
-        'Km_End':                km_end,
-        'Route_Number':          S['Route_Number'],
-        'Route_Name':            S['Route_Name'],
-        'Route_Owner':           S['Route_Owner'],
-        'Average_Speed':         S.get('Average_Speed', pd.NA),
-        'Predominant_Speed':     S.get('Predominant_Speed', pd.NA),
-        'Speed_Coverage_Pct':    S.get('Speed_Coverage_Pct', 0.0),
-        'TT_Stopping':           tt_stop_B,
-        'TT_Passing':            tt_pass_B,
-        'speed_source':          'formula',
-        'geometry':              geom_B,
-    }
-
-    # Remove original segment, add A and B
-    segments = segments[segments.index != seg_idx].reset_index(drop=True)
-    segments = pd.concat(
-        [segments, gpd.GeoDataFrame([row_A, row_B], crs=SWISS_CRS)],
-        ignore_index=True
-    )
-
-    # --- Redistribute composition pieces ---
-    old_comp    = composition[composition['Segment_ID'] == S['Segment_ID']].copy()
-    composition = composition[
-        composition['Segment_ID'] != S['Segment_ID']
-    ].reset_index(drop=True)
-
-    new_comp_rows = []
-    cumulative = 0.0
-    for _, piece in old_comp.iterrows():
-        piece_len   = float(piece['Piece_Length'])
-        piece_start = cumulative
-        piece_end   = cumulative + piece_len
-
-        base = piece.to_dict()
-        base.pop('geometry', None)  # geometry will be set per-segment below
-
-        if piece_end <= split_dist:
-            # Entirely in A
-            new_comp_rows.append({
-                **base,
-                'Segment_ID':        id_A,
-                'From_Name': S['From_Name'],
-                'To_Name':   new_node_name,
-                '_geom':     geom_A,
-            })
-        elif piece_start >= split_dist:
-            # Entirely in B
-            new_comp_rows.append({
-                **base,
-                'Segment_ID':        id_B,
-                'From_Name': new_node_name,
-                'To_Name':   S['To_Name'],
-                '_geom':     geom_B,
-            })
-        else:
-            # Straddles split — divide into two rows
-            len_in_A = split_dist - piece_start
-            len_in_B = piece_end  - split_dist
-            new_comp_rows.append({
-                **base,
-                'Segment_ID':           id_A,
-                'From_Name':    S['From_Name'],
-                'To_Name':      new_node_name,
-                'Piece_Length': len_in_A,
-                '_geom':        geom_A,
-            })
-            new_comp_rows.append({
-                **base,
-                'Segment_ID':           id_B,
-                'From_Name':    new_node_name,
-                'To_Name':      S['To_Name'],
-                'Piece_Length': len_in_B,
-                '_geom':        geom_B,
-            })
-
-        cumulative += piece_len
-
-    if new_comp_rows:
-        geoms = [r.pop('_geom') for r in new_comp_rows]
-        new_comp_gdf = gpd.GeoDataFrame(new_comp_rows, geometry=geoms, crs=SWISS_CRS)
-        composition  = pd.concat([composition, new_comp_gdf], ignore_index=True)
-
-    return segments, composition
 
 
 def _add_node(
@@ -1874,245 +1670,44 @@ def _validate_and_autofill(
     segments: gpd.GeoDataFrame,
     composition: gpd.GeoDataFrame,
 ) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, bool]:
-    """Auto-fill derivable nulls and report remaining issues before save.
+    """Delegates to infrabuild_network_builder.validate_and_autofill (interactive)."""
+    return _validate_and_autofill_core(nodes, segments, composition, interactive=True)
 
-    Runs 10 sequential fills, then reports what changed. Non-blocking warnings
-    are printed but do not stop the save. Blocking issues (null endpoint names,
-    zero length) prompt "Save anyway?" and return False if the user declines.
 
-    Returns updated (nodes, segments, composition, ok_to_save).
+def _apply_seed_interactive(
+    nodes: gpd.GeoDataFrame,
+    segments: gpd.GeoDataFrame,
+    composition: gpd.GeoDataFrame,
+) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """Pick a seed year from data/Infrastructure/Seeds/ and import its elements.
+
+    Seeds are read-only — the version manager only imports FROM them; it never
+    writes back. Files are authored by hand (QGIS or scripted).
+
+    Available years are discovered from nodes_<year>.gpkg files in the Seeds
+    directory.
     """
-    print("\n" + "─" * 60)
-    print("  Pre-save validation")
-    print("─" * 60)
+    seeds_dir = Path(paths.MAIN) / paths.INFRASTRUCTURE_SEEDS_DIR
+    if not seeds_dir.is_dir():
+        print(f"\n  Seeds directory does not exist: {seeds_dir}")
+        return nodes, segments, composition
 
-    counts: dict = {}
-    warnings: List[str] = []
-    blockers: List[str] = []
-
-    node_lookup = {
-        str(r['Name']): r
-        for _, r in nodes.iterrows()
-        if pd.notna(r.get('Name'))
-    }
-
-    # ── Step 1 — Length from geometry ────────────────────────────────────────
-    bad_len_mask = segments['Length'].isnull() | (segments['Length'] <= 0)
-    for i in segments.index[bad_len_mask]:
-        g = segments.at[i, 'geometry']
-        if g is not None and not g.is_empty:
-            segments.at[i, 'Length'] = float(g.length)
-            counts['Length'] = counts.get('Length', 0) + 1
-
-    # ── Step 2 — From_E/N, To_E/N from nodes table ───────────────────────────
-    for i, row in segments.iterrows():
-        for prefix, name_col in (('From', 'From_Name'), ('To', 'To_Name')):
-            e_col, n_col = f'{prefix}_E', f'{prefix}_N'
-            if e_col not in segments.columns or n_col not in segments.columns:
-                continue
-            if pd.notna(segments.at[i, e_col]) and pd.notna(segments.at[i, n_col]):
-                continue
-            name = row.get(name_col)
-            if name in node_lookup:
-                segments.at[i, e_col] = float(node_lookup[name].get('E', 0) or 0)
-                segments.at[i, n_col] = float(node_lookup[name].get('N', 0) or 0)
-                counts['Endpoint_coords'] = counts.get('Endpoint_coords', 0) + 1
-
-    # ── Step 3 — Average_Speed from Predominant_Speed ────────────────────────
-    if 'Predominant_Speed' in segments.columns:
-        mask = segments['Average_Speed'].isnull() & segments['Predominant_Speed'].notna()
-        n_fill = int(mask.sum())
-        if n_fill:
-            segments.loc[mask, 'Average_Speed'] = segments.loc[mask, 'Predominant_Speed']
-            counts['Average_Speed'] = n_fill
-
-    # ── Step 4 — Speed_Coverage_Pct ──────────────────────────────────────────
-    if 'Speed_Coverage_Pct' in segments.columns:
-        mask_null = segments['Speed_Coverage_Pct'].isnull()
-        if mask_null.any():
-            segments.loc[mask_null & segments['Average_Speed'].notna(), 'Speed_Coverage_Pct'] = 1.0
-            segments.loc[mask_null & segments['Average_Speed'].isnull(), 'Speed_Coverage_Pct'] = 0.0
-            counts['Speed_Coverage_Pct'] = int(mask_null.sum())
-
-    # ── Step 5 — speed_source inference when null/empty ──────────────────────
-    if 'speed_source' not in segments.columns:
-        segments['speed_source'] = pd.NA
-    mask_null_src = (
-        segments['speed_source'].isnull()
-        | (segments['speed_source'].astype(str).str.strip() == '')
+    years = sorted(
+        p.name.removeprefix('nodes_').removesuffix('.gpkg')
+        for p in seeds_dir.glob('nodes_*.gpkg')
     )
-    if mask_null_src.any():
-        has_speed = segments['Average_Speed'].notna()
-        segments.loc[mask_null_src &  has_speed, 'speed_source'] = 'formula'
-        segments.loc[mask_null_src & ~has_speed, 'speed_source'] = 'estimate'
-        counts['speed_source'] = int(mask_null_src.sum())
+    if not years:
+        print(f"\n  No nodes_<year>.gpkg seed files found in {seeds_dir}")
+        return nodes, segments, composition
 
-    # ── Step 6 — TT_Stopping / TT_Passing from formula ───────────────────────
-    for col in ('TT_Stopping', 'TT_Passing'):
-        if col not in segments.columns:
-            segments[col] = pd.NA
-    null_tt_mask = segments['TT_Stopping'].isnull() | segments['TT_Passing'].isnull()
-    for i in segments.index[null_tt_mask]:
-        row = segments.loc[i]
-        length_m = float(row.get('Length') or 0)
-        if length_m <= 0:
-            continue
-        spd = row.get('Average_Speed')
-        if pd.notna(spd) and float(spd) > 0:
-            speed_kmh = float(spd)
-            new_src = 'formula'
-        else:
-            speed_kmh = _default_speed_for_segment(row)
-            new_src = 'estimate'
-        n_sta = _count_stations_at_endpoints(
-            row.get('From_Name'), row.get('To_Name'), nodes,
-        )
-        tt_s, tt_p = _auto_tt(length_m, speed_kmh, n_sta)
-        segments.at[i, 'TT_Stopping'] = tt_s
-        segments.at[i, 'TT_Passing']  = tt_p
-        if new_src == 'formula' and str(segments.at[i, 'speed_source']) == 'estimate':
-            segments.at[i, 'speed_source'] = 'formula'
-        counts['TT_filled'] = counts.get('TT_filled', 0) + 1
+    idx = _pick_one(years, "Seed year to apply")
+    if idx is None:
+        return nodes, segments, composition
 
-    # ── Step 7 — Number / Code from endpoint nodes ───────────────────────────
-    for i, row in segments.iterrows():
-        if 'Number' in segments.columns and pd.isna(row.get('Number')):
-            fn = node_lookup.get(str(row.get('From_Name', '') or ''))
-            tn = node_lookup.get(str(row.get('To_Name',   '') or ''))
-            if (fn is not None and tn is not None
-                    and pd.notna(fn.get('Number')) and pd.notna(tn.get('Number'))):
-                segments.at[i, 'Number'] = f"{int(fn['Number'])}_{int(tn['Number'])}"
-                counts['Number'] = counts.get('Number', 0) + 1
-        if 'Code' in segments.columns and pd.isna(row.get('Code')):
-            fn = node_lookup.get(str(row.get('From_Name', '') or ''))
-            tn = node_lookup.get(str(row.get('To_Name',   '') or ''))
-            if (fn is not None and tn is not None
-                    and pd.notna(fn.get('Code')) and pd.notna(tn.get('Code'))):
-                segments.at[i, 'Code'] = f"{fn['Code']}_{tn['Code']}"
-                counts['Code'] = counts.get('Code', 0) + 1
+    chosen_year = years[idx]
+    print(f"\n  Importing seed for year '{chosen_year}' (read-only)…")
+    return ic.load_and_apply_seed(chosen_year, nodes, segments, composition)
 
-    # ── Step 9 — Missing composition entries (before step 8 so step 8 sees them) ─
-    seg_ids_with_comp = (
-        set(composition['Segment_ID'].dropna().astype(str).unique())
-        if not composition.empty else set()
-    )
-    missing_comp_rows = []
-    for _, row in segments.iterrows():
-        sid = str(row.get('Segment_ID', '') or '')
-        if not sid or sid in seg_ids_with_comp:
-            continue
-        missing_comp_rows.append({
-            'Segment_ID':            sid,
-            'From_Name':             row.get('From_Name'),
-            'To_Name':               row.get('To_Name'),
-            'Engineering_Structure': 'normal',
-            'Edge_Level':            1,
-            'Under_Construction':    0,
-            'Piece_Length':          float(row.get('Length') or 0),
-            'geometry':              row.get('geometry'),
-        })
-    if missing_comp_rows:
-        composition = pd.concat(
-            [composition, gpd.GeoDataFrame(missing_comp_rows, crs=SWISS_CRS)],
-            ignore_index=True,
-        )
-        counts['Composition_added'] = len(missing_comp_rows)
-
-    # ── Step 8 — Tunnel/Bridge/Conventional_Length from composition ───────────
-    derived_cols = [
-        ('Tunnel_Length',       'tunnel'),
-        ('Bridge_Length',       'bridge'),
-        ('Conventional_Length', 'normal'),
-    ]
-    if all(c in segments.columns for c, _ in derived_cols):
-        for i, row in segments.iterrows():
-            if not any(pd.isna(segments.at[i, col]) for col, _ in derived_cols):
-                continue
-            sid = row.get('Segment_ID')
-            pieces = composition[composition['Segment_ID'] == sid]
-            if pieces.empty:
-                continue
-            by_type = pieces.groupby('Engineering_Structure')['Piece_Length'].sum()
-            for col, struct in derived_cols:
-                if pd.isna(segments.at[i, col]):
-                    segments.at[i, col] = float(by_type.get(struct, 0.0))
-                    counts['Length_breakdown'] = counts.get('Length_breakdown', 0) + 1
-
-    # ── Step 10 — Orphan composition rows ─────────────────────────────────────
-    seg_ids_existing = set(segments['Segment_ID'].dropna().astype(str).unique())
-    orphan_mask = ~composition['Segment_ID'].astype(str).isin(seg_ids_existing)
-    n_orphan = int(orphan_mask.sum())
-    if n_orphan > 0:
-        composition = composition[~orphan_mask].reset_index(drop=True)
-        counts['Composition_orphans_removed'] = n_orphan
-
-    # ── Non-blocking warnings ─────────────────────────────────────────────────
-    null_class = nodes[
-        nodes['Node_Class'].isnull()
-        | (nodes['Node_Class'].astype(str).str.strip() == '')
-    ]
-    if not null_class.empty:
-        names = null_class['Name'].dropna().astype(str).tolist()
-        warnings.append(
-            f"{len(null_class)} node(s) have null Node_Class: "
-            f"{', '.join(names[:5])}{'…' if len(names) > 5 else ''}"
-        )
-
-    null_num = nodes[nodes['Number'].isnull()]
-    if not null_num.empty:
-        names = null_num['Name'].dropna().astype(str).tolist()
-        warnings.append(
-            f"{len(null_num)} node(s) have null Number: "
-            f"{', '.join(names[:5])}{'…' if len(names) > 5 else ''}"
-        )
-
-    # ── Blocking issues ───────────────────────────────────────────────────────
-    null_endpoint = segments[
-        segments['From_Name'].isnull() | segments['To_Name'].isnull()
-    ]
-    if not null_endpoint.empty:
-        ids = null_endpoint['Segment_ID'].dropna().astype(str).tolist()
-        blockers.append(
-            f"{len(null_endpoint)} segment(s) have null From_Name or To_Name: "
-            f"{', '.join(ids[:5])}{'…' if len(ids) > 5 else ''}"
-        )
-
-    bad_length = segments[
-        segments['Length'].isnull() | (segments['Length'] <= 0)
-    ]
-    if not bad_length.empty:
-        ids = bad_length['Segment_ID'].dropna().astype(str).tolist()
-        blockers.append(
-            f"{len(bad_length)} segment(s) have Length <= 0 after auto-fill: "
-            f"{', '.join(ids[:5])}{'…' if len(ids) > 5 else ''}"
-        )
-
-    # ── Report ────────────────────────────────────────────────────────────────
-    if counts:
-        print("\n  Auto-filled:")
-        for key, n in counts.items():
-            print(f"    {key:32s} {n} row(s)")
-    else:
-        print("\n  Nothing to auto-fill — all derivable values already populated.")
-
-    if warnings:
-        print("\n  Warnings (save will proceed):")
-        for w in warnings:
-            print(f"    • {w}")
-
-    ok_to_save = True
-    if blockers:
-        print("\n  BLOCKING ISSUES:")
-        for b in blockers:
-            print(f"    • {b}")
-        ans = input("\n  Save anyway? (y/n) [n]: ").strip().lower() or 'n'
-        if ans != 'y':
-            print("  Save aborted. Fix the issues above and try again.")
-            ok_to_save = False
-        else:
-            print("  Saving despite blocking issues — downstream pipeline may fail.")
-
-    return nodes, segments, composition, ok_to_save
 
 
 # =============================================================================
@@ -2138,8 +1733,9 @@ def main():
                 print("    2) Adjust a node")
                 print("    3) Add a node")
                 print("    4) Import nodes from another version")
-                print("    5) Proceed to segment editing  →")
-                c = input("  Select (1-5): ").strip()
+                print("    5) Apply a seed file (import-only, read-only on seed)")
+                print("    6) Proceed to segment editing  →")
+                c = input("  Select (1-6): ").strip()
 
                 if c == '1':
                     nodes, segments, composition = _remove_node(nodes, segments, composition)
@@ -2150,6 +1746,10 @@ def main():
                 elif c == '4':
                     nodes, segments, composition = _import_nodes(nodes, segments, composition, name)
                 elif c == '5':
+                    nodes, segments, composition = _apply_seed_interactive(
+                        nodes, segments, composition,
+                    )
+                elif c == '6':
                     phase = 2
                     break
                 else:
@@ -2257,3 +1857,305 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# =============================================================================
+# Derived infrastructure versions (Topic 2)
+# Builds and caches infra versions derived from a named base by applying a
+# sorted set of infra-intervention IDs. Naming: <BASE>+<id1>+<id2>+...
+# =============================================================================
+
+SUPPORTED_INFRA_INT_TYPES: Tuple[str, ...] = ('cc', 'cap')
+
+
+def list_intervention_ids(int_type: str) -> List[str]:
+    """Return all distinct int_ids found in <int_type>_interventions.gpkg.
+
+    Args:
+        int_type: registry short code (e.g. 'cc', 'cap').
+
+    Returns:
+        Sorted list of int_id strings. Empty list if the registry file or its
+        layers are missing.
+    """
+    gpkg_path = Path(paths.get_infra_int_registry(int_type))
+    if not gpkg_path.exists():
+        return []
+    try:
+        layers = set(fiona.listlayers(str(gpkg_path)))
+    except Exception as exc:
+        print(f"  [registry] {gpkg_path.name}: cannot list layers ({exc})")
+        return []
+
+    ids: set = set()
+    for layer in ('nodes', 'segments'):
+        if layer not in layers:
+            continue
+        gdf = gpd.read_file(gpkg_path, layer=layer)
+        if 'int_id' in gdf.columns:
+            ids.update(gdf['int_id'].dropna().astype(str).tolist())
+    return sorted(ids)
+
+
+def read_intervention_rows(
+    int_type: str,
+    int_ids: List[str],
+) -> Tuple[Optional[gpd.GeoDataFrame], Optional[gpd.GeoDataFrame], Optional[gpd.GeoDataFrame]]:
+    """Return (nodes, segments, composition) GeoDataFrames filtered to int_ids.
+
+    Each returned frame may be None if the corresponding layer does not exist
+    or has no rows for the requested IDs.
+    """
+    gpkg_path = Path(paths.get_infra_int_registry(int_type))
+    if not gpkg_path.exists() or not int_ids:
+        return None, None, None
+
+    layers = set(fiona.listlayers(str(gpkg_path)))
+    wanted = set(str(i) for i in int_ids)
+
+    def _filter(layer: str) -> Optional[gpd.GeoDataFrame]:
+        if layer not in layers:
+            return None
+        gdf = gpd.read_file(gpkg_path, layer=layer)
+        if 'int_id' not in gdf.columns:
+            return None
+        sel = gdf[gdf['int_id'].astype(str).isin(wanted)].reset_index(drop=True)
+        return sel if not sel.empty else None
+
+    return _filter('nodes'), _filter('segments'), _filter('segments_composition')
+
+
+def derived_version_name(base_version_name: str, infra_int_ids: List[str]) -> str:
+    """Compute the verbose derived-version folder name.
+
+    Empty int list → returns base name unchanged (no derived version needed).
+    """
+    if not infra_int_ids:
+        return base_version_name
+    suffix = '+'.join(sorted(str(i) for i in infra_int_ids))
+    return f"{base_version_name}+{suffix}"
+
+
+def resolve_or_build(
+    base_version_name: str,
+    infra_int_ids: List[str],
+) -> str:
+    """Return the name of a derived infra version with the given ints applied.
+
+    Reuses an existing folder if one already exists; otherwise builds the
+    derived version by copying the base and applying each int in turn.
+
+    Args:
+        base_version_name: existing infra version (e.g. 'AS_2026_ZH').
+        infra_int_ids: list of registry int IDs to apply (any combination of
+            'cc_*', 'cap_*', ...). Sorted alphabetically for naming.
+
+    Returns:
+        Name of the derived infra version on disk.
+    """
+    name = derived_version_name(base_version_name, infra_int_ids)
+    target_dir = Path(paths.get_derived_infra_version_dir(name))
+
+    if target_dir.is_dir() and paths.derived_version_exists(name):
+        print(f"  [derived] reusing existing '{name}'")
+        return name
+
+    base_dir = Path(paths.get_infra_version_dir(base_version_name))
+    if not paths.infra_version_exists(base_version_name):
+        raise FileNotFoundError(
+            f"Base infra version '{base_version_name}' not found at {base_dir}"
+        )
+
+    print(f"  [derived] building '{name}' from '{base_version_name}'")
+    nodes = gpd.read_file(base_dir / 'nodes.gpkg')
+    segs  = gpd.read_file(base_dir / 'segments.gpkg')
+    comp_path = base_dir / 'segments_composition.gpkg'
+    comp = (gpd.read_file(comp_path)
+            if comp_path.exists()
+            else gpd.GeoDataFrame(columns=['Segment_ID'], crs=ic.SWISS_CRS))
+
+    by_type: Dict[str, List[str]] = {}
+    for iid in infra_int_ids:
+        prefix = str(iid).split('_', 1)[0].lower()
+        by_type.setdefault(prefix, []).append(str(iid))
+
+    for int_type, ids in by_type.items():
+        print(f"  [derived]   applying {len(ids)} {int_type}-int(s): {ids}")
+        new_nodes, new_segs, new_comp = read_intervention_rows(int_type, ids)
+        if new_nodes is not None and not new_nodes.empty:
+            nodes, segs, comp = ic.merge_nodes(
+                nodes, new_nodes, segs, comp,
+                snap_and_split=True,
+                replace_existing=(int_type == 'cap'),
+            )
+        if new_segs is not None and not new_segs.empty:
+            segs, comp = ic.merge_segments(segs, comp, new_segs, new_comp)
+
+    if '_delete' in segs.columns:
+        segs = segs[~segs['_delete'].fillna(False)].drop(columns='_delete').reset_index(drop=True)
+
+    nodes, segs, comp, ok = ic.validate_and_autofill(
+        nodes, segs, comp, interactive=False,
+    )
+    if not ok:
+        print(f"  [derived] validation reported blockers; '{name}' NOT saved.")
+        raise RuntimeError(f"Validation failed building derived version '{name}'")
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    nodes.to_file(target_dir / 'nodes.gpkg', driver='GPKG')
+    segs.to_file(target_dir / 'segments.gpkg', driver='GPKG')
+    if not comp.empty:
+        comp.to_file(target_dir / 'segments_composition.gpkg', driver='GPKG')
+    print(f"  [derived] saved to {target_dir}")
+    return name
+
+
+def build_full_reference(base_version_name: str) -> str:
+    """Build a 'full' reference version with ALL ints from ALL registries applied.
+
+    Stored under data/Infrastructure/Developments/Dev_Full/<base>_full/.
+    For visualisation and sanity checking only — not used by the main pipeline.
+    """
+    all_ids: List[str] = []
+    for int_type in SUPPORTED_INFRA_INT_TYPES:
+        all_ids.extend(list_intervention_ids(int_type))
+
+    full_name = f"{base_version_name}_full"
+    target_dir = Path(paths.MAIN) / paths.INFRASTRUCTURE_DEV_FULL_DIR / full_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    if not all_ids:
+        print(f"  [full] no infra ints registered; '{full_name}' will mirror base.")
+    else:
+        print(f"  [full] applying {len(all_ids)} infra int(s): {all_ids}")
+
+    derived_name = resolve_or_build(base_version_name, all_ids)
+    derived_dir = Path(paths.get_derived_infra_version_dir(derived_name))
+
+    for fname in ('nodes.gpkg', 'segments.gpkg', 'segments_composition.gpkg'):
+        src = derived_dir / fname
+        if src.exists():
+            (target_dir / fname).write_bytes(src.read_bytes())
+
+    qgz_path = target_dir / f"{full_name}.qgz"
+    ic._build_infra_qgz(
+        qgz_path=str(qgz_path),
+        version_dir=target_dir,
+        name=full_name,
+    )
+    print(f"  [full] copied to {target_dir}")
+    return full_name
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cap-intervention registry write helper (called by the capacity workflow)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def append_cap_intervention_rows(
+    new_nodes: Optional[gpd.GeoDataFrame],
+    new_segments: Optional[gpd.GeoDataFrame],
+    new_composition: Optional[gpd.GeoDataFrame] = None,
+) -> None:
+    """Append auto-generated Tier-1 cap-intervention rows to cap_interventions.gpkg.
+
+    Each row must carry an 'int_id' column (e.g. 'cap_ps_017'). The gpkg is
+    created if missing; existing rows with the same int_id are replaced.
+    """
+    gpkg_path = Path(paths.get_infra_int_registry('cap'))
+    gpkg_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_layers = set()
+    if gpkg_path.exists():
+        try:
+            existing_layers = set(fiona.listlayers(str(gpkg_path)))
+        except Exception:
+            pass
+
+    def _append(layer_name: str, new_gdf: Optional[gpd.GeoDataFrame]) -> None:
+        if new_gdf is None or new_gdf.empty:
+            return
+        if layer_name in existing_layers:
+            existing = gpd.read_file(gpkg_path, layer=layer_name)
+            if 'int_id' in existing.columns and 'int_id' in new_gdf.columns:
+                new_ids = set(new_gdf['int_id'].dropna().astype(str).tolist())
+                existing = existing[~existing['int_id'].astype(str).isin(new_ids)]
+            combined = pd.concat([existing, new_gdf], ignore_index=True)
+            combined = gpd.GeoDataFrame(combined, crs=ic.SWISS_CRS)
+        else:
+            combined = new_gdf
+        combined.to_file(gpkg_path, layer=layer_name, driver='GPKG')
+
+    _append('nodes', new_nodes)
+    _append('segments', new_segments)
+    _append('segments_composition', new_composition)
+    print(f"  [cap-registry] appended rows to {gpkg_path.name}")
+
+
+SVC_INT_TYPES: Tuple[str, ...] = ('ext', 'cc')
+
+
+def resolve_active_svc_int_types() -> List[str]:
+    """Resolve which svc-int types are active under settings.INFRA_INT_MODE.
+
+    Mode values (mirrors old main_cap.infra_generation_modification_type):
+      'NONE' → []
+      'ALL'  → every type in SVC_INT_TYPES
+      'EXT'  → ['ext']
+      'CC'   → ['cc']
+
+    Returns sorted lower-case short codes. Unknown modes log a warning and
+    return [] (baseline).
+    """
+    mode = str(getattr(settings, 'INFRA_INT_MODE', 'NONE')).upper()
+    if mode == 'NONE':
+        return []
+    if mode == 'ALL':
+        return list(SVC_INT_TYPES)
+    if mode.lower() in SVC_INT_TYPES:
+        return [mode.lower()]
+    print(f"  [intervention] unknown INFRA_INT_MODE='{mode}' — treating as 'NONE'")
+    return []
+
+
+def enumerate_active_infra_ints() -> List[str]:
+    """Collect all infra-int IDs implied by the active svc-int types.
+
+    Resolution:
+      1. SVC_INT_MODE / SVC_INT_SELECTED → list of active svc-int types.
+      2. For each active type that has its own infra registry (e.g. 'cc'),
+         add every int_id from that registry.
+      3. For each active type that has an svc-only registry (e.g. 'ext'),
+         read the registry's 'requires_infra' column and add the listed IDs.
+
+    Cap ints are NOT enumerated here — they are auto-generated during the
+    capacity workflow and persisted to cap_interventions.gpkg separately.
+
+    Returns:
+        Sorted, deduplicated list of infra-int IDs.
+    """
+    active_types = resolve_active_svc_int_types()
+    if not active_types:
+        return []
+
+    active_ids: set = set()
+    infra_registry_types = set(SUPPORTED_INFRA_INT_TYPES)
+
+    for t in active_types:
+        if t in infra_registry_types:
+            active_ids.update(list_intervention_ids(t))
+        else:
+            svc_path = Path(paths.get_svc_int_registry(t))
+            if not svc_path.exists():
+                continue
+            try:
+                df = pd.read_excel(svc_path, sheet_name='extensions')
+            except Exception as exc:
+                print(f"  [registry] cannot read {svc_path.name}: {exc}")
+                continue
+            if 'requires_infra' in df.columns:
+                for raw in df['requires_infra'].dropna().astype(str):
+                    for token in raw.split(','):
+                        s = token.strip()
+                        if s:
+                            active_ids.add(s)
+
+    return sorted(active_ids)

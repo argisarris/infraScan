@@ -54,9 +54,9 @@ from infrabuild_version_manager import list_versions, _pick_one
 SWISS_CRS = "EPSG:2056"
 TRACK_BASED_FEEDER_LAYERS = {"tram", "funicular", "metro"}
 
-# Physics parameters — must match infrabuild_network_builder._compute_approx_travel_times
-_DECEL_A = 0.7   # m/s², service-brake deceleration
-_BUFFER  = 1.30  # shared buffer for stopping & passing formulas
+# Physics parameters — sourced from settings.py §11 (single source of truth).
+_DECEL_A = settings.SERVICE_BRAKE_DECEL_MS2
+_BUFFER  = settings.TT_OPERATIONAL_BUFFER
 _STATION_CLASSES = {'station'}
 
 _MODE_DEFAULT_SPEEDS: Dict[str, float] = {

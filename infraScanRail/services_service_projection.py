@@ -43,6 +43,8 @@ from matplotlib_map_utils.core.north_arrow import NorthArrow, north_arrow
 
 sys.path.insert(0, str(Path(__file__).parent))
 import paths
+import settings
+
 
 # =============================================================================
 # Constants
@@ -138,8 +140,8 @@ _MODE_DEFAULT_SPEEDS: Dict[str, int] = {
 # infrabuild_infrastructure_enhancement.{_DECEL_A, _BUFFER, _STATION_CLASSES}.
 # Update all three together if recalibrating. Used by the per-(service, edge)
 # routing weight callable produced by _make_weight_fn.
-_DECEL_A:         float        = 0.7   # m/s², service-brake deceleration
-_BUFFER:          float        = 1.30  # shared buffer for stopping & passing formulas
+_DECEL_A:         float        = settings.SERVICE_BRAKE_DECEL_MS2
+_BUFFER:          float        = settings.TT_OPERATIONAL_BUFFER
 _STATION_CLASSES: frozenset    = frozenset({'station'})
 
 # Layers subject to boundary gateway rerouting (Phase 1.5).
@@ -2031,6 +2033,62 @@ def route_between_nodes(
     )
 
 
+def _derive_forced_via(
+    node_from: Optional[int],
+    node_to: Optional[int],
+    hub_topology: Dict,
+    G: nx.Graph,
+) -> Optional[List[int]]:
+    """Derive a forced_via waypoint list for a routing call between two nodes.
+
+    For hub children whose direct approach edge is physically longer than the
+    surface detour (e.g. the DML tunnel), find the natural gateway the train
+    passes through on its surface approach and return it as a forced waypoint
+    when that gateway is flagged forced=True.
+
+    Mirrors the inline logic previously in _apply_enrichment so the post-pass
+    can reproduce the same forced_via that the original routing call used.
+
+    Returns None when no forced gateway applies.
+    """
+    if not hub_topology or node_from is None or node_to is None:
+        return None
+
+    for child_id, other_id in [(node_from, node_to), (node_to, node_from)]:
+        for hub_id, hub_data in hub_topology.items():
+            children = hub_data.get("children", {})
+            if child_id not in children:
+                continue
+            gw_entries = children[child_id]["gateways"]
+
+            G_surface = G.copy()
+            for gw, gdata in gw_entries.items():
+                if gdata.get("forced") and G_surface.has_edge(gw, child_id):
+                    G_surface.remove_edge(gw, child_id)
+
+            try:
+                surface_path = nx.shortest_path(
+                    G_surface, other_id, child_id, weight="length_m"
+                )
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                surface_path = []
+
+            natural_gw: Optional[int] = None
+            for node in surface_path:
+                if node in gw_entries:
+                    natural_gw = node
+                    break
+
+            if (
+                natural_gw is not None
+                and gw_entries[natural_gw].get("forced")
+                and natural_gw in G
+            ):
+                return [natural_gw]
+            break  # only the first hub containing child_id is considered
+    return None
+
+
 # =============================================================================
 # Stop Sequence Builders
 # =============================================================================
@@ -2188,6 +2246,42 @@ def _make_via_cols(path_nodes_str: str) -> tuple:
     return via_nodes, via_segment
 
 
+def _parse_path_nodes(s) -> List[int]:
+    """Parse a ';'-joined node_id string (from the path_nodes column) into a
+    list of ints. Empty / non-string input returns []. Unparseable tokens
+    are silently skipped — defensive against GPKG round-trip quirks.
+    """
+    if not isinstance(s, str) or not s:
+        return []
+    out: List[int] = []
+    for tok in s.split(";"):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.append(int(float(tok)))
+        except ValueError:
+            pass
+    return out
+
+
+def _to_int_or_none(x) -> Optional[int]:
+    """Coerce a value to int, returning None for None/NaN/pd.NA/unparseable.
+    Tolerates the float64 round-trip GPKG performs on integer columns.
+    """
+    if x is None:
+        return None
+    try:
+        if pd.isna(x):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
 def _lookup_node_code(node_id, nodes: "gpd.GeoDataFrame") -> str:
     """Return the BAV Code abbreviation for a node Number, or '' if not found."""
     if node_id is None:
@@ -2305,67 +2399,9 @@ def _apply_enrichment(
     node_id_to = match_to.node_id
 
     if match_from.candidates and match_to.candidates and inside_from and inside_to:
-        # Generalised forced_via: for hub children whose direct approach edge is
-        # physically longer than the surface detour (e.g. the DML tunnel), find
-        # the natural gateway the train passes through on its approach and force
-        # routing through it when that gateway has forced=True.
-        #
-        # "Natural gateway" is determined by removing all forced direct edges
-        # (gateway→child edges flagged forced=True) from a temporary graph and
-        # running Dijkstra from other_id to child_id.  The first gateway of
-        # child_id that appears on that surface path is the approach gateway.
-        # Forced_via is only applied when that gateway's forced flag is True —
-        # this prevents stations that happen to be adjacent to a forced gateway
-        # (e.g. Wipkingen adjacent to ZOES) from being routed back through the
-        # DML tunnel they did not arrive via.
-        forced_via: Optional[List[int]] = None
-        if hub_topology:
-            for child_id, other_id in [
-                (match_from.node_id, match_to.node_id),
-                (match_to.node_id,   match_from.node_id),
-            ]:
-                if child_id is None or other_id is None:
-                    continue
-                for hub_id, hub_data in hub_topology.items():
-                    children = hub_data.get("children", {})
-                    if child_id not in children:
-                        continue
-                    gw_entries = children[child_id]["gateways"]
-
-                    # Build a graph with all forced gateway→child direct edges removed
-                    # so that Dijkstra reveals the natural surface approach path.
-                    G_surface = G.copy()
-                    for gw, gdata in gw_entries.items():
-                        if gdata.get("forced") and G_surface.has_edge(gw, child_id):
-                            G_surface.remove_edge(gw, child_id)
-
-                    # Use length_m as the weight here — we only need the
-                    # natural surface path, not its precise travel time. Dijkstra
-                    # by physical distance is sufficient and avoids constructing
-                    # a per-service weight closure for this auxiliary lookup.
-                    try:
-                        surface_path = nx.shortest_path(
-                            G_surface, other_id, child_id, weight="length_m"
-                        )
-                    except (nx.NetworkXNoPath, nx.NodeNotFound):
-                        surface_path = []
-
-                    # Find the first gateway of child_id on this surface path
-                    natural_gw: Optional[int] = None
-                    for node in surface_path:
-                        if node in gw_entries:
-                            natural_gw = node
-                            break
-
-                    if (
-                        natural_gw is not None
-                        and gw_entries[natural_gw].get("forced")
-                        and natural_gw in G
-                    ):
-                        forced_via = [natural_gw]
-                    break
-                if forced_via is not None:
-                    break
+        forced_via = _derive_forced_via(
+            match_from.node_id, match_to.node_id, hub_topology or {}, G,
+        )
 
         # Hard constraint: route on gauge-filtered graph when gauge is determinable.
         G_route = G
@@ -2475,6 +2511,63 @@ def _get_hub_node_type(c: int, hub_id: int, hub: dict) -> str:
     if c == hub_id:
         return hub.get("hub_node_type", "terminal")
     return hub.get("children", {}).get(c, {}).get("node_type", "terminal")
+
+
+def _is_boundary_terminal(node_id: Optional[int], hub_topology: Dict) -> bool:
+    """Return True iff node_id is a terminal hub parent or terminal hub child.
+
+    Used by the inter-leg backtracking post-pass to exempt legitimate
+    Kopfbahnhof reversals (e.g. HB parent, Zug) and connector turnarounds
+    (e.g. Rehalp / Anschluss FB) from the same-edge veto. Stops not present
+    in hub_topology are treated as non-terminal — the veto applies.
+
+    Args:
+        node_id: BAV Betriebspunkt_Nummer of the candidate boundary stop.
+        hub_topology: Output of build_hub_topology.
+    """
+    if node_id is None:
+        return False
+    for hub_id, hub in hub_topology.items():
+        if node_id == hub_id or node_id in hub.get("children", {}):
+            return _get_hub_node_type(node_id, hub_id, hub) == "terminal"
+    return False
+
+
+def _path_traverses_sibling(
+    cheapest_term: int,
+    approaching: int,
+    hub_id: int,
+    hub: Dict,
+    G: nx.Graph,
+) -> bool:
+    """Return True iff the shortest path from cheapest_term to approaching
+    traverses any other valid candidate of the same hub (parent or any child
+    other than cheapest_term itself).
+
+    Used by _preselect_rail_stop_nodes to override the terminal-preference
+    boost when picking the terminal would force the leg to back-haul through
+    a through-child anyway (the S-Bahn U at HB → Stadelhofen case).
+
+    Weight: _cruise_time_s (same service-agnostic weight as the surrounding
+    pre-selection logic). Returns False on unreachable / missing nodes — the
+    caller falls back to the existing TERMINAL_PREFERENCE_S logic.
+    """
+    if cheapest_term is None or approaching is None:
+        return False
+    if cheapest_term not in G or approaching not in G:
+        return False
+    try:
+        path = nx.shortest_path(
+            G, cheapest_term, approaching, weight="_cruise_time_s"
+        )
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return False
+    siblings = {hub_id} | set(hub.get("children", {}).keys())
+    siblings.discard(cheapest_term)
+    for node in path[1:-1]:
+        if node in siblings:
+            return True
+    return False
 
 
 def _nearest_outlying(
@@ -2829,6 +2922,9 @@ def _preselect_rail_stop_nodes(
                 if not is_through:
                     # Step (e): terminating service (or backtracking through service)
                     # Prefer terminal child nodes; apply TERMINAL_PREFERENCE_S tolerance.
+                    # Override: if picking the terminal would force a back-haul
+                    # through a sibling through-child (e.g. S-Bahn U HB --> Stadelhofen),
+                    # prefer the through-child directly.
                     approaching    = prev_node if i > 0 else next_node
                     cheapest_all   = min(valid_cands, key=lambda c: _approach_cost(c, approaching))
                     terminal_cands = [
@@ -2837,11 +2933,17 @@ def _preselect_rail_stop_nodes(
                     ]
                     if terminal_cands:
                         cheapest_term = min(terminal_cands, key=lambda c: _approach_cost(c, approaching))
-                        extra = (
-                            _approach_cost(cheapest_term, approaching)
-                            - _approach_cost(cheapest_all, approaching)
-                        )
-                        best = cheapest_term if extra <= TERMINAL_PREFERENCE_S else cheapest_all
+                        if (
+                            cheapest_term != cheapest_all
+                            and _path_traverses_sibling(cheapest_term, approaching, hub_id, hub, G)
+                        ):
+                            best = cheapest_all
+                        else:
+                            extra = (
+                                _approach_cost(cheapest_term, approaching)
+                                - _approach_cost(cheapest_all, approaching)
+                            )
+                            best = cheapest_term if extra <= TERMINAL_PREFERENCE_S else cheapest_all
                     else:
                         best = cheapest_all
 
@@ -2876,6 +2978,212 @@ def _preselect_rail_stop_nodes(
             overrides[key] = svc_overrides
 
     return overrides
+
+
+def _reroute_leg_with_edge_forbidden(
+    row: object,
+    forbidden_edge: Tuple[int, int],
+    G: nx.Graph,
+    seg_lookup: Dict,
+    node_attrs: Dict,
+    hub_topology: Dict,
+    gauge_graphs: Optional[Dict],
+) -> Optional[Dict]:
+    """Try to reroute one leg between its existing endpoints with one edge removed.
+
+    Returns a dict of new column values on success, or None if no path exists or
+    inputs are invalid. The caller decides whether to apply the result (e.g. by
+    comparing the resulting total path-length against an alternative reroute).
+    """
+    node_from = _to_int_or_none(getattr(row, "node_id_from", None))
+    node_to   = _to_int_or_none(getattr(row, "node_id_to",   None))
+    if node_from is None or node_to is None:
+        return None
+
+    # Gauge-filtered graph (mirror _apply_enrichment behaviour)
+    G_route = G
+    if gauge_graphs:
+        eg = _node_gauge(node_from, G)
+        if eg is not None and eg in gauge_graphs:
+            G_route = gauge_graphs[eg]
+
+    u, v = forbidden_edge
+    G_restricted = G_route.copy()
+    if G_restricted.has_edge(u, v):
+        G_restricted.remove_edge(u, v)
+
+    forced_via = _derive_forced_via(node_from, node_to, hub_topology, G)
+
+    geom, via_st, via_jn, path_len, _, _, pns, pw = route_between_nodes(
+        G_restricted, [node_from], [node_to],
+        seg_lookup, node_attrs,
+        forced_via=forced_via,
+        service_stops={node_from, node_to},
+    )
+    if geom is None or not pns:
+        return None
+
+    via_nodes, via_segment = _make_via_cols(pns)
+    return {
+        "geometry":      geom,
+        "Via_Station":   via_st,
+        "Via_Junction":  via_jn,
+        "path_nodes":    pns,
+        "Via_Nodes":     via_nodes,
+        "Via_Segment":   via_segment,
+        "path_length_m": path_len,
+        "_path_tt_min":  pw / 60.0 if pw > 0 else 0.0,
+    }
+
+
+def _apply_reroute_to_row(
+    enriched: gpd.GeoDataFrame, idx, result: Dict,
+) -> None:
+    """Apply a reroute result dict to a single row of the enriched GeoDataFrame.
+
+    Also refreshes TravelTime / tt_source when the row was filled by the
+    sentinel-TT branch (forward-compat; inert today).
+    """
+    for col, val in result.items():
+        enriched.at[idx, col] = val
+    if "tt_source" in enriched.columns and "TravelTime" in enriched.columns:
+        if _is_sentinel_tt(
+            enriched.at[idx, "tt_source"],
+            enriched.at[idx, "TravelTime"],
+        ):
+            tt_min_new = result.get("_path_tt_min", 0.0)
+            if tt_min_new > 0:
+                enriched.at[idx, "TravelTime"] = _round_half_min(tt_min_new)
+                enriched.at[idx, "tt_source"]  = "formula"
+
+
+def _postprocess_inter_leg_backtracking(
+    enriched: gpd.GeoDataFrame,
+    G: nx.Graph,
+    seg_lookup: Dict,
+    node_attrs: Dict,
+    hub_topology: Dict,
+    gauge_graphs: Optional[Dict] = None,
+) -> gpd.GeoDataFrame:
+    """Fix 1 post-pass: veto inter-leg same-edge re-use (symmetric).
+
+    Iterates each (Service, Direction, variant_rank) group, chains legs by
+    matching FromCode/ToCode, and for every transition where leg N+1's first
+    edge equals leg N's last edge (undirected), tries BOTH reroute options —
+    re-routing leg N+1 with the conflict edge removed, OR re-routing leg N
+    with the conflict edge removed — and applies whichever yields the shorter
+    sum of the two legs' path-lengths. Tie → reroute leg N+1 (preserves
+    backward-compat with the original asymmetric behaviour).
+
+    Terminal-type boundary stops (per build_hub_topology) are exempt — the
+    veto skips them so legitimate Kopfbahnhof reversals (HB, Zug, Rehalp
+    connector) are preserved.
+
+    When neither reroute yields a path, the original rows are kept unchanged
+    (per spec: "allow when necessary").
+
+    Updates the rerouted row's geometry, Via_Station, Via_Junction, path_nodes,
+    Via_Nodes, Via_Segment, path_length_m, _path_tt_min. When the row was
+    filled by the sentinel-TT branch (tt_source='formula' or sentinel
+    TravelTime), TravelTime and tt_source are also refreshed.
+
+    path_nodes is re-read from the GeoDataFrame on each iteration so that
+    cascading conflicts (a reroute in transition N→N+1 affecting transition
+    N+1→N+2) are detected correctly.
+    """
+    has_variant = "variant_rank" in enriched.columns
+    group_cols = (
+        ["Service", "Direction", "variant_rank"]
+        if has_variant else ["Service", "Direction"]
+    )
+
+    rewrites_next = 0   # leg N+1 rerouted (original asymmetric behaviour)
+    rewrites_prev = 0   # leg N rerouted (new symmetric option)
+    fallbacks = 0
+    skipped_exempt = 0
+
+    for _, grp in enriched.groupby(group_cols, dropna=False):
+        # Chain legs by FromCode -> ToCode (BAV Numbers, set by _apply_enrichment)
+        rows = list(grp.itertuples())
+        by_from: Dict[int, object] = {}
+        for r in rows:
+            f = _to_int_or_none(getattr(r, "FromCode", None))
+            if f is not None and f not in by_from:
+                by_from[f] = r
+        tos = {_to_int_or_none(getattr(r, "ToCode", None)) for r in rows}
+        froms = set(by_from.keys())
+        starts = (froms - tos) or ({next(iter(by_from))} if by_from else set())
+
+        for start in starts:
+            ordered: List = []
+            cur, seen = start, set()
+            while cur in by_from and cur not in seen:
+                seen.add(cur)
+                r = by_from[cur]
+                ordered.append(r)
+                cur = _to_int_or_none(getattr(r, "ToCode", None))
+
+            for i in range(len(ordered) - 1):
+                row_a, row_b = ordered[i], ordered[i + 1]
+                # Re-read paths from enriched so that a prior iteration's
+                # rewrite is visible to this iteration's conflict check.
+                p1 = _parse_path_nodes(enriched.at[row_a.Index, "path_nodes"])
+                p2 = _parse_path_nodes(enriched.at[row_b.Index, "path_nodes"])
+                if len(p1) < 2 or len(p2) < 2:
+                    continue
+                # Undirected same-edge check: leg_{N+1}'s first edge = leg_N's last edge
+                if not (p2[0] == p1[-1] and p2[1] == p1[-2]):
+                    continue
+
+                boundary = p1[-1]
+                if _is_boundary_terminal(boundary, hub_topology):
+                    skipped_exempt += 1
+                    continue  # legit reversal — keep original
+
+                forbidden = (p1[-2], p1[-1])
+                len_a_orig = float(enriched.at[row_a.Index, "path_length_m"] or 0.0)
+                len_b_orig = float(enriched.at[row_b.Index, "path_length_m"] or 0.0)
+
+                # Symmetric reroute: try both sides, pick the smaller total length.
+                result_next = _reroute_leg_with_edge_forbidden(
+                    row_b, forbidden, G, seg_lookup, node_attrs,
+                    hub_topology, gauge_graphs,
+                )
+                result_prev = _reroute_leg_with_edge_forbidden(
+                    row_a, forbidden, G, seg_lookup, node_attrs,
+                    hub_topology, gauge_graphs,
+                )
+
+                total_next = (
+                    len_a_orig + result_next["path_length_m"]
+                    if result_next else float("inf")
+                )
+                total_prev = (
+                    result_prev["path_length_m"] + len_b_orig
+                    if result_prev else float("inf")
+                )
+
+                if total_next == float("inf") and total_prev == float("inf"):
+                    fallbacks += 1
+                    continue
+
+                # Tie → reroute leg N+1 (preserves original asymmetric default).
+                if total_next <= total_prev:
+                    _apply_reroute_to_row(enriched, row_b.Index, result_next)
+                    rewrites_next += 1
+                else:
+                    _apply_reroute_to_row(enriched, row_a.Index, result_prev)
+                    rewrites_prev += 1
+
+    rewrites_total = rewrites_next + rewrites_prev
+    if rewrites_total or fallbacks or skipped_exempt:
+        print(
+            f"  Inter-leg backtracking pass: {rewrites_total} rerouted "
+            f"({rewrites_prev} leg N, {rewrites_next} leg N+1), "
+            f"{fallbacks} fallback (no alt path), "
+            f"{skipped_exempt} exempt (terminal boundary)."
+        )
+    return enriched
 
 
 def enrich_rail_links(
@@ -2941,6 +3249,9 @@ def enrich_rail_links(
         enriched_rows.append(new_row)
 
     result = gpd.GeoDataFrame(enriched_rows, crs=SWISS_CRS)
+    result = _postprocess_inter_leg_backtracking(
+        result, G, seg_lookup, node_attrs, hub_topology or {}, gauge_graphs,
+    )
     return result
 
 
@@ -3762,7 +4073,8 @@ def _build_projected_lines(
         line_rows = []
         for (gtfs_id, dir_id, var_rank), grp in segs.groupby(
                 [gtfs_col, dir_col, "variant_rank"]):
-            geoms = [g for g in grp.geometry if g is not None and not g.is_empty]
+            geoms = [g for g in grp.geometry
+                     if g is not None and not g.is_empty and g.length > 0]
             if not geoms:
                 continue
             union = unary_union(geoms)
@@ -4967,6 +5279,7 @@ def _add_scale_bar(ax, location=(0.72, 0.04)):
         val_km = (i * cell_m) / 1000.0
         label = f'{val_km:.0f} km' if val_km == int(val_km) else f'{val_km:.1f} km'
         ax.text(x0 + i * cell_m, y0 + bar_h * 1.6, label, ha='center', va='bottom', fontsize=7, zorder=7)
+
 
 def _plot_gazette_style(
     config: ProjectionConfig,

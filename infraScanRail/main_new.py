@@ -1,25 +1,11 @@
 """
 infraScanRail - New Main Pipeline
-Last modified: 2026-05-15
+Last modified: 2026-05-23
 
-Orchestrates Phases 1 and 2 of the new pipeline.
-Phases 3A/3B (infra/services network building, Workflow 2) and
-Phase 3C (capacity, Workflow 3) are stubs pending future workflows.
+Orchestrates the full pipeline: Phase 1 (Initialisation), Phase 2 (Data Preparation),
+Phase 3A (Infrastructure), Phase 3B (Services), Phase 3C (Capacity).
 """
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# RUN CONTROL
-# ═══════════════════════════════════════════════════════════════════════════════
-# 'all'  — run the complete pipeline from start to finish
-# list   — run only the listed phases, e.g. ['1', '2'] or ['3A'] or ['1', '3A']
-# Valid phase names: '1', '2', '3A', '3B', '3C'
-# Phase dependencies:
-#   '2'  requires '1' outputs on disk (study/catchment area gpkgs, BAV raw, GTFS)
-#   '3A' requires '2' outputs on disk (Raw_ZH infra gpkgs)
-#   '3B' requires '3A' outputs on disk (named infra version) + '2' GTFS output
-#   '3C' requires '3B' outputs on disk (enhanced infra, projected services)
-RUN_MODE = 'all'
-# ═══════════════════════════════════════════════════════════════════════════════
 
 import os
 import sys
@@ -202,6 +188,26 @@ def phase_1_initialisation(runtimes: dict) -> tuple:
             PIPELINE_CONFIG.infra_version = settings.INFRA_BUILD_NEW_NAME
         else:
             raise SystemExit("Aborted: infrastructure version not found.")
+
+    # ── Step 1.3b: Derived infra version from active interventions (Topic 2) ─
+    print("\n--- Step 1.3b: Derived Infra Version ---\n")
+    try:
+        import infrabuild_version_manager as _vm
+        _active_infra_ints = _vm.enumerate_active_infra_ints()
+        if _active_infra_ints and PIPELINE_CONFIG.infra_version not in ('Build_New', None):
+            print(f"  Active infra ints: {_active_infra_ints}")
+            _derived = _vm.resolve_or_build(
+                PIPELINE_CONFIG.infra_version, _active_infra_ints,
+            )
+            if _derived != PIPELINE_CONFIG.infra_version:
+                print(f"  Pipeline infra version: '{PIPELINE_CONFIG.infra_version}'"
+                      f" → '{_derived}'")
+                PIPELINE_CONFIG.infra_version = _derived
+        else:
+            print("  No active infra ints — base infra version retained.")
+    except Exception as _exc:
+        print(f"  WARNING: derived version resolution failed: {_exc}")
+        print("  Continuing with base infra version.")
 
     # ── Step 1.4: Services version check ─────────────────────────────────────
     print("\n--- Step 1.4: Services Version ---\n")
@@ -440,23 +446,29 @@ def phase_3a_infrastructure(runtimes: dict) -> None:
     base_name = f'Base_{settings.CATCHMENT_CANTON_ABBREV}'
     infra_v   = PIPELINE_CONFIG.infra_version  # resolved by Phase 1
 
-    # ── Step 3A.1: Base network ───────────────────────────────────────────────
-    print("--- Step 3A.1: Base Network ---\n")
-    if paths.infra_version_exists(base_name):
-        print(f"  Base network '{base_name}' found — skipping build.")
-    else:
-        print(f"  '{base_name}' not found — building macroscopic Base "
-              f"from '{settings.INFRA_RAW_VERSION}' ...")
-        from infrabuild_network_builder import run_build_base
-        raw_dir = paths.get_infra_raw_dir(settings.INFRA_RAW_VERSION)
-        out_dir = paths.get_infra_version_dir(base_name)
-        run_build_base(raw_dir=raw_dir, output_dir=out_dir)
-        print(f"  Base network built → {out_dir}")
-    print()
-
-    # ── Step 3A.2: Infrastructure version ─────────────────────────────────────
-    print("--- Step 3A.2: Infrastructure Version ---\n")
+    # ── Steps 3A.1 + 3A.2: Base network and infrastructure version ───────────
     if settings.INFRA_VERSION == 'Build_New':
+        # 3A.1 — always rebuild Base, seeded from INFRA_BUILD_NEW_NAME year
+        print("--- Step 3A.1: Base Network ---\n")
+        from infrabuild_network_builder import run_build_base
+        import re as _re_seed
+        _m = _re_seed.search(r'(20\d{2})', settings.INFRA_BUILD_NEW_NAME)
+        _seed_year = _m.group(1) if _m else None
+        if _seed_year:
+            print(f"  INFRA_VERSION=Build_New — rebuilding '{base_name}' "
+                  f"with seed year '{_seed_year}' (from INFRA_BUILD_NEW_NAME).")
+        else:
+            print(f"  INFRA_VERSION=Build_New — rebuilding '{base_name}' "
+                  f"(no year detected in INFRA_BUILD_NEW_NAME='{settings.INFRA_BUILD_NEW_NAME}').")
+        run_build_base(
+            raw_dir=paths.get_infra_raw_dir(settings.INFRA_RAW_VERSION),
+            output_dir=paths.get_infra_version_dir(base_name),
+            seed_year=_seed_year,
+        )
+        print(f"  Base network built → {paths.get_infra_version_dir(base_name)}\n")
+
+        # 3A.2 — open version manager to create the named version
+        print("--- Step 3A.2: Infrastructure Version ---\n")
         print(f"  Opening Infrastructure Version Manager to create '{infra_v}'.")
         print(f"  ┌─ INSTRUCTIONS ──────────────────────────────────────────────────")
         print(f"  │  Create from '{base_name}' or copy an existing named version.")
@@ -474,13 +486,13 @@ def phase_3a_infrastructure(runtimes: dict) -> None:
             print(f"  Ensure you saved before closing (Phase 3 → Save and close).")
         else:
             print(f"  Infrastructure version '{infra_v}' created successfully.")
+
     else:
-        if paths.infra_version_exists(infra_v):
-            print(f"  Infrastructure version '{infra_v}' found on disk.")
-        else:
-            print(f"  ERROR: Infrastructure version '{infra_v}' not found.")
-            print(f"  Phase 1 should have caught this — re-run from Phase 1.")
-            raise SystemExit("Aborted: infrastructure version not found in Phase 3A.")
+        # Named version exists (guaranteed by Phase 1) — base check not needed
+        print("--- Step 3A.1: Base Network ---\n")
+        print(f"  Infrastructure version '{infra_v}' already exists — base check skipped.\n")
+        print("--- Step 3A.2: Infrastructure Version ---\n")
+        print(f"  Infrastructure version '{infra_v}' found on disk.")
     print()
 
     # ── Step 3A.3: Pre-enhancement network visualisation ──────────────────────
@@ -941,6 +953,259 @@ def phase_3b_services(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Phase 3C -Capacity Analysis
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def phase_3c_capacity(
+    sa_boundary,
+    ca_boundary,
+    runtimes: dict,
+) -> None:
+    """Capacity analysis: sectioning, capacity calculation, and Phase 4 interventions.
+
+    Reads PIPELINE_CONFIG.infra_version and PIPELINE_CONFIG.svc_version (resolved by
+    Phases 3A/3B). Branches on settings.CAPACITY_MODE:
+      'None'      → skip entirely
+      'Set_Value' → sectioning + fixed CAPACITY_SET_VALUE × track_count + Phase 4
+      'Dynamic'   → full iterative capacity formula + Phase 4
+
+    Args:
+        sa_boundary: Study area polygon (Shapely) — reserved for future plot clipping.
+        ca_boundary: Catchment area polygon (Shapely) — reserved for future plot clipping.
+        runtimes:    Dict tracking phase execution times.
+    """
+    print("\n" + "=" * 80)
+    print("PHASE 3C: CAPACITY ANALYSIS")
+    print("=" * 80 + "\n")
+    st = time.time()
+
+    # ── Step 3C.0: Mode check ─────────────────────────────────────────────────
+    print("--- Step 3C.0: Mode Check ---\n")
+    cap_mode = settings.CAPACITY_MODE
+    if cap_mode == 'None':
+        print(f"  CAPACITY_MODE = 'None' — skipping Phase 3C.")
+        return
+
+    print(f"  CAPACITY_MODE = '{cap_mode}'")
+
+    # ── Resolve infra and service versions ────────────────────────────────────
+    infra_v = PIPELINE_CONFIG.infra_version
+    svc_v   = PIPELINE_CONFIG.svc_version
+
+    if infra_v is None:
+        print("  WARNING: PIPELINE_CONFIG.infra_version not set (Phase 1 may not have run).")
+        infra_v = settings.INFRA_VERSION
+        if infra_v == 'Build_New':
+            infra_v = settings.INFRA_BUILD_NEW_NAME
+    if svc_v is None:
+        print("  WARNING: PIPELINE_CONFIG.svc_version not set (Phase 1 may not have run).")
+        svc_v = settings.SVC_VERSION
+        if svc_v == 'Build_New':
+            svc_v = settings.SVC_BUILD_NEW_NAME
+
+    import re as _re
+    _safe = lambda s: _re.sub(r'[^\w-]+', '_', str(s)).strip('_')
+    network_label = f"{_safe(svc_v)}_{_safe(infra_v)}"
+
+    print(f"  Infra version : {infra_v}")
+    print(f"  Svc version   : {svc_v}")
+    print(f"  Network label : {network_label}\n")
+
+    # ── Step 3C.1: Build capacity tables (scope-aware) ───────────────────────
+    print("--- Step 3C.1: Build Capacity Tables ---\n")
+    from capacity_calculator import (
+        build_capacity_tables_sa, build_capacity_tables_ca,
+        _build_sections_dataframe, CAPACITY_ROOT,
+    )
+    from pathlib import Path as _Path
+
+    _scope = getattr(settings, 'CAPACITY_SCOPE', 'CA')
+    _cap_mode_sa = getattr(settings, 'CAPACITY_MODE_SA', cap_mode)
+    _cap_mode_ca = getattr(settings, 'CAPACITY_MODE_CA', cap_mode)
+    _grp_strat   = PIPELINE_CONFIG.grouping_strategy
+    _sa_node_set = None
+
+    print(f"  Capacity scope: {_scope}\n")
+
+    if _scope == 'SA':
+        stations_peak, segments_peak, stations_offpeak, segments_offpeak, \
+        junction_numbers, _sa_node_set = \
+            build_capacity_tables_sa(infra_v, svc_v, network_label + '_sa',
+                                     output_dir=_Path(CAPACITY_ROOT) / infra_v / svc_v)
+    else:  # 'CA'
+        stations_peak, segments_peak, stations_offpeak, segments_offpeak, \
+        junction_numbers, _, _sa_node_set = \
+            build_capacity_tables_ca(infra_v, svc_v, network_label + '_ca',
+                                     output_dir=_Path(CAPACITY_ROOT) / infra_v / svc_v)
+
+    print(f"  Peak   : {len(stations_peak)} stations, {len(segments_peak)} segments")
+    print(f"  Off-peak: {len(stations_offpeak)} stations, {len(segments_offpeak)} segments\n")
+
+    # ── Step 3C.2: Sectioning ─────────────────────────────────────────────────
+    print("--- Step 3C.2: Sectioning ---\n")
+
+    # Determine whether to run UIC formulas and for which sections.
+    # SA scope: compute_capacity driven by CAPACITY_MODE_SA setting.
+    # CA scope: pass sa_node_set so UIC runs only for SA sections when modes differ.
+    if _scope == 'SA':
+        _compute_cap = (_cap_mode_sa == 'Dynamic')
+        _sec_sa_set  = None
+    else:  # CA
+        _modes_same  = (_cap_mode_sa == _cap_mode_ca)
+        _compute_cap = True
+        _sec_sa_set  = None if _modes_same else _sa_node_set
+        if _modes_same and _cap_mode_sa == 'Set_Value':
+            _compute_cap = False
+
+    sections_df = _build_sections_dataframe(
+        stations_peak,
+        segments_peak,
+        junction_numbers=junction_numbers,
+        segments_offpeak_df=segments_offpeak,
+        compute_capacity=_compute_cap,
+        sa_node_set=_sec_sa_set,
+        grouping_strategy=_grp_strat,
+    )
+    if sections_df.empty:
+        print("  WARNING: No sections identified. Check that the projected services file "
+              "and infra version are compatible.")
+        runtimes["Phase 3C: Capacity Analysis"] = time.time() - st
+        return
+
+    print(f"  Sections identified: {len(sections_df)}\n")
+
+    # ── Step 3C.3: Apply capacity methods per scope ───────────────────────────
+    print("--- Step 3C.3: Capacity Assignment ---\n")
+    _cap_val = settings.CAPACITY_SET_VALUE
+
+    def _apply_set_value(df, mask, val):
+        df.loc[mask, 'Capacity_peak']       = df.loc[mask, 'track_count'] * val
+        df.loc[mask, 'Capacity_offpeak']    = df.loc[mask, 'track_count'] * val
+        df.loc[mask, 'Utilization_peak']    = (
+            df.loc[mask, 'total_tphpd_peak'] / df.loc[mask, 'Capacity_peak']
+        ).where(df.loc[mask, 'Capacity_peak'] > 0)
+        df.loc[mask, 'Utilization_offpeak'] = (
+            df.loc[mask, 'total_tphpd_offpeak'] / df.loc[mask, 'Capacity_offpeak']
+        ).where(df.loc[mask, 'Capacity_offpeak'] > 0)
+
+    if _scope == 'SA':
+        if _cap_mode_sa == 'Set_Value':
+            _apply_set_value(sections_df, sections_df.index, _cap_val)
+            print(f"  [SA] Set_Value {_cap_val} tphpd/track — all {len(sections_df)} sections.")
+        else:
+            _n = int(sections_df['Capacity_peak'].notna().sum())
+            print(f"  [SA] Dynamic — {_n}/{len(sections_df)} sections have capacity.")
+
+    else:  # CA
+        if _modes_same:
+            if _cap_mode_sa == 'Set_Value':
+                _apply_set_value(sections_df, sections_df.index, _cap_val)
+                print(f"  [CA] Set_Value {_cap_val} tphpd/track — all {len(sections_df)} sections.")
+            else:
+                _n = int(sections_df['Capacity_peak'].notna().sum())
+                print(f"  [CA] Dynamic — {_n}/{len(sections_df)} sections have capacity.")
+        else:
+            # Mixed: SA=Dynamic (filled), CA=Set_Value (NaN from skipped UIC)
+            _ca_mask = sections_df['Capacity_peak'].isna()
+            _apply_set_value(sections_df, _ca_mask, _cap_val)
+            print(f"  [CA] SA sections (Dynamic): {int((~_ca_mask).sum())}  "
+                  f"CA sections (Set_Value {_cap_val}): {int(_ca_mask.sum())}")
+
+    # ── Step 3C.4: Write sections workbook ────────────────────────────────────
+    print("--- Step 3C.4: Sections Workbook ---\n")
+    _safe_label  = _re.sub(r'[^\w-]+', '_', network_label).strip('_')
+    if _scope == 'CA':
+        _safe_label = _safe_label + '_ca'
+    sections_dir = _Path(CAPACITY_ROOT) / infra_v / svc_v
+    sections_dir.mkdir(parents=True, exist_ok=True)
+    sections_path = sections_dir / f'sections_{_safe_label}.xlsx'
+
+    import openpyxl as _openpyxl  # noqa: F401
+    with pd.ExcelWriter(sections_path, engine='openpyxl') as _w:
+        stations_peak.to_excel(_w,    sheet_name='Stations_Peak',    index=False)
+        segments_peak.to_excel(_w,    sheet_name='Segments_Peak',    index=False)
+        stations_offpeak.to_excel(_w, sheet_name='Stations_Offpeak', index=False)
+        segments_offpeak.to_excel(_w, sheet_name='Segments_Offpeak', index=False)
+        sections_df.to_excel(_w,      sheet_name='Sections',         index=False)
+    print(f"  Sections workbook → {sections_path}\n")
+
+    # ── Step 3C.5: Phase 4 interventions ─────────────────────────────────────
+    print("--- Step 3C.5: Phase 4 Capacity Interventions ---\n")
+    try:
+        from capacity_interventions import run_phase_four
+
+        # Adapt sections_df to old column names expected by run_phase_four
+        _sec_adapted = sections_df.copy()
+        for _src, _dst in [
+            ('Capacity_peak',      'Capacity'),
+            ('Utilization_peak',   'Utilization'),
+            ('total_tphpd_peak',   'total_tphpd'),
+            ('stopping_tphpd_peak','stopping_tphpd'),
+            ('passing_tphpd_peak', 'passing_tphpd'),
+        ]:
+            if _src in _sec_adapted.columns and _dst not in _sec_adapted.columns:
+                _sec_adapted[_dst] = _sec_adapted[_src]
+
+        # Adapt segments/stations to old column names
+        _segs_adapted = segments_peak.copy()
+        _sta_adapted  = stations_peak.copy()
+        for _s, _d in [('Num_Tracks','tracks'), ('Length','length_m'),
+                        ('TT_Stopping','travel_time_stopping'), ('TT_Passing','travel_time_passing'),
+                        ('Average_Speed','speed')]:
+            if _s in _segs_adapted.columns and _d not in _segs_adapted.columns:
+                _segs_adapted[_d] = _segs_adapted[_s]
+        for _s, _d in [('Track_Count','tracks'), ('Platform_Count','platforms'),
+                        ('Name','NAME'), ('Code','CODE'), ('E_LV95','E_LV95'), ('N_LV95','N_LV95')]:
+            if _s in _sta_adapted.columns and _d not in _sta_adapted.columns:
+                _sta_adapted[_d] = _sta_adapted[_s]
+
+        # capacity workbook as prep path (best-effort; full rework deferred)
+        _cap_workbook = sections_dir / f'capacity_{_safe_label}.xlsx'
+        _enh_dir = sections_dir / 'enhanced'
+        _enh_dir.mkdir(parents=True, exist_ok=True)
+
+        _interventions, _enh_prep_path, _final_sections = run_phase_four(
+            original_sections_df=_sec_adapted,
+            original_segments_df=_segs_adapted,
+            original_stations_df=_sta_adapted,
+            prep_workbook_path=_cap_workbook,
+            output_dir=_enh_dir,
+            network_label=network_label,
+            threshold_tphpd=settings.capacity_threshold,
+            max_iterations=settings.max_enhancement_iterations,
+        )
+        print(f"  Phase 4 complete: {len(_interventions)} intervention(s) designed.\n")
+    except Exception as _e:
+        print(f"  WARNING: Phase 4 interventions could not complete: {_e}")
+        print(f"  Full interventions rework is deferred to a future workflow.\n")
+
+    # ── Step 3C.6: Plots ──────────────────────────────────────────────────────
+    print("--- Step 3C.6: Capacity Plots ---\n")
+    if not settings.PLOT_CAPACITY:
+        print("  PLOT_CAPACITY = False — skipping capacity plots.\n")
+    else:
+        try:
+            from capacity_network_plots import plot_capacity_network
+            from pathlib import Path as _Path
+            import paths as _paths
+            _plots_dir = _Path(_paths.MAIN) / _paths.CAPACITY_PLOTS_DIR / infra_v / svc_v
+            _plots_dir.mkdir(parents=True, exist_ok=True)
+            _plot_paths = plot_capacity_network(
+                workbook_path=str(sections_path),
+                sections_workbook_path=str(sections_path),
+                generate_network=True,
+                network_label=network_label,
+                infra_version=infra_v,
+                output_dir=_plots_dir,
+            )
+            print(f"  Plots written: {_plot_paths}\n")
+        except Exception as _e:
+            print(f"  WARNING: Capacity plots could not be generated: {_e}\n")
+
+    runtimes["Phase 3C: Capacity Analysis"] = time.time() - st
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Runtime writer
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -967,68 +1232,26 @@ def _save_runtimes(runtimes: dict, filename: str) -> None:
 # Main orchestrator
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _should_run(phase: str) -> bool:
-    """Return True if this phase should execute given RUN_MODE."""
-    if RUN_MODE == 'all':
-        return True
-    return phase in RUN_MODE
-
-
 def infrascanrail_new():
-    """New InfraScanRail pipeline orchestrator.
-
-    Runs all phases or a subset defined by RUN_MODE at the top of this file.
-    Each phase function can also be called directly for isolated debugging:
-        phase_1_initialisation(runtimes)
-        phase_2_data_preparation(sa_boundary, sa_buffer, ca_boundary, ca_buffer, runtimes)
-    """
+    """New InfraScanRail pipeline orchestrator. Runs all phases in sequence."""
     os.chdir(paths.MAIN)
     warnings.filterwarnings("ignore")
     runtimes = {}
 
-    sa_boundary = sa_buffer = ca_boundary = ca_buffer = None
+    sa_boundary, sa_buffer, ca_boundary, ca_buffer = phase_1_initialisation(runtimes)
+    phase_2_data_preparation(sa_boundary, sa_buffer, ca_boundary, ca_buffer, runtimes)
+    phase_3a_infrastructure(runtimes)
+    phase_3b_services(sa_boundary, ca_boundary, runtimes)
+    phase_3c_capacity(sa_boundary, ca_boundary, runtimes)
 
-    # Phase 1: Initialisation
-    if _should_run('1'):
-        sa_boundary, sa_buffer, ca_boundary, ca_buffer = phase_1_initialisation(runtimes)
-    else:
-        # Load area geometries from disk so later phases have them available
-        _sa  = gpd.read_file(os.path.join(paths.MAIN, paths.STUDY_AREA_BOUNDARY_GPKG))
-        _sab = gpd.read_file(os.path.join(paths.MAIN, paths.STUDY_AREA_BUFFER_GPKG))
-        _ca  = gpd.read_file(os.path.join(paths.MAIN, paths.CATCHMENT_AREA_BOUNDARY_GPKG))
-        _cab = gpd.read_file(os.path.join(paths.MAIN, paths.CATCHMENT_AREA_BUFFER_GPKG))
-        sa_boundary = _sa.geometry.iloc[0]
-        sa_buffer   = _sab.geometry.iloc[0]
-        ca_boundary = _ca.geometry.iloc[0]
-        ca_buffer   = _cab.geometry.iloc[0]
-
-    # Phase 2: Data Preparation
-    if _should_run('2'):
-        phase_2_data_preparation(sa_boundary, sa_buffer, ca_boundary, ca_buffer, runtimes)
-
-    # Phase 3A: Infrastructure Network Building
-    if _should_run('3A'):
-        phase_3a_infrastructure(runtimes)
-
-    # Phase 3B: Services Network Building
-    if _should_run('3B'):
-        phase_3b_services(sa_boundary, ca_boundary, runtimes)
-
-    # Phase 3C: Capacity Analysis                (Workflow 3 - not yet implemented)
-    # if _should_run('3C'):
-    #     phase_3c_capacity(runtimes)
-
-    if runtimes:
-        _save_runtimes(runtimes, 'report_new.txt')
+    _save_runtimes(runtimes, 'report_new.txt')
 
     print("\n" + "=" * 80)
-    phases_run = RUN_MODE if RUN_MODE == 'all' else ', '.join(RUN_MODE)
-    print(f"PIPELINE COMPLETE  (phases: {phases_run})")
+    print("PIPELINE COMPLETE")
     print("=" * 80)
-    if runtimes:
-        total = sum(runtimes.values())
-        print(f"\nTotal runtime: {int(total // 60)}m {int(total % 60)}s")
-        print(f"Runtimes saved to: report_new.txt")
+    total = sum(runtimes.values())
+    print(f"\nTotal runtime: {int(total // 60)}m {int(total % 60)}s")
+    print(f"Runtimes saved to: report_new.txt")
     print()
 
 
