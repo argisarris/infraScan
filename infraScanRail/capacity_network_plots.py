@@ -466,6 +466,7 @@ class SectionSummary:
     utilization: float
     stopping_tphpd: float
     passing_tphpd: float
+    intermediate_stations: Tuple[Station, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -704,7 +705,42 @@ def _segment_key(from_node: int, to_node: int) -> Tuple[int, int]:
     return tuple(sorted((from_node, to_node)))
 
 
-_SERVICE_WARNING_EMITTED: Set[str] = set()
+_ASYMMETRIC_SERVICES: Set[str] = set()
+
+
+def _polyline_midpoint(xs: Sequence[float], ys: Sequence[float]) -> Tuple[float, float]:
+    """Return the point at half the cumulative arc length along the polyline.
+
+    Used to anchor section labels to the visual centre of the line that runs
+    through intermediate stations, rather than the straight-line midpoint
+    between endpoints (which can be far off the actual route).
+    """
+    if not xs or not ys:
+        return (0.0, 0.0)
+    if len(xs) == 1:
+        return (xs[0], ys[0])
+    seg_lens = [
+        math.hypot(xs[i + 1] - xs[i], ys[i + 1] - ys[i]) for i in range(len(xs) - 1)
+    ]
+    total = sum(seg_lens)
+    if total <= 0.0:
+        return (xs[0], ys[0])
+    target = total / 2.0
+    cum = 0.0
+    for i, seg_len in enumerate(seg_lens):
+        if cum + seg_len >= target:
+            t = (target - cum) / seg_len if seg_len > 0 else 0.0
+            return (xs[i] + t * (xs[i + 1] - xs[i]), ys[i] + t * (ys[i + 1] - ys[i]))
+        cum += seg_len
+    return (xs[-1], ys[-1])
+
+
+def _flush_directional_asymmetry_summary() -> None:
+    """Emit one summary line listing services with asymmetric directional frequency."""
+    if _ASYMMETRIC_SERVICES:
+        services = ", ".join(sorted(_ASYMMETRIC_SERVICES))
+        print(f"Note: Directional frequency asymmetry detected for services: {services} (using max per segment).")
+        _ASYMMETRIC_SERVICES.clear()
 
 
 def _merge_bounds(
@@ -760,13 +796,7 @@ def _parse_service_frequencies(cell: str, segment_label: str) -> Dict[str, float
             continue
         max_freq = max(freq_values)
         if any(abs(value - max_freq) > 1e-6 for value in freq_values):
-            warning_key = f"{segment_label}:{service}"
-            if warning_key not in _SERVICE_WARNING_EMITTED:
-                print(
-                    f"Warning: Directional frequency not homogenous for service '{service}' on segment {segment_label}; "
-                    f"using max value {max_freq}."
-                )
-                _SERVICE_WARNING_EMITTED.add(warning_key)
+            _ASYMMETRIC_SERVICES.add(service)
         result[service] = max_freq
     return result
 
@@ -1073,6 +1103,22 @@ def _load_capacity_sections(
             getattr(row, "passing_tphpd_peak", None) or getattr(row, "passing_tphpd", math.nan)
         )
 
+        # Intermediate stations along the section (between start and end), used
+        # to route the line through real station geometry and to render faded
+        # markers for stops that do not act as section boundaries.
+        node_seq_raw = str(getattr(row, "node_sequence", "") or "")
+        intermediate: List[Station] = []
+        if node_seq_raw:
+            tokens = [tok.strip() for tok in node_seq_raw.split("->") if tok.strip()]
+            try:
+                path_ids = [int(tok) for tok in tokens]
+            except ValueError:
+                path_ids = []
+            for nid in path_ids[1:-1]:
+                station = station_records.get(nid)
+                if station is not None:
+                    intermediate.append(station)
+
         sections.append(
             SectionSummary(
                 section_id=section_id,
@@ -1084,6 +1130,7 @@ def _load_capacity_sections(
                 utilization=utilization,
                 stopping_tphpd=stopping_tphpd,
                 passing_tphpd=passing_tphpd,
+                intermediate_stations=tuple(intermediate),
             )
         )
 
@@ -2107,9 +2154,12 @@ def _draw_capacity_map(
     extent_min_y = math.inf
     extent_max_y = -math.inf
 
-    # Separate regular and junction scatter points for different marker sizes.
+    # Separate regular, junction, and intermediate scatter points for different
+    # marker sizes. Intermediate stations are stops that fall inside a section
+    # (not at its endpoints) — they get a faded marker.
     regular_points: Dict[int, Tuple[float, float]] = {}
     junction_points: Dict[int, Tuple[float, float]] = {}
+    intermediate_points: Dict[int, Tuple[float, float]] = {}
     track_categories: Set[str] = set()
 
     for section in sections:
@@ -2120,6 +2170,12 @@ def _draw_capacity_map(
         for station in (start, end):
             target = junction_points if station.is_junction else regular_points
             target[station.node_id] = (station.x, station.y)
+        # Intermediate junctions still drive the polyline geometry, but are
+        # not rendered as markers — only real stations get a faded dot.
+        for station in section.intermediate_stations:
+            if station.is_junction:
+                continue
+            intermediate_points[station.node_id] = (station.x, station.y)
 
         util_value = section.utilization
         track_categories.add(_segment_track_category(section.track_count))
@@ -2135,9 +2191,14 @@ def _draw_capacity_map(
         # Cap line width at 2-track maximum for capacity plot
         capped_track_count = min(section.track_count, 2.0) if not math.isnan(section.track_count) else section.track_count
 
-        xs, ys = (start.x, end.x), (start.y, end.y)
-        mid_x = (start.x + end.x) / 2.0
-        mid_y = (start.y + end.y) / 2.0
+        # Route the section polyline through intermediate stations when present
+        # to approximate the real track geometry. Label anchor follows the
+        # polyline midpoint (by arc length) so utilisation/info boxes stay
+        # near the centre of the rendered line, not the straight start↔end line.
+        path_stations = [start, *section.intermediate_stations, end]
+        xs = [s.x for s in path_stations]
+        ys = [s.y for s in path_stations]
+        mid_x, mid_y = _polyline_midpoint(xs, ys)
 
         ax.plot(
             xs,
@@ -2252,6 +2313,16 @@ def _draw_capacity_map(
         extent_max_x = max(extent_max_x, d_max_x)
         extent_min_y = min(extent_min_y, d_min_y)
         extent_max_y = max(extent_max_y, d_max_y)
+
+    # Intermediate-only stations are those that never act as a section endpoint;
+    # render them faded so users can see which stops a section passes through
+    # without offering passing opportunities.
+    for nid in list(intermediate_points.keys()):
+        if nid in regular_points or nid in junction_points:
+            del intermediate_points[nid]
+    if intermediate_points:
+        ixs, iys = zip(*intermediate_points.values())
+        ax.scatter(ixs, iys, s=45, c="#bbbbbb", edgecolors="white", linewidths=0.4, alpha=0.6, zorder=4)
 
     if regular_points:
         rxs, rys = zip(*regular_points.values())
@@ -3089,6 +3160,7 @@ def plot_capacity_network(
             plt.close(base_fig)
         plt.close(capacity_fig)
 
+    _flush_directional_asymmetry_summary()
     return base_output, capacity_output
 
 
@@ -3273,6 +3345,7 @@ def plot_service_network(
     else:
         plt.close(fig)
 
+    _flush_directional_asymmetry_summary()
     return service_output
 
 

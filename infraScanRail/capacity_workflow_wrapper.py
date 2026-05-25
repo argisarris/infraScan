@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 import paths
@@ -96,6 +97,27 @@ def _existing_sections(infra_version: str, svc_version: str, label: str) -> Opti
 
 def _safe(*parts: str) -> str:
     return re.sub(r"[^\w-]+", "_", "_".join(parts)).strip("_")
+
+
+def _floor_capacity_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Cast capacity columns to nullable Int64 (floor any fractional value).
+
+    Covers the selected Capacity_peak / Capacity_offpeak as well as the
+    diagnostic per-strategy columns (capacity_single_track_tphpd, capacity_good_tphpd,
+    etc.). Fractional tphpd values do not make physical sense (you cannot run
+    half a train), so we round down conservatively. pd.NA is used for sections
+    that have no computed capacity.
+    """
+    capacity_cols = [
+        col for col in df.columns
+        if col in ("Capacity_peak", "Capacity_offpeak")
+        or (col.startswith("capacity_") and col.endswith("_tphpd"))
+    ]
+    for col in capacity_cols:
+        df[col] = df[col].apply(
+            lambda x: pd.NA if pd.isna(x) else int(np.floor(x))
+        ).astype("Int64")
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -264,8 +286,9 @@ def _execute_capacity_run(
 
         if capacity_mode == "Set_Value":
             cap_val = set_value if set_value is not None else settings.CAPACITY_SET_VALUE
-            sections_df["Capacity_peak"]       = sections_df["track_count"] * cap_val
-            sections_df["Capacity_offpeak"]    = sections_df["track_count"] * cap_val
+            capacity = np.floor(sections_df["track_count"] * cap_val)
+            sections_df["Capacity_peak"]       = capacity
+            sections_df["Capacity_offpeak"]    = capacity
             sections_df["Utilization_peak"]    = (
                 sections_df["total_tphpd_peak"] / sections_df["Capacity_peak"]
             ).where(sections_df["Capacity_peak"] > 0)
@@ -277,6 +300,7 @@ def _execute_capacity_run(
             n_with = int(sections_df["Capacity_peak"].notna().sum())
             print(f"  {n_with}/{len(sections_df)} sections have calculated peak capacity.")
 
+        _floor_capacity_columns(sections_df)
         with pd.ExcelWriter(sections_path, engine=EXCEL_ENGINE) as writer:
             stations_peak.to_excel(writer,    sheet_name="Stations_Peak",    index=False)
             segments_peak.to_excel(writer,    sheet_name="Segments_Peak",    index=False)
@@ -427,8 +451,9 @@ def run_study_area_workflow(
             return 1
 
         if cap_mode == "Set_Value":
-            sections_df["Capacity_peak"]       = sections_df["track_count"] * cap_val
-            sections_df["Capacity_offpeak"]    = sections_df["track_count"] * cap_val
+            capacity = np.floor(sections_df["track_count"] * cap_val)
+            sections_df["Capacity_peak"]       = capacity
+            sections_df["Capacity_offpeak"]    = capacity
             sections_df["Utilization_peak"]    = (
                 sections_df["total_tphpd_peak"] / sections_df["Capacity_peak"]
             ).where(sections_df["Capacity_peak"] > 0)
@@ -440,6 +465,7 @@ def run_study_area_workflow(
             n_with = int(sections_df["Capacity_peak"].notna().sum())
             print(f"  {n_with}/{len(sections_df)} sections have Dynamic capacity.")
 
+        _floor_capacity_columns(sections_df)
         with pd.ExcelWriter(sections_path, engine=EXCEL_ENGINE) as writer:
             stations_peak.to_excel(writer,    sheet_name="Stations_Peak",    index=False)
             segments_peak.to_excel(writer,    sheet_name="Segments_Peak",    index=False)
@@ -562,8 +588,9 @@ def run_catchment_area_workflow(
             )
             if not sections_df.empty and cap_mode_sa == "Set_Value":
                 cap_val = cap_val_sa
-                sections_df["Capacity_peak"]       = sections_df["track_count"] * cap_val
-                sections_df["Capacity_offpeak"]    = sections_df["track_count"] * cap_val
+                capacity = np.floor(sections_df["track_count"] * cap_val)
+                sections_df["Capacity_peak"]       = capacity
+                sections_df["Capacity_offpeak"]    = capacity
                 sections_df["Utilization_peak"]    = (
                     sections_df["total_tphpd_peak"] / sections_df["Capacity_peak"]
                 ).where(sections_df["Capacity_peak"] > 0)
@@ -590,12 +617,9 @@ def run_catchment_area_workflow(
                 n_sa  = int((~ca_mask).sum())
                 n_ca  = int(ca_mask.sum())
                 if ca_mask.any():
-                    sections_df.loc[ca_mask, "Capacity_peak"]       = (
-                        sections_df.loc[ca_mask, "track_count"] * cap_val_ca
-                    )
-                    sections_df.loc[ca_mask, "Capacity_offpeak"]    = (
-                        sections_df.loc[ca_mask, "track_count"] * cap_val_ca
-                    )
+                    ca_capacity = np.floor(sections_df.loc[ca_mask, "track_count"] * cap_val_ca)
+                    sections_df.loc[ca_mask, "Capacity_peak"]    = ca_capacity
+                    sections_df.loc[ca_mask, "Capacity_offpeak"] = ca_capacity
                     sections_df.loc[ca_mask, "Utilization_peak"]    = (
                         sections_df.loc[ca_mask, "total_tphpd_peak"]
                         / sections_df.loc[ca_mask, "Capacity_peak"]
@@ -610,6 +634,7 @@ def run_catchment_area_workflow(
             print("  WARNING: No sections produced. Check infra/service data.")
             return 1
 
+        _floor_capacity_columns(sections_df)
         with pd.ExcelWriter(sections_path, engine=EXCEL_ENGINE) as writer:
             stations_peak.to_excel(writer,    sheet_name="Stations_Peak",    index=False)
             segments_peak.to_excel(writer,    sheet_name="Segments_Peak",    index=False)

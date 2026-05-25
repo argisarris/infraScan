@@ -64,7 +64,7 @@ INFRA_RAW_VERSION   = 'Raw_ZH'             # infrabuild_filter_network output: d
 # 'AS_2035_ZH_enhanced' — AS_2035_ZH enriched with projected svc travel times and corrections
 INFRA_VERSION = 'Build_New'
 
-INFRA_BUILD_NEW_NAME = 'AS_2026_ZH'        # name for the new version — used only when INFRA_VERSION = 'Build_New'
+INFRA_BUILD_NEW_NAME = 'AS_2035_ZH'        # name for the new version — used only when INFRA_VERSION = 'Build_New'
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 4. SERVICES VERSION
@@ -78,9 +78,9 @@ GTFS_FILTER_VERSION = 'GTFS_SVC2026_ZH'        # services_filter_gtfs output: da
 # 'AK_2026_S18' — AK_2026 with S18 line included
 # 'AK_2035'     — scheduled services as of 2035 timetable
 # 'AK_2035_S18' — AK_2035 with S18 line included
-SVC_VERSION = 'AK_2026'
+SVC_VERSION = 'AK_2035_S18'
 
-SVC_BUILD_NEW_NAME = 'AK_2026'                 # name for the new version — used only when SVC_VERSION = 'Build_New'
+SVC_BUILD_NEW_NAME = 'AK_2035_S18'                 # name for the new version — used only when SVC_VERSION = 'Build_New'
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 5. CAPACITY
@@ -89,25 +89,25 @@ SVC_BUILD_NEW_NAME = 'AK_2026'                 # name for the new version — us
 # 'None'      — skip capacity phases entirely
 # 'Set_Value' — apply a fixed trains/hour/direction threshold to all sections
 # 'Dynamic'   — full iterative capacity calculator workflow (capacity_workflow_wrapper.py)
-CAPACITY_MODE = 'None'
+CAPACITY_MODE = 'Dynamic'
 
 # Spatial scope for capacity analysis (used by main_new.py Phase 3C and capacity_workflow_wrapper.py)
 # 'SA' — Study Area only: infra/services filtered to nodes within the study area
 # 'CA' — Catchment Area: infra/services filtered to nodes within the catchment area boundary
-CAPACITY_SCOPE = 'SA'
+CAPACITY_SCOPE = 'CA'
 
 # Capacity method per spatial scope — used when CAPACITY_SCOPE = 'SA' or 'CA'
 # SA method must be the same or more precise than CA method.
 # Valid combinations: both Dynamic | SA Dynamic + CA Set_Value | both Set_Value
 CAPACITY_MODE_SA = 'Dynamic'    # method applied to Study Area sections
-CAPACITY_MODE_CA = 'Set_Value'  # method applied to Catchment Area sections outside the SA
+CAPACITY_MODE_CA = 'Dynamic'  # method applied to Catchment Area sections outside the SA
 
 # Capacity grouping strategy — controls automated decisions in the capacity workflow
 # 'manual'       — prompt for each capacity grouping decision
 # 'conservative' — always choose the lowest capacity option
 # 'baseline'     — always choose the middle option
 # 'optimal'      — always choose the highest capacity option
-CAPACITY_GROUPING_STRATEGY = 'manual'
+CAPACITY_GROUPING_STRATEGY = 'baseline'
 
 CAPACITY_SET_VALUE = 6             # trains/hour/direction — used when CAPACITY_MODE = 'Set_Value'
 capacity_threshold = 2.0           # minimum available capacity (tphpd) — Dynamic only
@@ -147,7 +147,7 @@ only_demand_from_to_perimeter = True
 OD_TYPE = 'canton_ZH'
 
 # Base year for the population/employment grids, OD matrices, and scenario scaling
-POPULATION_BASE_YEAR = 2023
+POPULATION_BASE_YEAR = 2035
 
 # OD scaling weights — control how population and employment growth are blended when computing per-commune OD growth factors.
 # OD_SCALING_EMPL_WEIGHT = 0.0 because employment is derived from population (empl scales with pop), so adding employment weight changes nothing.
@@ -160,8 +160,8 @@ OD_SCALING_EMPL_WEIGHT = 0.0
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # 'GENERATED' — Monte Carlo random scenarios from population growth models
-# 'STATIC_9'  — fixed set of 9 canonical scenarios
-# 'dummy'     — minimal placeholder scenarios for testing
+# 'STATIC_9'  — Fixed set of 9 canonical scenarios
+# 'dummy'     — Minimal placeholder scenarios for testing
 scenario_type = 'GENERATED'
 
 amount_of_scenarios = 100
@@ -182,9 +182,9 @@ VISUALIZATION_MODE = 'manual'
 # Per-pipeline plot toggles — set False to suppress all plots for that pipeline area
 # without changing the global VISUALIZATION_MODE for interactive decisions elsewhere
 PLOT_CATCHMENT = False   # catchment_base population/employment maps (Phase 2)
-PLOT_INFRA     = False    # infrabuild network plots (Phase 3A)
-PLOT_SERVICES  = False   # services pipeline plots (Phase 3B)
-PLOT_CAPACITY  = False   # capacity analysis plots (Phase 3C)
+PLOT_INFRA     = True    # infrabuild network plots (Phase 3A)
+PLOT_SERVICES  = True   # services pipeline plots (Phase 3B)
+PLOT_CAPACITY  = True   # capacity analysis plots (Phase 3C)
 PLOT_RESULTS   = False   # final CBA/result visualisations
 
 plot_passenger_flow = False

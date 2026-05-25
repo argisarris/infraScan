@@ -356,6 +356,7 @@ def load_projected_services(svc_version: str, infra_version: str) -> pd.DataFram
           service, direction_id, from_stop_nr (int), to_stop_nr (int),
           from_stop_name, to_stop_name,
           seg_from_node (int), seg_to_node (int),
+          freq_am_peak (float), freq_pm_peak (float),
           freq_peak (float), freq_offpeak (float),
           is_origin (bool), is_destination (bool)
     """
@@ -387,10 +388,14 @@ def load_projected_services(svc_version: str, infra_version: str) -> pd.DataFram
     print(f"  load_projected_services: {len(raw)} service links from '{svc_version}'"
           f" projected on '{infra_version}' ({len(layers)} layers)")
 
-    # Derive peak and off-peak frequencies (departures/hour per direction)
+    # _freq_am_peak / _freq_pm_peak feed temporal-aware aggregation that avoids
+    # double-counting when AM and PM peaks reverse direction; _freq_peak stays
+    # as max(AM, PM) for the per-service display columns (services_tph(pd)).
     am   = pd.to_numeric(raw["freq_am_peak_dep_hr"],  errors="coerce").fillna(0.0)
     pm   = pd.to_numeric(raw["freq_pm_peak_dep_hr"],  errors="coerce").fillna(0.0)
     offp = pd.to_numeric(raw["freq_offpeak_dep_hr"],  errors="coerce").fillna(0.0)
+    raw["_freq_am_peak"] = am
+    raw["_freq_pm_peak"] = pm
     raw["_freq_peak"]    = am.combine(pm, max)
     raw["_freq_offpeak"] = offp
 
@@ -428,6 +433,8 @@ def load_projected_services(svc_version: str, infra_version: str) -> pd.DataFram
 
         from_stop_name = str(row.get("from_stop_name") or "")
         to_stop_name   = str(row.get("to_stop_name")   or "")
+        freq_am_peak   = float(row["_freq_am_peak"])
+        freq_pm_peak   = float(row["_freq_pm_peak"])
         freq_peak      = float(row["_freq_peak"])
         freq_offpeak   = float(row["_freq_offpeak"])
 
@@ -441,6 +448,8 @@ def load_projected_services(svc_version: str, infra_version: str) -> pd.DataFram
                 "to_stop_name":   to_stop_name,
                 "seg_from_node":  path[i],
                 "seg_to_node":    path[i + 1],
+                "freq_am_peak":   freq_am_peak,
+                "freq_pm_peak":   freq_pm_peak,
                 "freq_peak":      freq_peak,
                 "freq_offpeak":   freq_offpeak,
                 "is_origin":      (i == 0),
@@ -452,7 +461,8 @@ def load_projected_services(svc_version: str, infra_version: str) -> pd.DataFram
         result = pd.DataFrame(columns=[
             "service", "direction_id", "from_stop_nr", "to_stop_nr",
             "from_stop_name", "to_stop_name", "seg_from_node", "seg_to_node",
-            "freq_peak", "freq_offpeak", "is_origin", "is_destination",
+            "freq_am_peak", "freq_pm_peak", "freq_peak", "freq_offpeak",
+            "is_origin", "is_destination",
         ])
     print(f"  load_projected_services: expanded to {len(result)} per-segment rows")
     return result
@@ -623,6 +633,8 @@ def load_projected_services_sa(
     am   = pd.to_numeric(raw["freq_am_peak_dep_hr"], errors="coerce").fillna(0.0)
     pm   = pd.to_numeric(raw["freq_pm_peak_dep_hr"], errors="coerce").fillna(0.0)
     offp = pd.to_numeric(raw["freq_offpeak_dep_hr"], errors="coerce").fillna(0.0)
+    raw["_freq_am_peak"] = am
+    raw["_freq_pm_peak"] = pm
     raw["_freq_peak"]    = am.combine(pm, max)
     raw["_freq_offpeak"] = offp
     raw = raw[(raw["_freq_peak"] > 0) | (raw["_freq_offpeak"] > 0)].reset_index(drop=True)
@@ -670,6 +682,8 @@ def load_projected_services_sa(
 
         from_stop_name  = str(row.get("from_stop_name") or "")
         to_stop_name    = str(row.get("to_stop_name")   or "")
+        freq_am_peak    = float(row["_freq_am_peak"])
+        freq_pm_peak    = float(row["_freq_pm_peak"])
         freq_peak       = float(row["_freq_peak"])
         freq_offpeak    = float(row["_freq_offpeak"])
         true_origin     = (start_idx == 0)
@@ -685,6 +699,8 @@ def load_projected_services_sa(
                 "to_stop_name":   to_stop_name,
                 "seg_from_node":  clipped[i],
                 "seg_to_node":    clipped[i + 1],
+                "freq_am_peak":   freq_am_peak,
+                "freq_pm_peak":   freq_pm_peak,
                 "freq_peak":      freq_peak,
                 "freq_offpeak":   freq_offpeak,
                 "is_origin":      (i == 0 and true_origin),
@@ -696,7 +712,8 @@ def load_projected_services_sa(
         result = pd.DataFrame(columns=[
             "service", "direction_id", "from_stop_nr", "to_stop_nr",
             "from_stop_name", "to_stop_name", "seg_from_node", "seg_to_node",
-            "freq_peak", "freq_offpeak", "is_origin", "is_destination",
+            "freq_am_peak", "freq_pm_peak", "freq_peak", "freq_offpeak",
+            "is_origin", "is_destination",
         ])
     print(f"  load_projected_services_sa: {n_clipped} rows path-clipped, "
           f"expanded to {len(result)} per-segment rows")
@@ -934,6 +951,74 @@ def build_segment_contributions(
 # Aggregation logic
 # ---------------------------------------------------------------------------
 
+def _binding_metrics_from_grouped(
+    am_stop: Dict[str, float],
+    am_pass: Dict[str, float],
+    pm_stop: Dict[str, float],
+    pm_pass: Dict[str, float],
+    has_pm: bool,
+) -> Tuple[float, float, float, float, float, float]:
+    """Derive temporal-aware binding metrics from per-direction frequency sums.
+
+    Each *_stop / *_pass argument maps direction_id → summed frequency at one
+    segment or node within one peak window. For off-peak only AM is supplied
+    (has_pm=False); the PM dicts should be empty.
+
+    Returns (in order):
+        stopping_tph    bidirectional binding throughput for stopping trains
+                        — max(am_stop_total, pm_stop_total).
+        passing_tph     same, for passing trains.
+        total_tph       bidirectional binding throughput counting stop+pass
+                        jointly — max over peak windows of (stop+pass) summed
+                        across directions.
+        stopping_tphpd  binding per-direction load on stopping infrastructure
+                        — max over (peak window × direction).
+        passing_tphpd   same, for passing.
+        total_tphpd     binding per-direction load on shared infrastructure
+                        — max over (peak window × direction) of (stop+pass)
+                        at that bucket.
+
+    Symmetric inputs reproduce the pre-Level-2 numbers exactly; asymmetric
+    inputs replace the old `/2` halving with the binding peak × direction.
+    """
+    am_stop_total = sum(am_stop.values())
+    am_pass_total = sum(am_pass.values())
+    pm_stop_total = sum(pm_stop.values()) if has_pm else 0.0
+    pm_pass_total = sum(pm_pass.values()) if has_pm else 0.0
+
+    if has_pm:
+        stop_tph  = max(am_stop_total, pm_stop_total)
+        pass_tph  = max(am_pass_total, pm_pass_total)
+        total_tph = max(am_stop_total + am_pass_total, pm_stop_total + pm_pass_total)
+    else:
+        stop_tph  = am_stop_total
+        pass_tph  = am_pass_total
+        total_tph = am_stop_total + am_pass_total
+
+    directions = set(am_stop) | set(am_pass) | set(pm_stop) | set(pm_pass)
+    stop_dir_values: List[float] = []
+    pass_dir_values: List[float] = []
+    combined_dir_values: List[float] = []
+    for d in directions:
+        am_s = am_stop.get(d, 0.0)
+        am_p = am_pass.get(d, 0.0)
+        stop_dir_values.append(am_s)
+        pass_dir_values.append(am_p)
+        combined_dir_values.append(am_s + am_p)
+        if has_pm:
+            pm_s = pm_stop.get(d, 0.0)
+            pm_p = pm_pass.get(d, 0.0)
+            stop_dir_values.append(pm_s)
+            pass_dir_values.append(pm_p)
+            combined_dir_values.append(pm_s + pm_p)
+
+    stop_tphpd  = max(stop_dir_values) if stop_dir_values else 0.0
+    pass_tphpd  = max(pass_dir_values) if pass_dir_values else 0.0
+    total_tphpd = max(combined_dir_values) if combined_dir_values else 0.0
+
+    return stop_tph, pass_tph, total_tph, stop_tphpd, pass_tphpd, total_tphpd
+
+
 def aggregate_station_metrics(
     nodes_df: pd.DataFrame,
     service_links_df: pd.DataFrame,
@@ -952,32 +1037,66 @@ def aggregate_station_metrics(
         DataFrame with NR, Name, Code, Node_Class, E_LV95, N_LV95,
         Track_Count, Platform_Count, stopping_tph/tphpd, passing_tph/tphpd,
         stopping_services, passing_services.
+
+    Notes:
+        For 'peak' the AM and PM windows are aggregated independently before
+        being collapsed: tph reports the binding window's bidirectional total
+        and tphpd reports the binding direction in the binding window. This
+        avoids double-counting commuter services that reverse direction
+        between AM and PM. Off-peak is collapsed across its single window.
     """
-    freq_col = "freq_peak" if period == "peak" else "freq_offpeak"
-    active = service_links_df[service_links_df[freq_col] > 0].copy()
+    if period == "peak":
+        am_col = "freq_am_peak"
+        pm_col = "freq_pm_peak"
+        has_pm = True
+        active = service_links_df[
+            (service_links_df[am_col] > 0) | (service_links_df[pm_col] > 0)
+        ].copy()
+    else:
+        am_col = "freq_offpeak"
+        pm_col = None
+        has_pm = False
+        active = service_links_df[service_links_df[am_col] > 0].copy()
 
-    # Stopping: endpoint is an actual GTFS stop and node is not a junction
-    stop_from = active[active["is_origin"]  & ~active["seg_from_node"].isin(junction_numbers)]
-    stop_to   = active[active["is_destination"] & ~active["seg_to_node"].isin(junction_numbers)]
+    junction_set: Set[int] = set(int(j) for j in junction_numbers)
 
-    stopping_by_node = (
-        stop_from.groupby("seg_from_node")[freq_col].sum()
-        .add(stop_to.groupby("seg_to_node")[freq_col].sum(), fill_value=0.0)
-    )
+    stop_from_mask = active["is_origin"] & ~active["seg_from_node"].isin(junction_set)
+    stop_to_mask   = active["is_destination"] & ~active["seg_to_node"].isin(junction_set)
+    pass_from_mask = ~stop_from_mask
+    pass_to_mask   = ~stop_to_mask
 
-    # Passing: endpoint is not a stop for this link, or node is a junction
-    pass_from_mask = (~active["is_origin"])       | active["seg_from_node"].isin(junction_numbers)
-    pass_to_mask   = (~active["is_destination"])  | active["seg_to_node"].isin(junction_numbers)
-    passing_by_node = (
-        active[pass_from_mask].groupby("seg_from_node")[freq_col].sum()
-        .add(active[pass_to_mask].groupby("seg_to_node")[freq_col].sum(), fill_value=0.0)
-    )
+    def _node_contributions(mask_from, mask_to, col: str) -> Dict[int, Dict[str, float]]:
+        sub_from = active.loc[mask_from, ["seg_from_node", "direction_id", col]].rename(
+            columns={"seg_from_node": "node"}
+        )
+        sub_to = active.loc[mask_to, ["seg_to_node", "direction_id", col]].rename(
+            columns={"seg_to_node": "node"}
+        )
+        combined = pd.concat([sub_from, sub_to], ignore_index=True)
+        if combined.empty:
+            return {}
+        combined["node"] = combined["node"].astype(int)
+        combined["direction_id"] = combined["direction_id"].astype(str)
+        grouped = combined.groupby(["node", "direction_id"])[col].sum()
+        result: Dict[int, Dict[str, float]] = defaultdict(dict)
+        for (node, direction), val in grouped.items():
+            result[int(node)][str(direction)] = float(val)
+        return result
 
-    # Collect service names per node
+    am_stop_by_node = _node_contributions(stop_from_mask, stop_to_mask, am_col)
+    am_pass_by_node = _node_contributions(pass_from_mask, pass_to_mask, am_col)
+    if has_pm:
+        pm_stop_by_node = _node_contributions(stop_from_mask, stop_to_mask, pm_col)
+        pm_pass_by_node = _node_contributions(pass_from_mask, pass_to_mask, pm_col)
+    else:
+        pm_stop_by_node = {}
+        pm_pass_by_node = {}
+
+    # Service-name maps per node (display, unchanged behaviour).
     stop_svc_map: Dict[int, set] = defaultdict(set)
-    for _, row in stop_from.iterrows():
+    for _, row in active[stop_from_mask].iterrows():
         stop_svc_map[int(row["seg_from_node"])].add(str(row["service"]))
-    for _, row in stop_to.iterrows():
+    for _, row in active[stop_to_mask].iterrows():
         stop_svc_map[int(row["seg_to_node"])].add(str(row["service"]))
 
     pass_svc_map: Dict[int, set] = defaultdict(set)
@@ -986,11 +1105,25 @@ def aggregate_station_metrics(
     for _, row in active[pass_to_mask].iterrows():
         pass_svc_map[int(row["seg_to_node"])].add(str(row["service"]))
 
+    def _node_metrics(node_nr: int) -> Tuple[float, float, float, float]:
+        stop_tph, pass_tph, _t_tph, stop_tphpd, pass_tphpd, _t_tphpd = (
+            _binding_metrics_from_grouped(
+                am_stop_by_node.get(node_nr, {}),
+                am_pass_by_node.get(node_nr, {}),
+                pm_stop_by_node.get(node_nr, {}),
+                pm_pass_by_node.get(node_nr, {}),
+                has_pm,
+            )
+        )
+        return stop_tph, pass_tph, stop_tphpd, pass_tphpd
+
     result = nodes_df.copy()
-    result["stopping_tph"]      = result["NR"].map(stopping_by_node).fillna(0.0)
-    result["passing_tph"]       = result["NR"].map(passing_by_node).fillna(0.0)
-    result["stopping_tphpd"]    = result["stopping_tph"] / 2.0
-    result["passing_tphpd"]     = result["passing_tph"] / 2.0
+    metrics = {int(nr): _node_metrics(int(nr)) for nr in result["NR"]}
+    result["stopping_tph"]   = result["NR"].map(lambda n: metrics[int(n)][0]).fillna(0.0)
+    result["passing_tph"]    = result["NR"].map(lambda n: metrics[int(n)][1]).fillna(0.0)
+    result["stopping_tphpd"] = result["NR"].map(lambda n: metrics[int(n)][2]).fillna(0.0)
+    result["passing_tphpd"]  = result["NR"].map(lambda n: metrics[int(n)][3]).fillna(0.0)
+
     result["stopping_services"] = result["NR"].map(
         {k: ", ".join(sorted(v)) for k, v in stop_svc_map.items()}
     ).fillna("")
@@ -1046,27 +1179,74 @@ def aggregate_segment_metrics(
 
     Returns:
         DataFrame with infra attributes merged with service frequencies.
+
+    Notes:
+        For 'peak' the AM and PM windows are aggregated independently before
+        being collapsed. tph reports the binding window's bidirectional total
+        and tphpd reports the binding direction in the binding window (max
+        over peak window × direction). total_* considers stop+pass jointly
+        within each (window, direction) bucket so segments are not
+        double-counted when stopping and passing services peak in different
+        windows.
     """
-    freq_col = "freq_peak" if period == "peak" else "freq_offpeak"
-    active = service_links_df[service_links_df[freq_col] > 0].copy()
+    if period == "peak":
+        am_col = "freq_am_peak"
+        pm_col = "freq_pm_peak"
+        peak_col = "freq_peak"
+        has_pm = True
+        active = service_links_df[
+            (service_links_df[am_col] > 0) | (service_links_df[pm_col] > 0)
+        ].copy()
+    else:
+        am_col = "freq_offpeak"
+        pm_col = None
+        peak_col = "freq_offpeak"
+        has_pm = False
+        active = service_links_df[service_links_df[am_col] > 0].copy()
 
     def _is_stopping(row) -> bool:
+        # Junction endpoints are transparent infrastructure — only station
+        # endpoints can disqualify a service from "stopping". A service counts
+        # as stopping on the segment if it has a real stop at every station
+        # endpoint; junctions are treated as if they weren't there. This means
+        # services are only classified as passing/express when they actually
+        # pass a station without stopping (not merely when they route through
+        # a junction).
         fn = int(row["seg_from_node"])
         tn = int(row["seg_to_node"])
-        if fn in junction_numbers or tn in junction_numbers:
-            return False
         svc = str(row["service"])
         did = str(row["direction_id"])
-        return (svc, did, fn) in stop_lookup and (svc, did, tn) in stop_lookup
+        fn_ok = fn in junction_numbers or (svc, did, fn) in stop_lookup
+        tn_ok = tn in junction_numbers or (svc, did, tn) in stop_lookup
+        return fn_ok and tn_ok
 
     active["_stopping"] = active.apply(_is_stopping, axis=1)
     active["_key"] = active.apply(
         lambda r: tuple(sorted((int(r["seg_from_node"]), int(r["seg_to_node"])))), axis=1
     )
+    active["_direction"] = active["direction_id"].astype(str)
 
-    stop_agg = active[active["_stopping"]].groupby("_key")[freq_col].sum()
-    pass_agg = active[~active["_stopping"]].groupby("_key")[freq_col].sum()
+    def _segment_contributions(is_stop: bool, col: str) -> Dict[tuple, Dict[str, float]]:
+        subset = active[active["_stopping"] == is_stop]
+        if subset.empty:
+            return {}
+        grouped = subset.groupby(["_key", "_direction"])[col].sum()
+        result: Dict[tuple, Dict[str, float]] = defaultdict(dict)
+        for (key, direction), val in grouped.items():
+            result[key][str(direction)] = float(val)
+        return result
 
+    am_stop_by_seg = _segment_contributions(True, am_col)
+    am_pass_by_seg = _segment_contributions(False, am_col)
+    if has_pm:
+        pm_stop_by_seg = _segment_contributions(True, pm_col)
+        pm_pass_by_seg = _segment_contributions(False, pm_col)
+    else:
+        pm_stop_by_seg = {}
+        pm_pass_by_seg = {}
+
+    # Per-service display maps preserve current behaviour using max-of-AM/PM
+    # per row (collapsed into _freq_peak / _freq_offpeak).
     svc_totals:     Dict[tuple, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
     svc_dir_totals: Dict[tuple, Dict[tuple, float]] = defaultdict(lambda: defaultdict(float))
     stop_svc_seg:   Dict[tuple, set] = defaultdict(set)
@@ -1076,7 +1256,7 @@ def aggregate_segment_metrics(
         key = row["_key"]
         svc = str(row["service"])
         did = str(row["direction_id"])
-        freq = float(row[freq_col])
+        freq = float(row[peak_col])
         svc_totals[key][svc] += freq
         svc_dir_totals[key][(svc, did)] += freq
         if row["_stopping"]:
@@ -1090,9 +1270,15 @@ def aggregate_segment_metrics(
         tn  = int(seg["to_node"])
         key = tuple(sorted((fn, tn)))
 
-        stop_tph  = float(stop_agg.get(key, 0.0))
-        pass_tph  = float(pass_agg.get(key, 0.0))
-        total_tph = stop_tph + pass_tph
+        stop_tph, pass_tph, total_tph, stop_tphpd, pass_tphpd, total_tphpd = (
+            _binding_metrics_from_grouped(
+                am_stop_by_seg.get(key, {}),
+                am_pass_by_seg.get(key, {}),
+                pm_stop_by_seg.get(key, {}),
+                pm_pass_by_seg.get(key, {}),
+                has_pm,
+            )
+        )
 
         records.append({
             "from_node":        fn,
@@ -1107,9 +1293,9 @@ def aggregate_segment_metrics(
             "stopping_tph":     stop_tph,
             "passing_tph":      pass_tph,
             "total_tph":        total_tph,
-            "stopping_tphpd":   stop_tph  / 2.0,
-            "passing_tphpd":    pass_tph  / 2.0,
-            "total_tphpd":      total_tph / 2.0,
+            "stopping_tphpd":   stop_tphpd,
+            "passing_tphpd":    pass_tphpd,
+            "total_tphpd":      total_tphpd,
             "services_tph":     _format_service_frequency_map(dict(svc_totals.get(key, {}))),
             "services_tphpd":   _format_service_direction_frequency_map(dict(svc_dir_totals.get(key, {}))),
             "stopping_services": ", ".join(sorted(stop_svc_seg.get(key, set()))),
@@ -2516,8 +2702,11 @@ def _summarise_section(
         if formula_track == 1:
             single_capacity = float("nan")
             if total_stopping_time > 0:
-                raw_capacity = _floor_capacity(60.0 / float(total_stopping_time))
-                single_capacity = raw_capacity / 2.0 if not math.isnan(raw_capacity) else float("nan")
+                # Floor the per-direction value (not the bidirectional), so odd
+                # bidirectional capacities round down conservatively rather than
+                # leaving a .5 train slot.
+                bidirectional_capacity = 60.0 / float(total_stopping_time)
+                single_capacity = _floor_capacity(bidirectional_capacity / 2.0)
             capacity_columns["capacity_single_track_tphpd"] = single_capacity
             demand_single_track = (
                 total_tphpd if not math.isnan(total_tphpd) else (total_tph / 2.0 if not math.isnan(total_tph) else float("nan"))

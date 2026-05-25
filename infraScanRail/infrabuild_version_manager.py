@@ -324,10 +324,23 @@ def _pick_one(labels: List[str], prompt: str = "Select") -> Optional[int]:
 # Phase 0 — Version selection
 # =============================================================================
 
-def _run_phase0() -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame,
-                            str, str, Path, str]:
+def _run_phase0(
+    create_from: Optional[str] = None,
+    preset_name: Optional[str] = None,
+    auto_overwrite: bool = False,
+) -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame,
+           str, str, Path, str]:
     """
     Phase 0 — version selection.
+
+    Parameters
+    ----------
+    create_from : str, optional
+        If set, skip Q1/Q2 and create a new version from this base version name.
+    preset_name : str, optional
+        If set, skip Q3 and use this as the new version name.
+    auto_overwrite : bool
+        If True, automatically answer 'y' to the overwrite prompt.
 
     Returns
     -------
@@ -350,67 +363,107 @@ def _run_phase0() -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame,
         print("  Run infrabuild_network_builder.py to build Base first.")
         raise SystemExit(1)
 
-    # Q1 — what do you want to do?
-    print("\n" + "─" * 60)
-    print("  What do you want to do?")
-    print("    1) Create a new version")
-    print("    2) Adjust an existing version")
-    while True:
-        choice = input("  Select (1/2): ").strip()
-        if choice in ('1', '2'):
-            break
-        print("  Enter 1 or 2.")
-
     versions = list_versions()
     if not versions:
         print(f"\n  No versions found in {infra_root}.")
         print("  Run infrabuild_network_builder.py to build Base first.")
         raise SystemExit(1)
 
-    if choice == '1':
+    if create_from is not None:
+        # Non-interactive path: create a new version from the specified base
         mode = 'new'
+        if create_from not in versions:
+            print(f"\n  ERROR: Base version '{create_from}' not found.")
+            print(f"  Available: {', '.join(versions)}")
+            raise SystemExit(1)
+        source_version = create_from
+        print(f"\n  [auto] Creating new version from '{source_version}'.")
 
-        # Q2 — choose base version
-        print("\n  Choose base version:")
-        idx = _pick_one(versions, "Base version")
-        if idx is None:
-            raise SystemExit(0)
-        source_version = versions[idx]
-
-        # Q3 — name for the new version
-        while True:
+        if preset_name is None:
             name = input("\n  Name for the new version (e.g. AS_2035): ").strip()
-            if not name:
-                print("  Name cannot be empty.")
-                continue
-            if name.startswith('Raw') or name.startswith('Base'):
-                print(f"  '{name}' starts with a reserved prefix (Raw/Base). Choose another.")
-                continue
-            out_dir = infra_root / name
-            if out_dir.exists() and (out_dir / 'nodes.gpkg').exists():
+        else:
+            name = preset_name
+            print(f"  [auto] Version name: '{name}'.")
+
+        if not name:
+            print("  Name cannot be empty.")
+            raise SystemExit(1)
+        if name.startswith('Raw') or name.startswith('Base'):
+            print(f"  '{name}' starts with a reserved prefix (Raw/Base).")
+            raise SystemExit(1)
+
+        out_dir = infra_root / name
+        if out_dir.exists() and (out_dir / 'nodes.gpkg').exists():
+            if auto_overwrite:
+                print(f"  Version '{name}' already exists — overwriting (auto).")
+            else:
                 print(f"  Version '{name}' already exists.")
                 overwrite = input("  Overwrite? (y/n) [n]: ").strip().lower() or 'n'
                 if overwrite != 'y':
-                    continue
-            break
+                    raise SystemExit(0)
 
-        # Create folder and copy geopackages from source version
         source_dir = infra_root / source_version
         out_dir.mkdir(parents=True, exist_ok=True)
         for gpkg in ('nodes.gpkg', 'segments.gpkg', 'segments_composition.gpkg'):
             shutil.copy2(source_dir / gpkg, out_dir / gpkg)
         print(f"  Copied {source_version}/ → {name}/")
 
-    else:  # choice == '2'
-        mode = 'adjust'
-        # list_versions already excludes Raw
-        print("\n  Choose version to adjust:")
-        idx = _pick_one(versions, "Version")
-        if idx is None:
-            raise SystemExit(0)
-        name = versions[idx]
-        source_version = name
-        out_dir = infra_root / name
+    else:
+        # Q1 — what do you want to do?
+        print("\n" + "─" * 60)
+        print("  What do you want to do?")
+        print("    1) Create a new version")
+        print("    2) Adjust an existing version")
+        while True:
+            choice = input("  Select (1/2): ").strip()
+            if choice in ('1', '2'):
+                break
+            print("  Enter 1 or 2.")
+
+        if choice == '1':
+            mode = 'new'
+
+            # Q2 — choose base version
+            print("\n  Choose base version:")
+            idx = _pick_one(versions, "Base version")
+            if idx is None:
+                raise SystemExit(0)
+            source_version = versions[idx]
+
+            # Q3 — name for the new version
+            while True:
+                name = input("\n  Name for the new version (e.g. AS_2035): ").strip()
+                if not name:
+                    print("  Name cannot be empty.")
+                    continue
+                if name.startswith('Raw') or name.startswith('Base'):
+                    print(f"  '{name}' starts with a reserved prefix (Raw/Base). Choose another.")
+                    continue
+                out_dir = infra_root / name
+                if out_dir.exists() and (out_dir / 'nodes.gpkg').exists():
+                    print(f"  Version '{name}' already exists.")
+                    overwrite = input("  Overwrite? (y/n) [n]: ").strip().lower() or 'n'
+                    if overwrite != 'y':
+                        continue
+                break
+
+            # Create folder and copy geopackages from source version
+            source_dir = infra_root / source_version
+            out_dir.mkdir(parents=True, exist_ok=True)
+            for gpkg in ('nodes.gpkg', 'segments.gpkg', 'segments_composition.gpkg'):
+                shutil.copy2(source_dir / gpkg, out_dir / gpkg)
+            print(f"  Copied {source_version}/ → {name}/")
+
+        else:  # choice == '2'
+            mode = 'adjust'
+            # list_versions already excludes Raw
+            print("\n  Choose version to adjust:")
+            idx = _pick_one(versions, "Version")
+            if idx is None:
+                raise SystemExit(0)
+            name = versions[idx]
+            source_version = name
+            out_dir = infra_root / name
 
     # Load the three geopackages
     print(f"\n  Loading '{name}'...")
@@ -1715,8 +1768,22 @@ def _apply_seed_interactive(
 # =============================================================================
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Infrastructure Version Manager')
+    parser.add_argument('--create-from', default=None,
+                        help='Base version to copy from (skips interactive Q1/Q2)')
+    parser.add_argument('--name', default=None,
+                        help='Name for the new version (skips interactive Q3)')
+    parser.add_argument('--overwrite', action='store_true',
+                        help='Auto-answer yes to the overwrite prompt')
+    args, _ = parser.parse_known_args()
+
     try:
-        nodes, segments, composition, name, source_version, out_dir, mode = _run_phase0()
+        nodes, segments, composition, name, source_version, out_dir, mode = _run_phase0(
+            create_from=args.create_from,
+            preset_name=args.name,
+            auto_overwrite=args.overwrite,
+        )
     except SystemExit:
         return
 
