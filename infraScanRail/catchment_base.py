@@ -56,7 +56,7 @@ PT_FEEDER_DATA_DIR     = os.path.join(CATCHMENT_DATA_DIR, 'PT_Feeder')
 MUNICIPAL_PLOT_DIR     = os.path.join(CATCHMENT_PLOT_DIR, 'Municipal')
 PT_FEEDER_PLOT_DIR     = os.path.join(CATCHMENT_PLOT_DIR, 'PT_Feeder')
 GUETEKLASSEN_PLOT_DIR  = os.path.join(CATCHMENT_PLOT_DIR, 'Gueteklassen')
-OD_COMPARISON_PLOT_DIR = os.path.join(CATCHMENT_PLOT_DIR, 'OD_Comparison')
+OD_COMPARISON_PLOT_DIR = os.path.join('plots', 'Traffic_Flow', 'OD', 'Comparison')
 
 # Aliases used by boundary-configuration helpers below
 CANTONS_GPKG              = paths.CANTON_BOUNDARIES_GPKG
@@ -623,7 +623,8 @@ def setup_versioned_dirs(svc_version: str) -> None:
     MUNICIPAL_PLOT_DIR     = os.path.join(ver_plot, 'Municipal')
     PT_FEEDER_PLOT_DIR     = os.path.join(ver_plot, 'PT_Feeder')
     GUETEKLASSEN_PLOT_DIR  = os.path.join(ver_plot, 'Gueteklassen')
-    OD_COMPARISON_PLOT_DIR = os.path.join(ver_plot, 'OD_Comparison')
+    OD_COMPARISON_PLOT_DIR = os.path.join('plots', 'Traffic_Flow', 'OD',
+                                          svc_version, 'Comparison')
 
 
 def _ensure_dirs():

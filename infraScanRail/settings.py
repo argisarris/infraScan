@@ -129,13 +129,19 @@ CATCHMENT_METHOD = 'PT_Feeder'
 
 # Travel-cost method — controls how access-time components are combined into a generalised cost
 # 'calibrated' — use literature-calibrated weights from cost_parameters.py (W_IVT/W_WAIT/W_WALK/W_BIKE/W_TRANSFER and the comfort-weighted transfer penalty)
-# 'absolute'   — set all weights to 1.0 at runtime (raw minutes, no weighting); uses the unweighted transfer penalty (cp.average_train_change_time, 7.1 min) instead of the comfort-weighted PI_TRANSFER_MIN
+# 'absolute'   — set all weights to 1.0 at runtime (raw minutes, no weighting)
 TRAVEL_COST_METHOD = 'absolute'
 
 # Transfer cost model — requires TRAVEL_COST_METHOD = 'calibrated' for the full literature value; 'absolute' uses raw minutes regardless.
-# 'fixed_value' — flat 12.1 min eq. IVT penalty (Axhausen 2014, Fuchs 2025)
+# 'fixed_value' — flat 12.1 min eq. IVT penalty (Axhausen 2014)
 # 'explicit'    — W_TRANSFER x (transfer walk time + wait time based on connecting headway)
 TRANSFER_COST_MODEL = 'explicit'
+
+# OD attribution mode — how communal OD is split across a commune's stations in the PT-Feeder branch.
+# 'specific' — origins weighted by population share, destinations by FTE share (production/attraction split)
+# 'blended'  — both origins and destinations weighted by OD_SCALING_POP_WEIGHT×pop_share + OD_SCALING_EMPL_WEIGHT×empl_share (symmetric)
+# Municipal branch is 1:1 commune→station and ignores this setting.
+OD_ATTRIBUTION_MODE = 'specific'
 
 # Temporal variant of the rail/feeder data — controls which subfolder is read for stops, segments, and line frequencies in catchment_allocate.
 # 'full_day' — top-level files (e.g. pt_feeder_lines.gpkg); all services

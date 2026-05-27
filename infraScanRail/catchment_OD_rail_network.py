@@ -12,11 +12,11 @@ preserved unmodified in Output 2 (they likely use an out-of-catchment transfer).
 
 Public entry point: route_od_matrices(svc_version, use_cache, od_method) -> None
 
-Outputs (under paths.MAIN):
-  data/traffic_flow/od/rail/rail_routing/sf_service_assignment_{window}.csv
-  data/traffic_flow/od/rail/rail_routing/logit_service_assignment_{window}.csv
-  data/traffic_flow/od/rail/rail_routing/gc_matrix_sf.csv
-  data/traffic_flow/od/rail/rail_routing/gc_matrix_logit.csv
+Outputs (under data/Traffic_Flow/OD/<svc_network>/Routing/):
+  sf_service_assignment_{window}.csv
+  logit_service_assignment_{window}.csv
+  gc_matrix_sf.csv
+  gc_matrix_logit.csv
 """
 
 import os
@@ -586,7 +586,7 @@ def _write_service_csv(service_df: pd.DataFrame, name_lookup: dict,
             'transfer_station_id', 'transfer_name',
             'variant_key', 'leg', 'trips', 'method']
     cols = [c for c in cols if c in out.columns]
-    out_full = Path(paths.MAIN) / output_path
+    out_full = Path(output_path)
     out_full.parent.mkdir(parents=True, exist_ok=True)
     out[cols].to_csv(out_full, index=False, encoding='utf-8-sig')
     print(f"    Saved -> {out_full}")
@@ -610,7 +610,7 @@ def _write_gc_matrix(gc_df: pd.DataFrame, name_lookup: dict,
     matrix.columns = [name_lookup.get(s, s) for s in str_cols]
     matrix.index.name   = 'origin'
     matrix.columns.name = 'destination'
-    out_full = Path(paths.MAIN) / output_path
+    out_full = Path(output_path)
     out_full.parent.mkdir(parents=True, exist_ok=True)
     matrix.to_csv(out_full, encoding='utf-8-sig')
     print(f"    Saved GC matrix -> {out_full}  "
@@ -633,11 +633,11 @@ def route_od_matrices(svc_version: str = '',
         use_cache:   If True, skip writing CSVs that already exist.
         od_method:   Which W3 OD to consume — 'pt_feeder' or 'municipal'.
 
-    Writes (under paths.MAIN):
-        data/traffic_flow/od/rail/rail_routing/sf_service_assignment_{window}.csv
-        data/traffic_flow/od/rail/rail_routing/logit_service_assignment_{window}.csv
-        data/traffic_flow/od/rail/rail_routing/gc_matrix_sf.csv
-        data/traffic_flow/od/rail/rail_routing/gc_matrix_logit.csv
+    Writes (under data/Traffic_Flow/OD/<svc_network>/Routing/):
+        sf_service_assignment_{window}.csv
+        logit_service_assignment_{window}.csv
+        gc_matrix_sf.csv
+        gc_matrix_logit.csv
     """
     if svc_version:
         catchment_base.setup_versioned_dirs(svc_version)
@@ -659,13 +659,13 @@ def route_od_matrices(svc_version: str = '',
     import catchment_OD_preparation as cod
     name_lookup = cod._build_station_name_lookup(rail_stations)
 
-    # W3 all-day OD path
-    if od_method == 'pt_feeder':
-        od_allday_path = os.path.join(paths.MAIN, paths.OD_STATIONS_PT_FEEDER_ALL_DAY_PATH)
-    else:
-        od_allday_path = os.path.join(paths.MAIN, paths.OD_STATIONS_MUNICIPAL_ALL_DAY_PATH)
+    # W3 full-day OD path (versioned)
+    if not svc_version:
+        raise ValueError("route_od_matrices requires svc_version to locate the "
+                         "versioned W3 OD matrix under data/Traffic_Flow/OD/.")
+    od_allday_path = paths.get_station_od_csv(svc_version, od_method, 'full_day')
 
-    print(f"\n[Step 1] Loading W3 all-day OD ({od_method}) ...")
+    print(f"\n[Step 1] Loading W3 full-day OD ({od_method}) ...")
     od_long = _load_w3_od(od_allday_path, rail_stations, name_lookup)
 
     # --- Build service table ---
@@ -689,44 +689,45 @@ def route_od_matrices(svc_version: str = '',
     # --- Write outputs ---
     print("\n[Step 4] Writing outputs ...")
 
+    routing_dir = paths.get_od_routing_dir(svc_version)
+    os.makedirs(routing_dir, exist_ok=True)
+
     windows = [
-        (cp.TAU_AM_PEAK_SHARE,  'am_peak',
-         paths.OD_RAIL_SF_SERVICE_AM_PEAK_PATH,
-         paths.OD_RAIL_LOGIT_SERVICE_AM_PEAK_PATH),
-        (cp.TAU_OFF_PEAK_SHARE, 'off_peak',
-         paths.OD_RAIL_SF_SERVICE_OFF_PEAK_PATH,
-         paths.OD_RAIL_LOGIT_SERVICE_OFF_PEAK_PATH),
-        (cp.TAU_ALL_DAY_SHARE,  'all_day',
-         paths.OD_RAIL_SF_SERVICE_ALL_DAY_PATH,
-         paths.OD_RAIL_LOGIT_SERVICE_ALL_DAY_PATH),
+        (cp.TAU_PEAK_SHARE,     'peak'),
+        (cp.TAU_OFFPEAK_SHARE,  'off_peak'),
+        (cp.TAU_FULL_DAY_SHARE, 'full_day'),
     ]
 
-    for tau, label, sf_path, logit_path in windows:
+    for tau, label in windows:
         sf_scaled    = _apply_tau_to_service(sf_svc_df,    tau)
         logit_scaled = _apply_tau_to_service(logit_svc_df, tau)
+        sf_path    = os.path.join(routing_dir, f'sf_service_assignment_{label}.csv')
+        logit_path = os.path.join(routing_dir, f'logit_service_assignment_{label}.csv')
 
-        if use_cache and (Path(paths.MAIN) / sf_path).exists():
+        if use_cache and Path(sf_path).exists():
             print(f"    cached: {sf_path}")
         else:
             _write_service_csv(sf_scaled, name_lookup, sf_path,
                                label=f'S&F {label}')
 
-        if use_cache and (Path(paths.MAIN) / logit_path).exists():
+        if use_cache and Path(logit_path).exists():
             print(f"    cached: {logit_path}")
         else:
             _write_service_csv(logit_scaled, name_lookup, logit_path,
                                label=f'Logit {label}')
 
     # GC matrices (time-independent)
-    if use_cache and (Path(paths.MAIN) / paths.OD_RAIL_SF_GC_PATH).exists():
-        print(f"    cached: {paths.OD_RAIL_SF_GC_PATH}")
+    sf_gc_path    = os.path.join(routing_dir, 'gc_matrix_sf.csv')
+    logit_gc_path = os.path.join(routing_dir, 'gc_matrix_logit.csv')
+    if use_cache and Path(sf_gc_path).exists():
+        print(f"    cached: {sf_gc_path}")
     else:
-        _write_gc_matrix(sf_gc_df, name_lookup, paths.OD_RAIL_SF_GC_PATH)
+        _write_gc_matrix(sf_gc_df, name_lookup, sf_gc_path)
 
-    if use_cache and (Path(paths.MAIN) / paths.OD_RAIL_LOGIT_GC_PATH).exists():
-        print(f"    cached: {paths.OD_RAIL_LOGIT_GC_PATH}")
+    if use_cache and Path(logit_gc_path).exists():
+        print(f"    cached: {logit_gc_path}")
     else:
-        _write_gc_matrix(logit_gc_df, name_lookup, paths.OD_RAIL_LOGIT_GC_PATH)
+        _write_gc_matrix(logit_gc_df, name_lookup, logit_gc_path)
 
     print("\n=== W4b rail routing done ===")
 

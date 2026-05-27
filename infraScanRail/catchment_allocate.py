@@ -90,8 +90,9 @@ MAX_CANDIDATE_STATIONS = 5
 # ===============================================================================
 # `settings.TRAVEL_COST_METHOD` controls how access-time components are combined:
 #   'calibrated' — literature weights from cost_parameters.py
-#   'absolute'   — all weights = 1.0 (raw minutes), unweighted transfer penalty,
-#                  no detour factors (Luftlinie)
+#   'absolute'   — all weights = 1.0 (raw minutes), unweighted transfer penalty.
+# Walk/cycle detour factors are mode-independent (always the cost_parameters
+# values) — only the GC weights and transfer penalty switch by method.
 
 
 def _get_active_weights() -> dict:
@@ -112,9 +113,12 @@ def _get_active_weights() -> dict:
 
 
 def _get_active_detours() -> dict:
-    """Return walk and cycle detour factors. 'absolute' uses 1.0 (Luftlinie)."""
-    if settings.TRAVEL_COST_METHOD == 'absolute':
-        return {'walk': 1.0, 'cycle': 1.0}
+    """Return walk and cycle detour factors (Luftlinie → network distance).
+
+    Mode-independent: both 'calibrated' and 'absolute' use the cost_parameters
+    values. The travel-cost method only switches the GC weights and transfer
+    penalty, not the geometric detour correction.
+    """
     return {'walk': float(cp.WALK_DETOUR), 'cycle': float(cp.CYCLE_DETOUR)}
 
 
@@ -1835,7 +1839,8 @@ def _allocate_cells(walk_df, cycle_df, feeder_df, grid, rail_stations,
     which is used for the argmin / hierarchical choice. The original
     `total_time_sec` (without penalty) survives as `access_time_sec` in the
     output, so plots and summary tables remain comparable to ARE Güteklasse
-    buffer outputs. Only effective when settings.TRAVEL_COST_METHOD = 'calibrated'.
+    buffer outputs. Effective in both cost methods — the penalty is raw
+    seconds, independent of the active weights.
 
     Returns
     -------
@@ -1849,8 +1854,7 @@ def _allocate_cells(walk_df, cycle_df, feeder_df, grid, rail_stations,
     rail_id_map = dict(zip(rail_stations['stop_id'].astype(str),
                            rail_stations['id_point']))
 
-    use_penalty = (settings.TRAVEL_COST_METHOD == 'calibrated'
-                   and station_freq_penalty is not None
+    use_penalty = (station_freq_penalty is not None
                    and len(station_freq_penalty) > 0)
 
     def _augment(df):
@@ -2788,6 +2792,15 @@ def _write_station_catchments_xlsx(output_dir: str, breakdown: pd.DataFrame,
             lines_sheet.to_excel(writer, sheet_name='Lines_per_station', index=False)
         if pt_stops_sheet is not None:
             pt_stops_sheet.to_excel(writer, sheet_name='PT-stops_SA', index=False)
+
+    # Full per-(commune, station) breakdown for ALL stations (not SA-filtered).
+    # Consumed by catchment_OD_preparation.py: pop_share_pct / empl_share_pct
+    # are the origin / destination weights for transplanting communal OD onto
+    # rail stations, so the OD attribution matches these catchment shares exactly.
+    breakdown_csv = os.path.join(output_dir, 'station_commune_breakdown.csv')
+    breakdown.to_csv(breakdown_csv, index=False, encoding='utf-8-sig')
+    print(f"    Station-commune breakdown ({len(breakdown):,} rows, all stations)"
+          f" saved -> {breakdown_csv}")
 
     suffix = f" ({method_label})" if method_label else ""
     mode_info     = f", Mode_access_by_station: {len(mode_sheet)} rows"     if mode_sheet     is not None else ""
@@ -4869,23 +4882,22 @@ def _run_pt_feeder_method(boundary, pop_grid, empl_grid, temporal='all',
     feeder_stop_to_rail_times, feeder_stop_to_rail_components, feeder_graph = _build_feeder_graph(
         feeder_stops, feeder_segments, rail_stations)
 
-    # Step 3b: W2 frequency-aware lookups (calibrated mode only)
-    if settings.TRAVEL_COST_METHOD == 'calibrated':
-        print("  Computing W2 frequency-aware lookups (calibrated mode) ...")
-        feeder_lines  = _load_feeder_line_freqs()
-        rail_lines    = _load_rail_line_freqs()
-        rail_segments = _load_rail_segments_table()
-        # (a) destination-conditional boarding wait
-        transfer_free_headway = _compute_transfer_free_headways(
-            feeder_segments, feeder_lines, feeder_stops, rail_stations,
-        )
-        # (b) invisible station-attractiveness penalty
-        station_freq_penalty = _compute_station_freq_penalties(
-            rail_lines, rail_segments, rail_stations,
-        )
-    else:
-        transfer_free_headway = None
-        station_freq_penalty  = None
+    # Step 3b: W2 frequency-aware lookups. Run in both cost methods — the only
+    # difference between 'calibrated' and 'absolute' is the weights applied
+    # downstream (w_wait scales the boarding-wait term; the station penalty is
+    # raw seconds either way). The frequency logic itself is mode-independent.
+    print("  Computing W2 frequency-aware lookups ...")
+    feeder_lines  = _load_feeder_line_freqs()
+    rail_lines    = _load_rail_line_freqs()
+    rail_segments = _load_rail_segments_table()
+    # (a) destination-conditional boarding wait
+    transfer_free_headway = _compute_transfer_free_headways(
+        feeder_segments, feeder_lines, feeder_stops, rail_stations,
+    )
+    # (b) invisible station-attractiveness penalty
+    station_freq_penalty = _compute_station_freq_penalties(
+        rail_lines, rail_segments, rail_stations,
+    )
 
     print(f"  [Step 3 complete: {time.time() - st:.1f}s]")
     st = time.time()
@@ -6317,8 +6329,8 @@ def _interactive_config():
     print("\nC. TEMPORAL NETWORK VARIANT")
     print("   1) Full day — all services (top-level rail_stops.gpkg / pt_feeder_stops.gpkg)")
     print("   2) All-day  — services operating throughout the day (All_Day/*_allday.gpkg)")
-    print("   3) Peak     — AM+PM peak services only          (Peak/*_peak.gpkg)")
-    print("   4) Off-peak — off-peak services only            (Off_Peak/*_offpeak.gpkg)")
+    print("   3) Peak     — services operating during peak hours (Peak/*_peak.gpkg)")
+    print("   4) Off-peak — services operating during off-peak hours (Off_Peak/*_offpeak.gpkg)")
 
     # Probe availability per option against the side we already discovered against
     if need_feeder:
@@ -6419,7 +6431,7 @@ def _interactive_config():
     print("   Controls how access-time components are weighted in the generalised-cost calculation.")
     print("   1) Calibrated — literature weights from cost_parameters.py "
           "(W_IVT, W_WAIT, W_WALK, W_BIKE, transfer penalty)")
-    print("   2) Absolute   — raw minutes, all weights = 1.0, no detour factors")
+    print("   2) Absolute   — raw minutes, all weights = 1.0")
     _settings_tcm = getattr(settings, 'TRAVEL_COST_METHOD', 'calibrated')
     _default_tcm  = '1' if _settings_tcm == 'calibrated' else '2'
     while True:

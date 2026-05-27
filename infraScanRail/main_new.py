@@ -61,8 +61,8 @@ def get_routing_od_method() -> str:
     """Translate the settings OD method to the internal string used by
     catchment_OD_rail_network.route_od_matrices() when selecting W3 CSV files.
 
-    'feeder_weighted' -> 'pt_feeder'   (reads OD_STATIONS_PT_FEEDER_* paths)
-    'municipal'       -> 'municipal'   (reads OD_STATIONS_MUNICIPAL_* paths)
+    'feeder_weighted' -> 'pt_feeder'   (reads the PT_Feeder station OD matrices)
+    'municipal'       -> 'municipal'   (reads the Municipal station OD matrices)
     """
     return 'pt_feeder' if get_catchment_od_method() == 'feeder_weighted' else 'municipal'
 
@@ -1162,6 +1162,102 @@ def phase_4a_catchment_allocation(
     runtimes["Phase 4A: Catchment Allocation"] = time.time() - st
 
 
+def phase_4b_station_od_matrix(runtimes: dict) -> None:
+    """Phase 4B — Station OD Matrix.
+
+    Runs catchment_OD_preparation.prepare_all_od_matrices() for the active
+    settings.CATCHMENT_METHOD. Communal OD is scaled forward to
+    POPULATION_BASE_YEAR (per-commune geometric mean), out-of-catchment demand is
+    routed to gateway (boundary) stations, and a top-5 origins/destinations Excel
+    is exported for study-area stations.
+
+    Gateway assignment behaves like the municipal station assignment: if a saved
+    assignment exists the user is offered to reuse or recreate it; if none exists
+    the interactive assignment runs here (the file is not required up-front).
+
+    Args:
+        runtimes: Dict tracking phase execution times.
+    """
+    print("\n" + "=" * 80)
+    print("PHASE 4B: STATION OD MATRIX")
+    print("=" * 80 + "\n")
+    st = time.time()
+
+    # ── Step 4B.1: Resolve method and service version ────────────────────────
+    catchment_method = settings.CATCHMENT_METHOD
+    method = 'pt_feeder' if catchment_method == 'PT_Feeder' else 'municipal'
+
+    svc_version = PIPELINE_CONFIG.svc_version
+    if svc_version is None:
+        svc_version = settings.SVC_VERSION
+        if svc_version == 'Build_New':
+            svc_version = settings.SVC_BUILD_NEW_NAME
+    svc_network = f'{svc_version}_network'
+
+    print(f"  Catchment method     : {catchment_method}  -> '{method}'")
+    print(f"  Attribution mode     : {settings.OD_ATTRIBUTION_MODE}")
+    print(f"  Service version      : {svc_version}  -> '{svc_network}'")
+    print(f"  Infrastructure       : {PIPELINE_CONFIG.infra_version}")
+    print(f"  Population base year  : {settings.POPULATION_BASE_YEAR}\n")
+
+    # ── Step 4B.2: Skip-if-cached check ──────────────────────────────────────
+    expected = [paths.get_station_od_csv(svc_network, method, w)
+                for w in ('peak', 'off_peak', 'full_day')]
+
+    if settings.use_cache_stationsOD:
+        missing = [f for f in expected if not os.path.exists(f)]
+        if not missing:
+            print(f"  use_cache_stationsOD = True and all {len(expected)} expected "
+                  f"OD matrices present — skipping Phase 4B.")
+            runtimes["Phase 4B: Station OD Matrix"] = time.time() - st
+            return
+        print(f"  use_cache_stationsOD = True but {len(missing)} expected file(s) "
+              f"missing — running OD preparation.")
+    else:
+        print("  use_cache_stationsOD = False — running OD preparation.")
+
+    # ── Step 4B.3: Run OD preparation ────────────────────────────────────────
+    # Interactive for gateway assignment: reuse if a saved assignment exists,
+    # otherwise prompt to create it here (mirrors the municipal assignment).
+    print("\n--- Step 4B.3: Run Station OD Preparation ---\n")
+    import catchment_OD_preparation as _odp
+    _odp._INTERACTIVE_MODE = True
+    _odp.prepare_all_od_matrices(
+        use_cache=settings.use_cache_stationsOD,
+        svc_version=svc_network,
+        infra_version=PIPELINE_CONFIG.infra_version,
+        method=method,
+        attribution_mode=settings.OD_ATTRIBUTION_MODE,
+    )
+
+    _write_station_od_to_report(method, svc_network)
+    runtimes["Phase 4B: Station OD Matrix"] = time.time() - st
+
+
+def _write_station_od_to_report(method: str, svc_network: str) -> None:
+    """Append a 'STATION OD MATRIX (Phase 4B)' block to report_new.txt."""
+    lines = [
+        "=" * 80,
+        "  STATION OD MATRIX (Phase 4B)",
+        "=" * 80,
+        f"  Method               : {method}",
+        f"  Attribution mode     : {settings.OD_ATTRIBUTION_MODE}",
+        f"  Service version      : {svc_network}",
+        f"  Population base year  : {settings.POPULATION_BASE_YEAR}",
+        f"  Temporal window      : {getattr(settings, 'TEMPORAL', 'full_day')}",
+        f"  OD output dir        : data/Traffic_Flow/OD/{svc_network}/",
+        "=" * 80,
+    ]
+    for line in lines:
+        print(line)
+    rt_file = os.path.join(paths.MAIN, 'report_new.txt')
+    with open(rt_file, 'a', encoding='utf-8') as f:
+        f.write("\n")
+        for line in lines:
+            f.write(line + "\n")
+        f.write("\n")
+
+
 def _write_calibration_inputs_to_report() -> None:
     """Print and append a 'CALIBRATION INPUTS (Phase 4A)' block to report_new.txt.
 
@@ -1277,6 +1373,7 @@ def infrascanrail_new():
     phase_3b_services(sa_boundary, ca_boundary, runtimes)
     phase_3c_capacity(sa_boundary, ca_boundary, runtimes)
     phase_4a_catchment_allocation(sa_boundary, ca_boundary, runtimes)
+    phase_4b_station_od_matrix(runtimes)
 
     _save_runtimes(runtimes, 'report_new.txt')
 

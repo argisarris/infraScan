@@ -14,25 +14,19 @@ DEVELOPMENT_DIRECTORY = r"data\Network\processed\developments"
 
 RAIL_NODES_PATH = r"data\Network\Rail_Node.csv"
 RAIL_POINTS_PATH = r"data\Network\processed\points.gpkg"
-OD_KT_ZH_PATH = r'data/traffic_flow/od/original/KTZH_00001982_00003903.xlsx'
-OD_STATIONS_KT_ZH_PATH      = r'data/traffic_flow/od/rail/ktzh/od_matrix_stations_ktzh_20.csv'
-OD_STATIONS_KT_ZH_2040_PATH = r'data/traffic_flow/od/rail/ktzh/od_matrix_stations_ktzh_2040.csv'
-# Station-pair OD matrices (W3): two methods × three time windows.
-OD_STATIONS_PT_FEEDER_AM_PEAK_PATH  = r'data/traffic_flow/od/rail/pt_feeder/od_matrix_stations_pt_feeder_am_peak.csv'
-OD_STATIONS_PT_FEEDER_OFF_PEAK_PATH = r'data/traffic_flow/od/rail/pt_feeder/od_matrix_stations_pt_feeder_off_peak.csv'
-OD_STATIONS_PT_FEEDER_ALL_DAY_PATH  = r'data/traffic_flow/od/rail/pt_feeder/od_matrix_stations_pt_feeder_all_day.csv'
-OD_STATIONS_MUNICIPAL_AM_PEAK_PATH  = r'data/traffic_flow/od/rail/municipal/od_matrix_stations_municipal_am_peak.csv'
-OD_STATIONS_MUNICIPAL_OFF_PEAK_PATH = r'data/traffic_flow/od/rail/municipal/od_matrix_stations_municipal_off_peak.csv'
-OD_STATIONS_MUNICIPAL_ALL_DAY_PATH  = r'data/traffic_flow/od/rail/municipal/od_matrix_stations_municipal_all_day.csv'
-# Rail network routing outputs (W4b): per-service assignment + expected-GC matrices.
-OD_RAIL_SF_SERVICE_ALL_DAY_PATH     = r'data/traffic_flow/od/rail/rail_routing/sf_service_assignment_all_day.csv'
-OD_RAIL_SF_SERVICE_AM_PEAK_PATH     = r'data/traffic_flow/od/rail/rail_routing/sf_service_assignment_am_peak.csv'
-OD_RAIL_SF_SERVICE_OFF_PEAK_PATH    = r'data/traffic_flow/od/rail/rail_routing/sf_service_assignment_off_peak.csv'
-OD_RAIL_LOGIT_SERVICE_ALL_DAY_PATH  = r'data/traffic_flow/od/rail/rail_routing/logit_service_assignment_all_day.csv'
-OD_RAIL_LOGIT_SERVICE_AM_PEAK_PATH  = r'data/traffic_flow/od/rail/rail_routing/logit_service_assignment_am_peak.csv'
-OD_RAIL_LOGIT_SERVICE_OFF_PEAK_PATH = r'data/traffic_flow/od/rail/rail_routing/logit_service_assignment_off_peak.csv'
-OD_RAIL_SF_GC_PATH                  = r'data/traffic_flow/od/rail/rail_routing/gc_matrix_sf.csv'
-OD_RAIL_LOGIT_GC_PATH               = r'data/traffic_flow/od/rail/rail_routing/gc_matrix_logit.csv'
+OD_KT_ZH_PATH = r'data/Traffic_Flow/OD/Original/KTZH_00001982_00003903.xlsx'
+OD_STATIONS_KT_ZH_PATH      = r'data/Traffic_Flow/OD/Rail/ktzh/od_matrix_stations_ktzh_20.csv'
+OD_STATIONS_KT_ZH_2040_PATH = r'data/Traffic_Flow/OD/Rail/ktzh/od_matrix_stations_ktzh_2040.csv'
+
+# Versioned OD outputs (W3 station-pair matrices, W4b routing, gateways) live under
+# data/Traffic_Flow/OD/<svc_network>/<Method|Gateway|Routing>/ — built via the
+# get_station_od_* / get_gateway_dir / get_od_routing_* helpers below (mirrors the
+# Catchment_Area/<svc_network>/<Method> layout). The legacy flat files under
+# data/Traffic_Flow/OD/ and data/Traffic_Flow/OD/Rail/ are retained as-is.
+TRAFFIC_FLOW_OD_DIR       = r'data/Traffic_Flow/OD'
+TRAFFIC_FLOW_OD_PLOTS_DIR = os.path.join('plots', 'Traffic_Flow', 'OD')
+_OD_METHOD_DIRS = {'pt_feeder': 'PT_Feeder', 'municipal': 'Municipal'}
+
 COMMUNE_TO_STATION_PATH = r"data\Network\processed\Communes_to_railway_stations_ZH.xlsx"
 GRAPH_POS_PATH = r"data\Network\processed\graph_data.pkl"
 
@@ -149,6 +143,79 @@ def infra_version_exists(version: str) -> bool:
 def get_projected_services_path(svc_version: str, infra_version: str) -> str:
     """Return absolute path to projected rail edges for a svc/infra version pair."""
     return os.path.join(MAIN, RAIL_LINES_DIR, svc_version + '_network', infra_version, 'rail_segments.gpkg')
+
+def get_od_version_dir(svc_network: str) -> str:
+    """Return absolute path to the versioned OD output dir for a svc version.
+
+    Args:
+        svc_network: service version folder name WITH the '_network' suffix.
+    """
+    return os.path.join(MAIN, TRAFFIC_FLOW_OD_DIR, svc_network)
+
+
+def get_station_od_dir(svc_network: str, method: str) -> str:
+    """Return absolute path to the per-method station OD dir
+    (data/Traffic_Flow/OD/<svc_network>/<PT_Feeder|Municipal>/)."""
+    return os.path.join(get_od_version_dir(svc_network),
+                        _OD_METHOD_DIRS.get(method, method))
+
+
+def get_station_od_csv(svc_network: str, method: str, window: str) -> str:
+    """Return absolute path to a station-pair OD matrix CSV for a (method, window).
+
+    Args:
+        method: 'pt_feeder' | 'municipal'.
+        window: 'peak' | 'off_peak' | 'full_day'.
+    """
+    return os.path.join(get_station_od_dir(svc_network, method),
+                        f'od_matrix_stations_{window}.csv')
+
+
+def get_od_top5_xlsx(svc_network: str, method: str) -> str:
+    """Return absolute path to the per-method top-5 origins/destinations workbook."""
+    return os.path.join(get_station_od_dir(svc_network, method), 'od_top5.xlsx')
+
+
+def get_station_od_matrix_xlsx(svc_network: str, method: str) -> str:
+    """Return absolute path to the per-method full station×station OD matrix
+    workbook (one sheet per time window)."""
+    return os.path.join(get_station_od_dir(svc_network, method),
+                        'od_matrix_stations.xlsx')
+
+
+def get_od_method_plot_dir(svc_network: str, method: str) -> str:
+    """Return absolute path to the per-method OD plot dir
+    (plots/Traffic_Flow/OD/<svc_network>/<PT_Feeder|Municipal>/).
+
+    Mirrors get_station_od_dir on the plots side so the repo tree is symmetric.
+    """
+    return os.path.join(MAIN, TRAFFIC_FLOW_OD_PLOTS_DIR, svc_network,
+                        _OD_METHOD_DIRS.get(method, method))
+
+
+def get_gateway_dir(svc_network: str) -> str:
+    """Return absolute path to the gateway-assignment dir
+    (data/Traffic_Flow/OD/<svc_network>/Gateway/)."""
+    return os.path.join(get_od_version_dir(svc_network), 'Gateway')
+
+
+def get_od_routing_dir(svc_network: str) -> str:
+    """Return absolute path to the W4b rail-routing output dir
+    (data/Traffic_Flow/OD/<svc_network>/Routing/)."""
+    return os.path.join(get_od_version_dir(svc_network), 'Routing')
+
+
+def get_boundary_stations_json(svc_network: str, infra_version: str) -> str:
+    """Return absolute path to boundary_stations.json for a svc/infra version pair.
+
+    Args:
+        svc_network:   service version folder name WITH the '_network' suffix,
+                       e.g. 'AK_2026_S18_network'.
+        infra_version: infrastructure version subfolder, e.g. 'AS_2026_ZH'.
+    """
+    return os.path.join(MAIN, RAIL_LINES_DIR, svc_network, infra_version,
+                        'boundary_stations.json')
+
 
 def svc_version_exists(svc_version: str) -> bool:
     """True if the svc_version network folder has a complete Unprojected rail base."""

@@ -18,19 +18,21 @@ duration = 50  # 50 years
 tts_valuation_period = (2050,2100)
 construction_start_year = 2050
 
-# --- Peak-hour share factors (fraction of daily interzonal PT demand
+# --- Demand-window share factors (fraction of daily interzonal PT demand
 # per representative hour). No Swiss authority publishes an explicit τ;
 # values triangulated from Swiss and international precedent. ---
-TAU_AM_PEAK_SHARE   = 0.13   # AM peak hour. Range 0.12-0.15 for commute-dominated
-                             # commuter rail. Source: FHWA K-factor (8-15% urban,
-                             # 15% rural); NPVM 2023 MSP/ASP-implied 12-15% range;
-                             # UK PDFH commuter convention (Worsley 2012). Central
-                             # value defensible for ZH-region S-Bahn.
-TAU_OFF_PEAK_SHARE  = 0.05   # Off-peak representative hour. Derived from
-                             # (1 − 2·0.13) ≈ 0.74 across ~12 off-peak hours of
-                             # the ARE 06:00-20:00 window ≈ 0.062/h, rounded to
-                             # 0.05 for a conservative off-peak baseline.
-TAU_ALL_DAY_SHARE   = 1.00   # Full daily total. No scaling.
+TAU_PEAK_SHARE     = 0.13   # Peak hour (busiest single hour). Range 0.12-0.15 for
+                            # commute-dominated commuter rail. Source: FHWA K-factor
+                            # (8-15% urban, 15% rural); NPVM 2023 MSP/ASP-implied
+                            # 12-15% range; UK PDFH commuter convention (Worsley
+                            # 2012). Central value defensible for ZH-region S-Bahn.
+TAU_OFFPEAK_SHARE  = 0.06   # Off-peak representative hour. Conservation over the
+                            # 06:00-20:00 operational day (14 h) with the two
+                            # busiest peak hours (AM + PM) at τ_peak:
+                            # (1 − 2·0.13) / 12 ≈ 0.062. Peak windows are
+                            # 06:00-09:00 and 16:00-19:00; the inter-peak off-peak
+                            # window is 09:00-16:00.
+TAU_FULL_DAY_SHARE = 1.00   # Full daily total. No scaling.
 
 # Logit route-choice scale parameter (1 / GC-minute). Controls concentration
 # of demand on lower-GC services. θ=0.20: a 10-min GC disadvantage reduces
