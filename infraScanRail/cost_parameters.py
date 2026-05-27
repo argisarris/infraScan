@@ -50,12 +50,12 @@ comfort_weighted_change_time = int(np.round(average_train_change_time * change_t
 # Per-weight metadata sourced from markdowns/MT_Task_1_OD/infraScanRail_Weight_Overview_Table.md.
 # All unitless weights set to 1.0 (neutralised baseline); restore recommended values for production runs.
 W_IVT      = 1.0   # range 1.0 (definitional). Wardman 2004; Axhausen 2008. Swiss: NPVM/NIBA/NISTRA all 1.0. Recommended: 1.0
-W_WAIT     = 1.0   # range 1.5–2.5. Wardman 2004; Axhausen 2008 (β_wait/β_IVT≈1.5–2.0); Ortelli 2025 ≈1.98. Swiss: NPVM implicit >1, value not published. Recommended: 1.5
-W_WALK     = 1.0   # range 1.5–2.5. Wardman 2004 ≈2.0; Axhausen 2008 (β_walk/β_IVT≈2.0); Ortelli 2025 ≈1.78. Swiss: NPVM implicit, ARE 2022 uses buffers instead. Recommended: 2.0
-W_BIKE     = 1.0   # range 1.0–2.0. No Swiss-specific source; PDFH (UK) ≈1.4–1.6. Swiss: not in NPVM/ARE; SBB B+R not monetised. Recommended: 1.5 (author choice)
+W_WAIT     = 1.5   # range 1.5–2.5. Wardman 2004; Axhausen 2008 (β_wait/β_IVT≈1.5–2.0); Ortelli 2025 ≈1.98. Swiss: NPVM implicit >1, value not published. Recommended: 1.5
+W_WALK     = 2.0   # range 1.5–2.5. Wardman 2004 ≈2.0; Axhausen 2008 (β_walk/β_IVT≈2.0); Ortelli 2025 ≈1.78. Swiss: NPVM implicit, ARE 2022 uses buffers instead. Recommended: 2.0
+W_BIKE     = 1.5   # range 1.0–2.0. No Swiss-specific source; PDFH (UK) ≈1.4–1.6. Swiss: not in NPVM/ARE; SBB B+R not monetised. Recommended: 1.5 (author choice)
 # Transfer-specific weight (Axhausen 2014 SVI 2001/534): applies in the 'explicit' model
 # to the combined walk+wait component of a transfer (see formula in PI_TRANSFER_MIN block).
-W_TRANSFER = 1.0   # range 1.5–2.5. Wardman 2004; Axhausen 2008; Ortelli 2025 ≈1.98. Swiss: NPVM implicit >1, "gewichtet" vs "ungewichtet" Abb. 59 NPVM 2023. Recommended: 2.0
+W_TRANSFER = 2.0   # range 1.5–2.5. Wardman 2004; Axhausen 2008; Ortelli 2025 ≈1.98. Swiss: NPVM implicit >1, "gewichtet" vs "ungewichtet" Abb. 59 NPVM 2023. Recommended: 2.0
 
 # --- Speed and detour factors ---
 # ARE 2022 implicit walking speed; NPVM convention for detour factor

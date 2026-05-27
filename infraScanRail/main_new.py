@@ -36,23 +36,11 @@ class PipelineConfig:
     """Holds resolved pipeline state set during Phase 1."""
 
     def __init__(self):
-        self.visualization_mode    = settings.VISUALIZATION_MODE
         self.grouping_strategy     = settings.CAPACITY_GROUPING_STRATEGY
         self.needs_projection      = False   # set True if svc version needs projection
         self.infra_version         = None    # resolved in phase_1_initialisation
         self.svc_version           = None    # resolved in phase_1_initialisation
         self._original_input       = None    # stored in infrascanrail_new for smart_input
-
-    def should_generate_plots(self, default_yes: bool = False):
-        """Return True/False/None based on visualization_mode.
-
-        None signals the caller to prompt the user (manual mode).
-        """
-        if self.visualization_mode == 'all':
-            return True
-        if self.visualization_mode == 'none':
-            return False
-        return None  # manual: caller decides
 
 
 PIPELINE_CONFIG = PipelineConfig()
@@ -268,12 +256,13 @@ def phase_1_initialisation(runtimes: dict) -> tuple:
         f"  GTFS version     : {settings.GTFS_FILTER_VERSION}",
         f"  Canton           : {settings.CATCHMENT_CANTON_ABBREV}",
         f"  Catchment method : {settings.CATCHMENT_METHOD}  (OD: {get_catchment_od_method()})",
+        f"  Travel cost      : {settings.TRAVEL_COST_METHOD}  "
+        f"(transfer: {settings.TRANSFER_COST_MODEL})",
         f"  Capacity mode    : {settings.CAPACITY_MODE}",
         f"  OD type          : {settings.OD_TYPE}  (base year {settings.POPULATION_BASE_YEAR})",
         f"  Population base  : {settings.POPULATION_BASE_YEAR}",
         f"  Scenarios        : {settings.amount_of_scenarios} x "
         f"[{settings.start_year_scenario}-{settings.end_year_scenario}]",
-        f"  Visualisation    : {settings.VISUALIZATION_MODE}",
         "-" * 80,
     ]
     print()
@@ -350,7 +339,7 @@ def phase_2_data_preparation(
     import catchment_base as _cb
     scale_report = _cb.main(
         year=settings.POPULATION_BASE_YEAR,
-        do_plots=settings.PLOT_CATCHMENT,
+        do_plots=settings.PLOT_DATA,
     )
     if scale_report:
         rt_file = os.path.join(paths.MAIN, 'report_new.txt')
@@ -1065,6 +1054,194 @@ def phase_3c_capacity(
 # Runtime writer
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def phase_4a_catchment_allocation(
+    sa_boundary,
+    ca_boundary,
+    runtimes: dict,
+) -> None:
+    """Phase 4A — Catchment Allocation.
+
+    Runs catchment_allocate.get_catchment() hands-off, based on settings:
+      - CATCHMENT_METHOD     → 'pt_feeder' or 'municipal'
+      - TRAVEL_COST_METHOD   → 'calibrated' (weights from cost_parameters) or 'absolute' (all 1.0)
+      - TRANSFER_COST_MODEL  → 'fixed_value' or 'explicit'
+      - PLOT_CATCHMENT       → toggles the Phase 4A plot suite
+      - use_cache_pt_catchment → skip when expected outputs are already on disk
+
+    Resolves the feeder/rail base paths from PIPELINE_CONFIG.svc_version
+    (set in Phase 1) and prints the active calibration inputs to terminal
+    + report_new.txt before invoking the allocation.
+
+    Args:
+        sa_boundary: Study area polygon (Shapely) — reserved for future use.
+        ca_boundary: Catchment area polygon (Shapely) — reserved for future use.
+        runtimes:    Dict tracking phase execution times.
+    """
+    print("\n" + "=" * 80)
+    print("PHASE 4A: CATCHMENT ALLOCATION")
+    print("=" * 80 + "\n")
+    st = time.time()
+
+    # ── Step 4A.0: Calibration inputs ─────────────────────────────────────────
+    print("--- Step 4A.0: Calibration Inputs ---")
+    _write_calibration_inputs_to_report()
+
+    # ── Step 4A.1: Resolve method and service version ────────────────────────
+    print("\n--- Step 4A.1: Resolution ---\n")
+    catchment_method = settings.CATCHMENT_METHOD
+    method = 'pt_feeder' if catchment_method == 'PT_Feeder' else 'municipal'
+
+    svc_version = PIPELINE_CONFIG.svc_version
+    if svc_version is None:
+        svc_version = settings.SVC_VERSION
+        if svc_version == 'Build_New':
+            svc_version = settings.SVC_BUILD_NEW_NAME
+
+    svc_network = f'{svc_version}_network'
+    feeder_base = os.path.join(paths.FEEDER_LINES_DIR, svc_network,
+                                paths.SERVICES_UNPROJECTED_SUBDIR)
+    rail_base   = os.path.join(paths.RAIL_LINES_DIR,   svc_network,
+                                paths.SERVICES_UNPROJECTED_SUBDIR)
+
+    temporal = getattr(settings, 'TEMPORAL', 'full_day')
+
+    print(f"  Catchment method     : {catchment_method}  -> '{method}'")
+    print(f"  Travel cost method   : {settings.TRAVEL_COST_METHOD}")
+    print(f"  Transfer cost model  : {settings.TRANSFER_COST_MODEL}")
+    print(f"  Temporal             : {temporal}")
+    print(f"  Plot catchment       : {settings.PLOT_CATCHMENT}")
+    print(f"  Service version      : {svc_version}")
+    print(f"  Feeder base          : {feeder_base}")
+    print(f"  Rail base            : {rail_base}\n")
+
+    # ── Step 4A.2: Skip-if-cached check ──────────────────────────────────────
+    print("--- Step 4A.2: Cache Check ---\n")
+    if method == 'pt_feeder':
+        expected = [
+            os.path.join(paths.MAIN, 'data', 'Catchment_Area', svc_network,
+                          'PT_Feeder', f)
+            for f in ('cell_station_candidates.csv',
+                      'catchment.gpkg',
+                      'station_catchments.xlsx')
+        ]
+    else:
+        expected = [
+            os.path.join(paths.MAIN, 'data', 'Catchment_Area', svc_network,
+                          'Municipal', f)
+            for f in ('station_assignment.csv',
+                      'catchment.gpkg',
+                      'station_catchments.xlsx')
+        ]
+
+    if settings.use_cache_pt_catchment:
+        missing = [f for f in expected if not os.path.exists(f)]
+        if missing:
+            print(f"  use_cache_pt_catchment = True but {len(missing)} expected file(s) missing — running allocation.")
+            for f in missing:
+                print(f"    missing: {f}")
+        else:
+            print(f"  use_cache_pt_catchment = True and all {len(expected)} expected files present — skipping Phase 4A.")
+            runtimes["Phase 4A: Catchment Allocation"] = time.time() - st
+            return
+    else:
+        print(f"  use_cache_pt_catchment = False — running allocation.")
+
+    # ── Step 4A.3: Run catchment_allocate.get_catchment ──────────────────────
+    print("\n--- Step 4A.3: Run Catchment Allocation ---\n")
+    import catchment_allocate as _ca
+    _ca.get_catchment(
+        use_cache=settings.use_cache_pt_catchment,
+        method=method,
+        feeder_base=feeder_base,
+        rail_base=rail_base,
+        temporal=temporal,
+        visualize=settings.PLOT_CATCHMENT,
+        infra_projection=PIPELINE_CONFIG.infra_version,
+    )
+
+    runtimes["Phase 4A: Catchment Allocation"] = time.time() - st
+
+
+def _write_calibration_inputs_to_report() -> None:
+    """Print and append a 'CALIBRATION INPUTS (Phase 4A)' block to report_new.txt.
+
+    Lists all travel-cost weights, transfer-cost parameters, wait-function
+    parameters, walk/cycle speeds + detour factors, and walk-buffer radii used
+    by Phase 4A catchment allocation. When settings.TRAVEL_COST_METHOD =
+    'absolute', the unitless weight values are shown as '1.0 (overridden)'
+    and the transfer penalty falls back to the raw 7.1 min value.
+    """
+    import cost_parameters as cp
+    import catchment_allocate as _ca
+
+    method   = settings.TRAVEL_COST_METHOD
+    tx_model = settings.TRANSFER_COST_MODEL
+    is_abs   = (method == 'absolute')
+
+    def _w(val: float) -> str:
+        if is_abs:
+            return "1.0 (overridden)"
+        return f"{val:.3f}"
+
+    if is_abs:
+        transfer_penalty_active = float(cp.average_train_change_time)
+        transfer_penalty_note   = "raw 7.1 min (no comfort weighting)"
+    else:
+        transfer_penalty_active = float(cp.PI_TRANSFER_MIN)
+        transfer_penalty_note   = "12.1 min eq. IVT (Axhausen 2014)"
+
+    lines = [
+        "=" * 80,
+        "  CALIBRATION INPUTS (Phase 4A)",
+        "=" * 80,
+        f"  Travel cost method     : {method}",
+        f"  Transfer cost model    : {tx_model}",
+        "-" * 80,
+        "  Generalised-cost weights (cost_parameters.py)",
+        f"    W_IVT      = {_w(cp.W_IVT)}",
+        f"    W_WAIT     = {_w(cp.W_WAIT)}",
+        f"    W_WALK     = {_w(cp.W_WALK)}",
+        f"    W_BIKE     = {_w(cp.W_BIKE)}",
+        f"    W_TRANSFER = {_w(cp.W_TRANSFER)}",
+        "-" * 80,
+        "  Transfer-penalty parameters",
+        f"    Active transfer penalty : {transfer_penalty_active:.2f} min  ({transfer_penalty_note})",
+        f"    PI_TRANSFER_MIN         : {cp.PI_TRANSFER_MIN:.2f} min  (comfort-weighted, 'fixed_value' model)",
+        f"    TRANSFER_WALK_MIN       : {cp.TRANSFER_WALK_MIN:.2f} min  ('explicit' model only)",
+        f"    average_train_change_time : {cp.average_train_change_time:.2f} min  (Axhausen 2014 raw)",
+        f"    change_time_comfort_factor: {cp.change_time_comfort_factor:.2f}",
+        "-" * 80,
+        "  Wait-function parameters (piecewise; Wardman 2004 / Bates 2001)",
+        f"    WAIT_THRESHOLD_MIN = {cp.WAIT_THRESHOLD_MIN:.2f} min",
+        f"    WAIT_SLOPE_ABOVE   = {cp.WAIT_SLOPE_ABOVE:.3f}",
+        "-" * 80,
+        "  Speed and detour factors",
+        f"    WALK_SPEED_KMH     = {cp.WALK_SPEED_KMH:.2f}",
+        f"    WALK_DETOUR        = {cp.WALK_DETOUR:.3f}",
+        f"    CYCLE_SPEED_KMH    = {cp.CYCLE_SPEED_KMH:.2f}",
+        f"    CYCLE_DETOUR       = {cp.CYCLE_DETOUR:.3f}",
+        f"    CYCLE_MAX_RADIUS_M = {cp.CYCLE_MAX_RADIUS_M:.0f} m",
+        "-" * 80,
+        "  Walk-buffer radii (catchment_allocate.py — ARE 2022)",
+        f"    BUFFER_RAIL_M = {_ca.BUFFER_RAIL_M:.0f} m",
+        f"    BUFFER_TRAM_M = {_ca.BUFFER_TRAM_M:.0f} m",
+        f"    BUFFER_BUS_M  = {_ca.BUFFER_BUS_M:.0f} m",
+        "=" * 80,
+    ]
+
+    print()
+    for line in lines:
+        print(line)
+    print()
+
+    rt_file = os.path.join(paths.MAIN, 'report_new.txt')
+    with open(rt_file, 'a', encoding='utf-8') as f:
+        f.write("\n")
+        for line in lines:
+            f.write(line + "\n")
+        f.write("\n")
+
+
 def _save_runtimes(runtimes: dict, filename: str) -> None:
     """Append phase runtimes to the run log file started by Phase 1."""
     total_time = sum(runtimes.values())
@@ -1099,6 +1276,7 @@ def infrascanrail_new():
     phase_3a_infrastructure(runtimes)
     phase_3b_services(sa_boundary, ca_boundary, runtimes)
     phase_3c_capacity(sa_boundary, ca_boundary, runtimes)
+    phase_4a_catchment_allocation(sa_boundary, ca_boundary, runtimes)
 
     _save_runtimes(runtimes, 'report_new.txt')
 

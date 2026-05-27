@@ -65,6 +65,7 @@ MUNICIPALITIES_GPKG       = paths.MUNICIPAL_BOUNDARIES_GPKG
 CATCHMENT_AREA_DIR        = os.path.join(CATCHMENT_DATA_DIR, 'Boundaries')
 STUDY_AREA_DIR            = os.path.join(CATCHMENT_DATA_DIR, 'Boundaries')
 POP_EMPL_DATA_DIR         = os.path.join(CATCHMENT_DATA_DIR, 'Pop_Empl_Data')
+POP_EMPL_PLOT_DIR         = os.path.join(CATCHMENT_PLOT_DIR, 'Pop_Empl_Data')
 STUDY_AREA_DEFAULT_BUFFER_M     = 3000
 CATCHMENT_AREA_DEFAULT_BUFFER_M = 5000
 
@@ -73,6 +74,60 @@ CATCHMENT_AREA_DEFAULT_BUFFER_M = 5000
 _SCALE_REPORT_LINES: list = []
 _BEZIRK_SCALES: dict = {}   # label -> bezirk_scale Series
 _TOTALS: dict = {}          # label -> {'base': float, 'target': float}
+
+
+# ===============================================================================
+# SHARED UTILITIES
+# ===============================================================================
+
+def hamilton_round(fractional: np.ndarray, total: int) -> np.ndarray:
+    """Largest-remainder integer rounding that preserves the input total exactly.
+
+    Each element of ``fractional`` is split into integer-floor + remainder. The
+    `total - floor.sum()` remaining units are distributed one at a time to the
+    indices with the largest fractional remainder (ties broken by lower index).
+    The returned array sums to ``total`` exactly.
+
+    Args:
+        fractional: 1-D non-negative array of floats.
+        total:      integer the returned array must sum to.
+
+    Returns:
+        1-D ndarray of int with the same shape as fractional and sum == total.
+        Returns an all-zeros array when fractional sums to zero.
+    """
+    arr = np.asarray(fractional, dtype=float).clip(min=0.0)
+    total = int(total)
+
+    if arr.size == 0 or arr.sum() <= 0:
+        return np.zeros(arr.shape, dtype=int)
+
+    floors = np.floor(arr).astype(int)
+    remainder = total - int(floors.sum())
+
+    if remainder == 0:
+        return floors
+    if remainder > 0:
+        # Distribute remaining units to largest fractional parts (ties → lower index)
+        fractions = arr - floors
+        order = np.argsort(-fractions, kind='stable')
+        bump = order[:remainder]
+        floors[bump] += 1
+        return floors
+
+    # remainder < 0: floors already overshoot total (only possible when
+    # `total` is less than sum(floor) — rare, but handle gracefully by
+    # subtracting one unit from indices with smallest fractional parts first).
+    take = -remainder
+    fractions = arr - floors
+    order = np.argsort(fractions, kind='stable')
+    for idx in order:
+        if take == 0:
+            break
+        if floors[idx] > 0:
+            floors[idx] -= 1
+            take -= 1
+    return floors
 
 
 # ===============================================================================
@@ -576,7 +631,7 @@ def _ensure_dirs():
     for d in [CATCHMENT_DATA_DIR, CATCHMENT_PLOT_DIR,
               MUNICIPAL_DATA_DIR, PT_FEEDER_DATA_DIR,
               MUNICIPAL_PLOT_DIR, PT_FEEDER_PLOT_DIR,
-              GUETEKLASSEN_PLOT_DIR]:
+              GUETEKLASSEN_PLOT_DIR, POP_EMPL_DATA_DIR, POP_EMPL_PLOT_DIR]:
         os.makedirs(d, exist_ok=True)
 
 
@@ -726,7 +781,9 @@ def _load_grid(df, boundary, label, year: int = None):
 
     print(f"    {label}: {len(gdf):,} cells within study area (>=50 % overlap)")
 
-    # Scale 2023 cell values to target year when year != 2023
+    # Scale 2023 cell values to target year when year != 2023.
+    # Cell-level values stay float; integer rounding is reserved for
+    # aggregate boundaries (commune totals, per-(commune, station) splits).
     if year != 2023:
         gdf = _scale_cells_to_year(gdf, year, label, boundary)
 
@@ -815,6 +872,11 @@ def _cumulate_per_municipality(pop_grid, empl_grid, boundary, year: int = None):
                             on=bfs_col, how='outer')
     summary = summary.fillna(0)
 
+    # Enforce integer types on per-municipality totals (cells already integer;
+    # this is defensive against any floating-point summation drift)
+    summary['total_population'] = summary['total_population'].round().astype(int)
+    summary['total_employment'] = summary['total_employment'].round().astype(int)
+
     # Recover name for outer-join rows that only have employment
     missing_name = summary[name_col].isna() | (summary[name_col] == 0)
     if missing_name.any():
@@ -835,8 +897,15 @@ def _cumulate_per_municipality(pop_grid, empl_grid, boundary, year: int = None):
     csv_path = os.path.join(POP_EMPL_DATA_DIR, f'municipal_pop_empl_summary_{year}.csv')
     summary[csv_cols].to_csv(csv_path, index=False, encoding='utf-8-sig')
     print(f"    Saved -> {csv_path}")
-    print(f"    Total pop = {summary['total_population'].sum():,.0f}, "
-          f"empl = {summary['total_employment'].sum():,.0f}")
+
+    # Also write an unsuffixed copy so legacy consumers
+    # (e.g. catchment_allocate.py searching for 'municipal_pop_empl_summary.csv')
+    # continue to work without a year-tag-aware path.
+    legacy_path = os.path.join(POP_EMPL_DATA_DIR, 'municipal_pop_empl_summary.csv')
+    summary[csv_cols].to_csv(legacy_path, index=False, encoding='utf-8-sig')
+    print(f"    Saved -> {legacy_path}  (unsuffixed legacy alias)")
+    print(f"    Total pop = {summary['total_population'].sum():,d}, "
+          f"empl = {summary['total_employment'].sum():,d}")
 
     return summary
 
@@ -954,7 +1023,7 @@ def _plot_municipal_distributions(summary_df, boundary, year: int = None):
             ax.set_aspect('equal')
 
             fname = f'plot_{title_word.lower()}_by_municipality_{year}{part_suffix}.pdf'
-            out_path = os.path.join(CATCHMENT_PLOT_DIR, fname)
+            out_path = os.path.join(POP_EMPL_PLOT_DIR, fname)
             fig.savefig(out_path, bbox_inches='tight', dpi=150)
             plt.close(fig)
             print(f"    Saved -> {out_path}")
@@ -1094,7 +1163,7 @@ def _plot_raster_map(gdf, label, boundary, year: int = None):
         ax.set_ylabel('N [m]')
         ax.set_aspect('equal')
 
-        out_path = os.path.join(CATCHMENT_PLOT_DIR,
+        out_path = os.path.join(POP_EMPL_PLOT_DIR,
                                 f'plot_{label}_raster_{year}{part_suffix}.pdf')
         fig.savefig(out_path, bbox_inches='tight', dpi=150)
         plt.close(fig)
@@ -1175,8 +1244,12 @@ def _scale_cells_to_year(gdf: gpd.GeoDataFrame, year: int, label: str,
     joined[bfs_col] = pd.to_numeric(joined[bfs_col], errors='coerce')
     cell_scales = joined[bfs_col].map(commune_scale).fillna(1.0)
 
+    # Apply per-cell Bezirk scaling. Cells are kept as floats — integer
+    # rounding happens only at aggregation boundaries (commune totals in
+    # `_cumulate_per_municipality`; per-(commune, station) splits in
+    # catchment_allocate's Phase 4 Hamilton step).
     result = gdf.copy()
-    result['NUMMER'] = (result['NUMMER'] * cell_scales.values).clip(lower=0).round(1)
+    result['NUMMER'] = (result['NUMMER'].values * cell_scales.values).clip(min=0.0).round(2)
 
     # Terminal report
     mean_scale  = float(bezirk_scale.mean())
@@ -1610,10 +1683,15 @@ def main(year: int = None, do_plots: bool = True) -> str:
       - data/Catchment_Area/Pop_Empl_Data/population_{year}_<canton>.csv
       - data/Catchment_Area/Pop_Empl_Data/employment_{year}_<canton>.csv
       - data/Catchment_Area/Pop_Empl_Data/municipal_pop_empl_summary_{year}.csv
-      - plots/Catchment_Area/plot_population_by_municipality_{year}.pdf  (if do_plots)
-      - plots/Catchment_Area/plot_employment_by_municipality_{year}.pdf  (if do_plots)
-      - plots/Catchment_Area/plot_population_raster_{year}.pdf           (if do_plots)
-      - plots/Catchment_Area/plot_employment_raster_{year}.pdf           (if do_plots)
+      - data/Catchment_Area/Pop_Empl_Data/municipal_pop_empl_summary.csv   (unsuffixed legacy alias)
+      - plots/Catchment_Area/Pop_Empl_Data/plot_population_by_municipality_{year}.pdf  (if do_plots)
+      - plots/Catchment_Area/Pop_Empl_Data/plot_employment_by_municipality_{year}.pdf  (if do_plots)
+      - plots/Catchment_Area/Pop_Empl_Data/plot_population_raster_{year}.pdf           (if do_plots)
+      - plots/Catchment_Area/Pop_Empl_Data/plot_employment_raster_{year}.pdf           (if do_plots)
+
+    All Pop/FTE values written to disk (cell-level NUMMER and per-municipality
+    totals) are integers. Per-commune cell sums equal the per-municipality
+    integer total exactly (Hamilton's largest-remainder rounding).
     """
     global _SCALE_REPORT_LINES, _BEZIRK_SCALES, _TOTALS
     _SCALE_REPORT_LINES = []
@@ -1628,6 +1706,7 @@ def main(year: int = None, do_plots: bool = True) -> str:
     os.makedirs(CATCHMENT_DATA_DIR, exist_ok=True)
     os.makedirs(POP_EMPL_DATA_DIR, exist_ok=True)
     os.makedirs(CATCHMENT_PLOT_DIR, exist_ok=True)
+    os.makedirs(POP_EMPL_PLOT_DIR, exist_ok=True)
 
     boundary  = _load_catchment_boundary()
     pop_grid  = _load_population_grid(boundary, year)
@@ -1665,9 +1744,9 @@ def _run_step2_cli():
             print("   Please enter a valid year.")
 
     do_plots_str = input("\n[3.2]  Generate plots? (y/n) "
-                         f"[{'y' if settings.PLOT_CATCHMENT else 'n'}]: ").strip().lower()
+                         f"[{'y' if settings.PLOT_DATA else 'n'}]: ").strip().lower()
     if do_plots_str == '':
-        do_plots = settings.PLOT_CATCHMENT
+        do_plots = settings.PLOT_DATA
     else:
         do_plots = do_plots_str != 'n'
 

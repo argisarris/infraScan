@@ -252,6 +252,8 @@ STUDY_AREA_BUFFER_GPKG   = r"data/Catchment_Area/Boundaries/study_area_buffer.gp
 CATCHMENT_AREA_DIR           = r"data/Catchment_Area"
 CATCHMENT_AREA_BOUNDARY_GPKG = r"data/Catchment_Area/Boundaries/catchment_area_boundary.gpkg"
 CATCHMENT_AREA_BUFFER_GPKG   = r"data/Catchment_Area/Boundaries/catchment_area_buffer.gpkg"
+# Catchment plots - mirrors the data folder structure (data/Catchment_Area/Pop_Empl_Data/...)
+POP_EMPL_PLOT_DIR            = r"plots/Catchment_Area/Pop_Empl_Data"
 POPULATION_CSV_2023 = r"data/Spatial_Data/Land_Use/Population/Inhabitants_2023_CH.csv"
 EMPLOYMENT_CSV_2023 = r"data/Spatial_Data/Land_Use/Employment/Employment_FTE_2023_CH.csv"
 # Canton Zurich commune-level actuals (population 1962-2025, employment 2011-2023)

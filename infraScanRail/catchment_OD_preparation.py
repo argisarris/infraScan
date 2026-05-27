@@ -510,29 +510,32 @@ def _load_pt_feeder_assignment() -> pd.DataFrame:
 
 
 def _load_pt_feeder_empl_assignment() -> pd.DataFrame:
-    """Read cell_station_candidates_empl.csv; return (RELI, Station_1_ID) as int.
+    """Read the unified cell_station_candidates.csv and filter to cells with
+    Emp > 0. Returns (RELI, Station_1_ID) as int.
 
-    Written by catchment_allocate._run_pt_feeder_method (W4a Phase 1).
-    Covers all cells with Empl > 0; station assignment is GC-based and
-    identical to the pop candidates for shared cells — only the included
-    RELI set differs (employment cells vs. population cells).
+    The single CSV (written by catchment_allocate._run_pt_feeder_method) covers
+    every cell with Pop > 0 OR Emp > 0; the station assignment is GC-based and
+    identical for production and attraction sides — only the row-set filter
+    differs.
 
     Returns:
         DataFrame with columns: RELI (int), Station_1_ID (int).
     """
     cand_path = os.path.join(paths.MAIN, catchment_base.PT_FEEDER_DATA_DIR,
-                             'cell_station_candidates_empl.csv')
+                             'cell_station_candidates.csv')
     if not os.path.exists(cand_path):
         raise FileNotFoundError(
-            f"Employment cell→station candidates not found at {cand_path}. "
+            f"PT-feeder cell→station candidates not found at {cand_path}. "
             f"Run catchment_allocate.get_catchment() first to generate it."
         )
     print(f"  Loading cell→station assignment (attraction / employment side) ...")
-    cand = pd.read_csv(cand_path)[['RELI', 'Station_1_ID']].copy()
+    cand = pd.read_csv(cand_path)[['RELI', 'Emp', 'Station_1_ID']].copy()
     cand['RELI']         = pd.to_numeric(cand['RELI'],         errors='coerce')
+    cand['Emp']          = pd.to_numeric(cand['Emp'],          errors='coerce')
     cand['Station_1_ID'] = pd.to_numeric(cand['Station_1_ID'], errors='coerce')
-    cand = cand.dropna()
-    cand = cand[cand['Station_1_ID'] > 0]
+    cand = cand.dropna(subset=['RELI', 'Station_1_ID'])
+    cand = cand[(cand['Station_1_ID'] > 0) & (cand['Emp'].fillna(0) > 0)]
+    cand = cand[['RELI', 'Station_1_ID']].copy()
     cand['RELI']         = cand['RELI'].astype(int)
     cand['Station_1_ID'] = cand['Station_1_ID'].astype(int)
     print(f"    {len(cand):,} cells with a valid employment station assignment")

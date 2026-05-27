@@ -64,7 +64,7 @@ INFRA_RAW_VERSION   = 'Raw_ZH'             # infrabuild_filter_network output: d
 # 'AS_2035_ZH_enhanced' — AS_2035_ZH enriched with projected svc travel times and corrections
 INFRA_VERSION = 'Build_New'
 
-INFRA_BUILD_NEW_NAME = 'AS_2035_ZH'        # name for the new version — used only when INFRA_VERSION = 'Build_New'
+INFRA_BUILD_NEW_NAME = 'AS_2026_ZH'        # name for the new version — used only when INFRA_VERSION = 'Build_New'
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 4. SERVICES VERSION
@@ -78,9 +78,9 @@ GTFS_FILTER_VERSION = 'GTFS_SVC2026_ZH'        # services_filter_gtfs output: da
 # 'AK_2026_S18' — AK_2026 with S18 line included
 # 'AK_2035'     — scheduled services as of 2035 timetable
 # 'AK_2035_S18' — AK_2035 with S18 line included
-SVC_VERSION = 'AK_2035_S18'
+SVC_VERSION = 'AK_2026_S18'
 
-SVC_BUILD_NEW_NAME = 'AK_2035_S18'                 # name for the new version — used only when SVC_VERSION = 'Build_New'
+SVC_BUILD_NEW_NAME = 'AK_2026_S18'                 # name for the new version — used only when SVC_VERSION = 'Build_New'
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 5. CAPACITY
@@ -127,13 +127,22 @@ baseline_network_for_developments = None
 #   PT_Feeder  ->  communal OD re-weighted by PT-feeder catchment shares
 CATCHMENT_METHOD = 'PT_Feeder'
 
-# When True, all access times expressed as equivalent IVT seconds (generalised cost)
-USE_GENERALISED_COST = True
+# Travel-cost method — controls how access-time components are combined into a generalised cost
+# 'calibrated' — use literature-calibrated weights from cost_parameters.py (W_IVT/W_WAIT/W_WALK/W_BIKE/W_TRANSFER and the comfort-weighted transfer penalty)
+# 'absolute'   — set all weights to 1.0 at runtime (raw minutes, no weighting); uses the unweighted transfer penalty (cp.average_train_change_time, 7.1 min) instead of the comfort-weighted PI_TRANSFER_MIN
+TRAVEL_COST_METHOD = 'absolute'
 
-# Transfer cost model — requires USE_GENERALISED_COST = True
+# Transfer cost model — requires TRAVEL_COST_METHOD = 'calibrated' for the full literature value; 'absolute' uses raw minutes regardless.
 # 'fixed_value' — flat 12.1 min eq. IVT penalty (Axhausen 2014, Fuchs 2025)
 # 'explicit'    — W_TRANSFER x (transfer walk time + wait time based on connecting headway)
-TRANSFER_COST_MODEL = 'fixed_value'
+TRANSFER_COST_MODEL = 'explicit'
+
+# Temporal variant of the rail/feeder data — controls which subfolder is read for stops, segments, and line frequencies in catchment_allocate.
+# 'full_day' — top-level files (e.g. pt_feeder_lines.gpkg); all services
+# 'all_day'  — All_Day subfolder; services operating throughout the day
+# 'peak'     — Peak subfolder; AM+PM peak services
+# 'offpeak'  — Off_Peak subfolder; off-peak services only
+TEMPORAL = 'full_day'
 
 # When True, OD demand is filtered to only include trips from/to the study area perimeter
 only_demand_from_to_perimeter = True
@@ -173,18 +182,12 @@ start_valuation_year = 2050
 # 9. VISUALISATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Global visualisation mode — controls how optional plots are handled at runtime
-# 'manual' — prompt the user for each optional plot decision
-# 'none'   — skip all optional plots without prompting
-# 'all'    — generate all optional plots without prompting
-VISUALIZATION_MODE = 'manual'
-
-# Per-pipeline plot toggles — set False to suppress all plots for that pipeline area
-# without changing the global VISUALIZATION_MODE for interactive decisions elsewhere
-PLOT_CATCHMENT = False   # catchment_base population/employment maps (Phase 2)
+# Per-pipeline plot toggles depending on which plots are desired for this run.
+PLOT_DATA      = True   # catchment_base population/employment maps (Phase 2)
 PLOT_INFRA     = True    # infrabuild network plots (Phase 3A)
 PLOT_SERVICES  = True   # services pipeline plots (Phase 3B)
 PLOT_CAPACITY  = True   # capacity analysis plots (Phase 3C)
+PLOT_CATCHMENT = True   # catchment allocation plots (Phase 4A)
 PLOT_RESULTS   = False   # final CBA/result visualisations
 
 plot_passenger_flow = False
@@ -207,8 +210,7 @@ use_cache_tts_calc = False
 # ═══════════════════════════════════════════════════════════════════════════════
 # 11. PHYSICS & DESIGN CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════════
-# Centralised physical and engineering constants. Each constant lists its valid
-# range and the standard / calibration source. Downstream modules import from here.
+# Centralised physical and engineering constants. Each constant lists its valid range and the standard / calibration source. Downstream modules import from here.
 
 MAX_TRAIN_LENGTH_M = 400              # universal train-length cap [m]. Range 100–500 (regional 80–200, long-distance ≤400)
 SERVICE_BRAKE_DECEL_MS2 = 0.7         # service-brake deceleration [m/s²]. Range 0.5–1.3 (UIC 544-1 / ERTMS); calibrated to 0.7 vs GTFS
@@ -218,8 +220,7 @@ MAX_SIDING_LENGTH_RATIO = 0.75        # passing-siding full-duplication threshol
 # ═══════════════════════════════════════════════════════════════════════════════
 # 12. INTERVENTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
-# Service interventions modify the rail offer (timetable + routing); the ones
-# that also require new physical infrastructure pull in the corresponding infra
+# Service interventions modify the rail offer (timetable + routing); the ones that also require new physical infrastructure pull in the corresponding infra
 # intervention via the 'requires_infra' column of their svc-int xlsx.
 #
 # Available intervention types:
